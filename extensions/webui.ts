@@ -17,12 +17,7 @@ import type { AddressInfo } from "node:net";
 import { dirname, extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getAgentDir, SessionManager } from "nife-coding-agent";
-import type {
-	ExtensionAPI,
-	ExtensionCommandContext,
-	ExtensionContext,
-	ExtensionUIContext,
-} from "nife-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "nife-coding-agent";
 
 /** Whatever ctx.model is; the package does not export the model type itself. */
 type AnyModel = NonNullable<ExtensionContext["model"]>;
@@ -49,8 +44,6 @@ type OriginalUI = Pick<ExtensionUIContext, "confirm" | "select" | "input" | "edi
 interface Bridge {
 	api: ExtensionAPI;
 	ctx: ExtensionContext;
-	/** Command-capable context: only present after /webui or a session switch. */
-	command: ExtensionCommandContext | undefined;
 	server: Server;
 	port: number;
 	token: string;
@@ -62,7 +55,22 @@ interface Bridge {
 	children: Map<string, { id: string; agent: string; count: number }>;
 	/** Set once the browser tab was opened for this process, so /reload does not reopen it. */
 	autoOpened: boolean;
+	/** Resolver for the session switch currently in flight, settled by the webui-session command. */
+	switchRequest: ((outcome: SwitchOutcome) => void) | undefined;
 }
+
+interface SwitchOutcome {
+	ok: boolean;
+	message?: string;
+}
+
+/**
+ * Session control (switchSession/newSession) only exists on ExtensionCommandContext, which the
+ * runtime hands to command handlers. The bridge is started from session_start, where there is
+ * only an ExtensionContext, so it dispatches its own command and lets the runtime build the
+ * command context instead of trying to hold one.
+ */
+const SWITCH_COMMAND = "webui-session";
 
 // The factory runs again whenever a session is replaced (/new, /resume, /fork). Module state
 // survives only if the loader reuses the module, so the bridge lives on globalThis: the server,
@@ -263,17 +271,22 @@ async function listSessions(b: Bridge): Promise<unknown> {
 	};
 }
 
-/** Runs a session replacement and keeps the command context fresh for the next one. */
-async function replaceSession(b: Bridge, run: (command: ExtensionCommandContext) => Promise<unknown>): Promise<void> {
-	const command = b.command;
-	if (!command) throw new Error("session control unavailable, run /webui in the terminal");
-	await run(command);
-	const fresh = b.command;
-	if (fresh) {
-		b.ctx = fresh;
-		patchDialogs(fresh, b);
-	}
-	broadcast(b, { type: "session_switch" });
+function requestSwitch(b: Bridge, args: string): Promise<SwitchOutcome> {
+	if (!b.ctx.isIdle()) return Promise.resolve({ ok: false, message: "stop the current turn first" });
+	const api = b.api;
+	return new Promise<SwitchOutcome>((resolve) => {
+		const timer = setTimeout(() => {
+			if (b.switchRequest === settle) b.switchRequest = undefined;
+			resolve({ ok: false, message: "session switch timed out" });
+		}, 120_000);
+		const settle = (outcome: SwitchOutcome) => {
+			clearTimeout(timer);
+			resolve(outcome);
+		};
+		b.switchRequest = settle;
+		// Dispatch through the runtime so the command handler receives a real command context.
+		api.sendUserMessage(`/${SWITCH_COMMAND} ${args}`, { expandPromptTemplates: true });
+	});
 }
 
 async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -361,24 +374,16 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		const body = await readJson(req);
 		const sessionPath = typeof body.path === "string" ? body.path : "";
 		if (!sessionPath) return send(res, 400, "missing path");
-		await replaceSession(b, (command) =>
-			command.switchSession(sessionPath, {
-				withSession: async (ctx) => {
-					b.command = ctx;
-				},
-			}),
-		);
+		const outcome = await requestSwitch(b, `resume ${sessionPath}`);
+		if (!outcome.ok) return send(res, 409, outcome.message ?? "switch failed");
+		broadcast(b, { type: "session_switch" });
 		return send(res, 200, "ok");
 	}
 
 	if (req.method === "POST" && path === "/api/new") {
-		await replaceSession(b, (command) =>
-			command.newSession({
-				withSession: async (ctx) => {
-					b.command = ctx;
-				},
-			}),
-		);
+		const outcome = await requestSwitch(b, "new");
+		if (!outcome.ok) return send(res, 409, outcome.message ?? "switch failed");
+		broadcast(b, { type: "session_switch" });
 		return send(res, 200, "ok");
 	}
 
@@ -433,7 +438,6 @@ function start(api: ExtensionAPI, ctx: ExtensionContext): Promise<Bridge> {
 	const b: Bridge = {
 		api,
 		ctx,
-		command: undefined,
 		server,
 		port: 0,
 		token,
@@ -443,6 +447,7 @@ function start(api: ExtensionAPI, ctx: ExtensionContext): Promise<Bridge> {
 		orig: undefined,
 		children: new Map(),
 		autoOpened: false,
+		switchRequest: undefined,
 	};
 
 	server.on("request", (req, res) => {
@@ -500,9 +505,39 @@ export default function webui(api: ExtensionAPI) {
 			}
 			b.api = api;
 			b.ctx = ctx;
-			b.command = ctx;
 			patchDialogs(ctx, b);
 			ctx.ui.notify(`webui: ${webuiUrl(b)}`, "info");
+		},
+	});
+
+	api.registerCommand(SWITCH_COMMAND, {
+		description: "Internal: session switching for the web UI",
+		handler: async (args, ctx) => {
+			const b = store.__nifeWebui;
+			const settle = (outcome: SwitchOutcome) => {
+				if (!b) return;
+				const request = b.switchRequest;
+				b.switchRequest = undefined;
+				request?.(outcome);
+			};
+			const [kind, ...rest] = args.trim().split(/\s+/);
+			try {
+				if (kind === "resume") {
+					const sessionPath = rest.join(" ");
+					if (!sessionPath) throw new Error("missing session path");
+					const result = await ctx.switchSession(sessionPath);
+					settle(result.cancelled ? { ok: false, message: "switch cancelled" } : { ok: true });
+					return;
+				}
+				if (kind === "new") {
+					const result = await ctx.newSession();
+					settle(result.cancelled ? { ok: false, message: "new session cancelled" } : { ok: true });
+					return;
+				}
+				throw new Error(`unknown switch kind: ${kind || "none"}`);
+			} catch (error) {
+				settle({ ok: false, message: error instanceof Error ? error.message : "switch failed" });
+			}
 		},
 	});
 

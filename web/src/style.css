@@ -400,6 +400,13 @@ img {
 	padding: 0 24px 12px;
 }
 
+.notice {
+	max-width: 860px;
+	margin: 0 auto 6px;
+	color: #f2777a;
+	font-size: 11px;
+}
+
 /*
  * The box outline is the context track, drawn as a 2px SVG stroke on a
  * rounded rect with pathLength="100", so a dasharray of "<pct> 100" fills

@@ -103,6 +103,11 @@ From the browser:
   tool call is in flight, and as `Delegated explorer · task` rows in the transcript
 - multi-agent on/off is still `/subagent` (or ctrl+y) in the terminal: the extension API exposes
   tools but not the `multiAgentEnabled` setting, so the web UI reports state instead of faking a toggle
+- session switching survives autostart: `switchSession`/`newSession` exist only on the command
+  context, which the runtime hands to command handlers, so the bridge dispatches a `webui-session`
+  command through `sendUserMessage("/webui-session ...", { expandPromptTemplates: true })`. That
+  command shows up in the terminal's command list; switching while a turn streams is refused with
+  a notice instead of being queued mid-turn
 - `/tree` is deliberately not exposed
 
 ## Rendering

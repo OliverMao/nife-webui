@@ -30,6 +30,14 @@ const menu = ref(null);
 const modelQuery = ref("");
 const thinkingDraft = ref(null);
 const subagents = ref([]);
+const notice = ref("");
+let noticeTimer;
+
+function showNotice(message) {
+	notice.value = message;
+	clearTimeout(noticeTimer);
+	noticeTimer = setTimeout(() => (notice.value = ""), 5000);
+}
 
 let source;
 let frame = 0;
@@ -315,13 +323,17 @@ async function loadSessions() {
 	currentFile.value = data.current ?? "";
 }
 
-async function post(path, body) {
+async function postDetailed(path, body) {
 	const response = await fetch(api(path), {
 		method: "POST",
 		headers: { "content-type": "application/json" },
 		body: body === undefined ? undefined : JSON.stringify(body),
 	});
-	return response.ok;
+	return { ok: response.ok, message: response.ok ? "" : (await response.text()).slice(0, 200) };
+}
+
+async function post(path, body) {
+	return (await postDetailed(path, body)).ok;
 }
 
 let pasteSeq = 0;
@@ -405,18 +417,24 @@ async function onThinkingChange(index) {
 
 async function switchTo(path) {
 	sidebarOpen.value = false;
-	if (await post("resume", { path })) {
-		await loadState();
-		await loadSessions();
+	const result = await postDetailed("resume", { path });
+	if (!result.ok) {
+		showNotice(result.message || "could not switch session");
+		return;
 	}
+	await loadState();
+	await loadSessions();
 }
 
 async function newSession() {
 	sidebarOpen.value = false;
-	if (await post("new")) {
-		await loadState();
-		await loadSessions();
+	const result = await postDetailed("new");
+	if (!result.ok) {
+		showNotice(result.message || "could not start a new session");
+		return;
 	}
+	await loadState();
+	await loadSessions();
 }
 
 async function answer(value) {
@@ -545,6 +563,7 @@ onMounted(async () => {
 			</main>
 
 			<form class="composer" @submit.prevent="send">
+				<p v-if="notice" class="notice">{{ notice }}</p>
 				<div class="composer-box">
 					<svg class="box-progress" aria-hidden="true" :title="contextPercent !== null ? `context ${Math.round(contextPercent)}%` : undefined">
 						<rect class="progress-track" x="0" y="0" width="100%" height="100%" rx="19" pathLength="100" />

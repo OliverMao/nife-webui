@@ -26,6 +26,14 @@ const api = {
 	},
 	sendUserMessage(text, opts) {
 		sent.push({ text, opts });
+		// Mirrors agent-session.prompt(): a slash command with expandPromptTemplates runs the
+		// command handler with a command context instead of queueing a user message.
+		if (opts?.expandPromptTemplates && text.startsWith("/")) {
+			const name = text.slice(1).split(/\s+/)[0];
+			const args = text.slice(1 + name.length).trim();
+			const command = commands.get(name);
+			if (command) void command.handler(args, ctx);
+		}
 	},
 	getSessionName() {
 		return "smoke";
@@ -214,7 +222,7 @@ const listed = await (await fetch(`${base}api/sessions?t=${token}`)).json();
 assert.equal(listed.sessions.length, 1);
 assert.equal(listed.sessions[0].path, "/fake/old.jsonl");
 
-// resume + new keep the same bridge (port/token) and rebind the command context
+// resume + new go through the dispatched webui-session command; the bridge keeps port/token
 assert.equal((await fetch(`${base}api/resume?t=${token}`, {
 	method: "POST",
 	headers: { "content-type": "application/json" },
@@ -223,6 +231,19 @@ assert.equal((await fetch(`${base}api/resume?t=${token}`, {
 assert.deepEqual(switched, ["/fake/old.jsonl"]);
 assert.equal((await fetch(`${base}api/new?t=${token}`, { method: "POST" })).status, 200);
 assert.deepEqual(switched, ["/fake/old.jsonl", "<new>"]);
+assert.deepEqual(
+	sent.filter((entry) => entry.text.startsWith("/webui-session")).map((entry) => entry.text),
+	["/webui-session resume /fake/old.jsonl", "/webui-session new"],
+);
+
+// a streaming turn refuses the switch instead of queueing it mid-turn
+ctx.isIdle = () => false;
+assert.equal((await fetch(`${base}api/resume?t=${token}`, {
+	method: "POST",
+	headers: { "content-type": "application/json" },
+	body: JSON.stringify({ path: "/fake/old.jsonl" }),
+})).status, 409);
+ctx.isIdle = () => true;
 assert.equal((await fetch(`${base}api/state?t=${token}`)).status, 200, "bridge survives session replacement");
 
 // streaming event forwarded as delta only
