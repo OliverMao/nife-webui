@@ -26,13 +26,15 @@ WEBUI_TARGET=http://127.0.0.1:PORT npm run dev
 ```
 extensions/webui.ts   server: HTTP + SSE, ctx.ui interception, event forwarding
 web/src/App.vue       transcript, composer, dialog modal
+web/src/MessageItem.vue  one transcript row; BlockItem.vue one content block
+web/src/transcript.js  collapses thinking/tool runs into one row (unit tested)
 web/src/images.js     pasted image -> canvas resize -> base64 ImageContent
 web/src/paste.js      text-paste markers + image mime/size rules (unit tested)
 web/src/files.js      dropped-file marker lines, names, sizes, type icons (unit tested)
 web/src/FileIcon.vue  one stroked 16px glyph per file category
 web/src/style.css     all styling
 web/dist/             built output, served by the extension
-scripts/files-test.mjs, paste-test.mjs, markdown-test.mjs   pure-function tests
+scripts/files-test.mjs, paste-test.mjs, markdown-test.mjs, transcript-test.mjs   pure-function tests
 scripts/smoke.mjs     fake ExtensionAPI + real HTTP server, no model needed
 ```
 
@@ -94,8 +96,12 @@ From the browser:
   the parked items follow that turn. `Resume` continues without a new message, `Clear` drops them; failures stay at the head with a
   `Retry` action instead of silently disappearing
 - `+` starts a fresh session (`/new`)
-- tool calls collapse into one-line rows (`Ran npm test`), expand for arguments and output,
-  failed rows are marked in red
+- thinking and tool calls collapse into one row, not one row per step: consecutive process-only
+  messages (`isProcessItem` in `web/src/transcript.js`) become a single closed `Worked · 3 tools ·
+  1 thought` row, and inside a message that also carries text, adjacent thinking/tool blocks
+  collapse the same way - so the transcript reads as answers only, with the working out one click
+  away. A lone step keeps its own row. Single tool rows are flat one-liners (`Ran npm test`),
+  expand for arguments and output, failed rows are marked in amber
 - panel button collapses the sidebar (remembered in `localStorage`); it becomes an overlay under
   820px, where a dimmed backdrop covers the page: tapping it, switching sessions, or Escape closes
   the overlay, and resizing back to a wide window clears the open state

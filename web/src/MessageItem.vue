@@ -1,15 +1,29 @@
 <script setup>
 import { computed } from "vue";
+import BlockItem from "./BlockItem.vue";
 import FileIcon from "./FileIcon.vue";
 import { splitAttachments } from "./files.js";
-import { blocksOf, dataUrl, imagesOf, mdOf, textOf, toolArg, toolLabel } from "./message-utils.js";
+import { blocksOf, dataUrl, imagesOf, textOf } from "./message-utils.js";
+import { failedTool, groupBlocks, stepLabel } from "./transcript.js";
 
 const props = defineProps({
 	item: { type: Object, required: true },
+	// inside a collapsed process group the steps are already behind one click: no second wrapper
+	flat: { type: Boolean, default: false },
 });
 
 // Dropped files travel as `[attached] <path>` lines; show chips instead of temp paths.
 const userContent = computed(() => splitAttachments(textOf(props.item.message.content)));
+
+// Thinking and tool calls collapse into one row per run, so a message reads as answer-first.
+const segments = computed(() => {
+	const blocks = blocksOf(props.item.message);
+	if (!props.flat) return groupBlocks(blocks);
+	return blocks.map((block) => ({ kind: "block", block }));
+});
+
+/** The collapsed row warns when a hidden step failed; the details stay closed otherwise. */
+const segmentFailed = (segment) => failedTool(segment.blocks, props.item.results);
 
 const noticeLabel = (message) => {
 	if (message.role === "compactionSummary") return "Context compacted";
@@ -38,37 +52,18 @@ const noticeText = (message) => {
 	</div>
 
 	<div v-else-if="item.kind === 'assistant'" class="msg assistant">
-		<template v-for="(block, i) in blocksOf(item.message)" :key="i">
-			<div v-if="block.type === 'text'" class="md" v-html="mdOf(block)"></div>
-			<details v-else-if="block.type === 'thinking'" class="thinking">
-				<summary>
-					<svg class="think-icon" viewBox="0 0 16 16" aria-hidden="true">
-						<path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M12.6 3.4l-1.4 1.4M4.8 11.2l-1.4 1.4" />
-					</svg>
-					<span class="think-label">Thought</span>
-					<span class="think-preview ellipsis">{{ block.thinking.replace(/\s+/g, " ").slice(0, 80) }}</span>
-				</summary>
-				<div class="think-body">{{ block.thinking }}</div>
-			</details>
-			<details
-				v-else-if="block.type === 'toolCall'"
-				class="tool"
-				:class="{ failed: item.results[block.id]?.isError }"
-			>
+		<template v-for="(segment, i) in segments" :key="i">
+			<details v-if="segment.kind === 'process'" class="process" :class="{ failed: segmentFailed(segment) }">
 				<summary>
 					<span class="chev"></span>
-					<span class="tool-verb">{{ toolLabel(block) }}</span>
-					<span class="tool-arg ellipsis">{{ toolArg(block) }}</span>
-					<span v-if="!item.results[block.id]" class="tool-state running">running</span>
+					<span class="tool-verb">Worked</span>
+					<span class="tool-arg ellipsis">{{ stepLabel(segment.counts) }}</span>
 				</summary>
-				<div class="tool-body">
-					<pre class="code">{{ JSON.stringify(block.arguments ?? {}, null, 2) }}</pre>
-					<template v-if="item.results[block.id]">
-						<div class="text">{{ textOf(item.results[block.id].content) }}</div>
-					</template>
+				<div class="process-body">
+					<BlockItem v-for="(block, j) in segment.blocks" :key="j" :block="block" :results="item.results" />
 				</div>
 			</details>
-			<img v-else-if="block.type === 'image'" :src="dataUrl(block)" alt="" />
+			<BlockItem v-else :block="segment.block" :results="item.results" />
 		</template>
 		<div v-if="item.message.errorMessage" class="text error">{{ item.message.errorMessage }}</div>
 	</div>

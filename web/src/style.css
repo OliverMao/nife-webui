@@ -491,6 +491,54 @@ svg {
 	color: #b9bdc4;
 }
 
+/* collapsed run of thinking/tool steps: the transcript keeps the answers, not the working out */
+
+.process {
+	width: 100%;
+	max-width: 860px;
+	margin: 6px auto;
+}
+
+.process > summary {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	cursor: pointer;
+	list-style: none;
+	font-size: 12.5px;
+	color: var(--muted);
+	padding: 2px 0;
+}
+
+.process > summary::-webkit-details-marker {
+	display: none;
+}
+
+.process > summary:hover {
+	color: var(--text);
+}
+
+.process.failed > summary {
+	color: var(--warn);
+}
+
+.process[open] > summary > .chev {
+	transform: rotate(45deg);
+}
+
+.process-body {
+	margin: 4px 0 0 6px;
+	padding-left: 12px;
+	border-left: 2px solid var(--line);
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+
+.process-body .msg {
+	margin: 0;
+}
+
 img {
 	max-width: 320px;
 	border-radius: 8px;

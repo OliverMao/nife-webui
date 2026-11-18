@@ -9,6 +9,7 @@ import { formatBytes } from "./files.js";
 import { blocksOf } from "./message-utils.js";
 import { IMAGE_MAX_COUNT, expandPastes, imageFiles, imageMimeType, imageProblem, pasteMarker, readClipboard } from "./paste.js";
 import { metaOf, previewOf, promptTextOf, queueProblem } from "./queue.js";
+import { groupItems, stepLabel } from "./transcript.js";
 
 const token = new URLSearchParams(location.search).get("t") ?? "";
 const api = (path) => `/api/${path}?t=${encodeURIComponent(token)}`;
@@ -116,6 +117,10 @@ const items = computed(() => {
 	}
 	return list;
 });
+
+// Thinking and tool calls between answers collapse into one row: the transcript shows the answers,
+// and the how-it-got-there stays one click away.
+const rows = computed(() => groupItems(items.value));
 
 const modelLabel = computed(() => (state.value.model ? (state.value.model.name ?? state.value.model.id) : "model"));
 
@@ -1113,7 +1118,19 @@ onBeforeUnmount(() => {
 						</p>
 					</div>
 
-					<MessageItem v-for="(item, index) in items" :key="index" :item="item" />
+					<template v-for="(row, index) in rows" :key="index">
+						<details v-if="row.kind === 'process'" class="process" :class="{ failed: row.counts.failed }">
+							<summary>
+								<span class="chev"></span>
+								<span class="tool-verb">Worked</span>
+								<span class="tool-arg ellipsis">{{ stepLabel(row.counts) }}</span>
+							</summary>
+							<div class="process-body">
+								<MessageItem v-for="(step, i) in row.steps" :key="i" :item="step" flat />
+							</div>
+						</details>
+						<MessageItem v-else :item="row" />
+					</template>
 
 					<LiveMessage v-if="live" :live="live" />
 				</div>
