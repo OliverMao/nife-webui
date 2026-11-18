@@ -1,1 +1,3 @@
 node_modules/
+.ssr-check/
+web/ssr-entry.mjs

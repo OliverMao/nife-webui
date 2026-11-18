@@ -10,6 +10,8 @@
 	--bubble: #2a4f9b;
 	--accent: #6b8fe8;
 	--error: #f2777a;
+	/* text-level warnings: no red text anywhere in the UI */
+	--warn: #e5c07b;
 	color-scheme: dark;
 }
 
@@ -210,7 +212,7 @@ svg {
 
 .session-delete:hover:not(:disabled) {
 	background: rgb(255 255 255 / 8%);
-	color: var(--error);
+	color: var(--warn);
 }
 
 .session-delete:disabled {
@@ -335,6 +337,9 @@ svg {
 	overflow-y: auto;
 	padding: 8px 24px 24px;
 	scrollbar-gutter: stable;
+	/* we drive scrollTop from follow(); the browser's own anchoring fights it when the composer or
+	   the queue strip changes the container height */
+	overflow-anchor: none;
 }
 
 .msg,
@@ -411,7 +416,7 @@ svg {
 }
 
 .text.error {
-	color: var(--error);
+	color: var(--warn);
 }
 
 .thinking summary::-webkit-details-marker,
@@ -463,7 +468,7 @@ svg {
 
 .tool.failed summary,
 .tool.failed .tool-verb {
-	color: var(--error);
+	color: var(--warn);
 }
 
 .tool-body {
@@ -499,13 +504,137 @@ img {
 }
 
 /* appears only while the view is scrolled away from the newest message */
+/*
+ * Queue strip: 20px narrower than the composer box on each side, flush against its top edge so it
+ * reads as one unit with the input.
+ */
+.queue {
+	width: calc(100% - 40px);
+	max-width: 820px;
+	margin: 0 auto 4px;
+	padding: 4px 6px 5px;
+	border: 1px solid var(--line);
+	border-radius: 10px;
+	background: #1e1e20;
+}
+
+.queue.paused {
+	border-color: rgb(229 192 123 / 45%);
+}
+
+.queue-head {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 1px 4px 3px;
+	font-size: 11px;
+	color: var(--muted);
+}
+
+.queue-title {
+	flex: 1;
+}
+
+.queue-action {
+	flex: 0 0 auto;
+	padding: 1px 8px;
+	border-radius: 999px;
+	background: rgb(255 255 255 / 7%);
+	color: var(--muted);
+	font-size: 11px;
+}
+
+.queue-action:hover {
+	background: rgb(255 255 255 / 13%);
+	color: var(--text);
+}
+
+.queue-action.resume {
+	background: rgb(229 192 123 / 18%);
+	color: #e5c07b;
+}
+
+.queue-list {
+	max-height: 84px;
+	overflow-y: auto;
+	scrollbar-width: thin;
+}
+
+.queue-item {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 3px 4px;
+	border-radius: 6px;
+	font-size: 12px;
+}
+
+.queue-item:hover {
+	background: rgb(255 255 255 / 4%);
+}
+
+.queue-index {
+	flex: 0 0 auto;
+	min-width: 12px;
+	color: var(--dim);
+	font-size: 11px;
+	font-variant-numeric: tabular-nums;
+	text-align: right;
+}
+
+.queue-text {
+	flex: 1 1 auto;
+	min-width: 0;
+	text-align: left;
+	color: var(--text);
+}
+
+.queue-meta,
+.queue-state,
+.queue-error {
+	flex: 0 0 auto;
+	font-size: 11px;
+	color: var(--dim);
+}
+
+.queue-state {
+	color: var(--accent);
+}
+
+.queue-error {
+	color: var(--warn);
+}
+
+.queue-remove {
+	flex: 0 0 auto;
+	width: 17px;
+	height: 17px;
+	display: grid;
+	place-items: center;
+	padding: 0;
+	border-radius: 50%;
+	color: var(--dim);
+	font-size: 13px;
+	line-height: 1;
+}
+
+.queue-remove:hover {
+	background: rgb(255 255 255 / 8%);
+	color: var(--warn);
+}
+
+/*
+ * Appears only while the view is scrolled away from the newest message. Sticky inside the
+ * transcript, so it pins to the bottom of the reading area whatever the composer or queue does.
+ */
 .jump-latest {
-	position: absolute;
-	right: 40px;
-	top: -36px;
-	display: inline-flex;
+	position: sticky;
+	bottom: 4px;
+	display: flex;
 	align-items: center;
 	gap: 5px;
+	width: max-content;
+	margin: 0 auto;
 	padding: 4px 11px;
 	border: 1px solid var(--line);
 	border-radius: 999px;
@@ -513,7 +642,7 @@ img {
 	color: var(--text);
 	font-size: 11px;
 	box-shadow: 0 4px 14px rgb(0 0 0 / 35%);
-	z-index: 38;
+	z-index: 5;
 }
 
 .jump-latest:hover {
@@ -525,11 +654,64 @@ img {
 	height: 11px;
 }
 
-.notice {
-	max-width: 860px;
-	margin: 0 auto 6px;
-	color: #f2777a;
-	font-size: 11px;
+/*
+ * Composer notices: a bubble that surfaces from the middle of the input box and fades out above
+ * it. Fixed positioning on purpose - it must not depend on the composer's own layout - and the
+ * `bottom` / `--rise` pair is measured from the box in showNotice().
+ */
+.composer-notice {
+	position: fixed;
+	left: 50%;
+	bottom: 96px;
+	z-index: 60;
+	max-width: min(560px, calc(100vw - 48px));
+	padding: 6px 14px;
+	border: 1px solid var(--line);
+	border-radius: 999px;
+	background: rgb(42 42 45 / 92%);
+	-webkit-backdrop-filter: blur(6px);
+	backdrop-filter: blur(6px);
+	box-shadow: 0 10px 30px rgb(0 0 0 / 45%);
+	color: var(--text);
+	font-size: 11.5px;
+	line-height: 1.5;
+	text-align: center;
+	pointer-events: none;
+	/* both: the 0% frame also applies before the animation starts, and nothing is painted at the
+	   wrong position for a frame (that was the flicker) */
+	opacity: 0;
+	transform: translate(-50%, 50%);
+	will-change: transform, opacity;
+	animation: notice-bubble 3s cubic-bezier(0.22, 0.72, 0.28, 1) both;
+}
+
+@keyframes notice-bubble {
+	/* fade in on the surface (~0.5s), drift up, then fade out in place */
+	0% {
+		opacity: 0;
+		transform: translate(-50%, 50%) scale(0.96);
+	}
+	16% {
+		opacity: 1;
+		transform: translate(-50%, 44%) scale(1);
+	}
+	70% {
+		opacity: 1;
+		transform: translate(-50%, var(--rise, -70px)) scale(1);
+	}
+	100% {
+		opacity: 0;
+		transform: translate(-50%, var(--rise, -70px)) scale(1);
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.composer-notice {
+		animation: none;
+		opacity: 1;
+		bottom: 128px;
+		transform: translateX(-50%);
+	}
 }
 
 /*
@@ -593,7 +775,32 @@ img {
 .box-progress .progress-value {
 	stroke: var(--accent);
 	stroke-linecap: butt;
-	transition: stroke-dasharray 400ms cubic-bezier(0.22, 1, 0.36, 1);
+	transition: stroke-dasharray 1400ms cubic-bezier(0.33, 0, 0.2, 1);
+}
+
+/* compaction: the ring keeps filling (0 -> 100, restart) and glows, then the drop back to the
+   measured value animates once it ends. The transition is off while the sweep runs - the rAF loop
+   owns the value, and its 1.4s lag on a per-frame update would make the fill feel stuck. */
+.box-progress.compacting .progress-value {
+	transition: none;
+	animation: progress-glow 1.6s ease-in-out infinite;
+}
+
+@keyframes progress-glow {
+	0%,
+	100% {
+		filter: drop-shadow(0 0 4px rgb(77 147 248 / 70%));
+	}
+	50% {
+		filter: drop-shadow(0 0 9px rgb(147 51 234 / 85%));
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.box-progress.compacting .progress-value {
+		animation: none;
+		filter: drop-shadow(0 0 5px rgb(91 141 240 / 70%));
+	}
 }
 
 .attachments {
@@ -752,6 +959,53 @@ img {
 	color: var(--dim);
 }
 
+/* compaction owns the session: the draft stays rendered but cannot be edited */
+.composer textarea:disabled {
+	color: var(--dim);
+	cursor: progress;
+}
+
+/* mask over the composer box while compaction runs (inset 0 = the padding box, 18px = 20px - 2px border) */
+.composer-mask {
+	position: absolute;
+	inset: 0;
+	z-index: 12;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	gap: 9px;
+	border-radius: 18px;
+	background: rgb(35 35 36 / 72%);
+	-webkit-backdrop-filter: blur(2px);
+	backdrop-filter: blur(2px);
+	color: var(--text);
+	font-size: 12px;
+	letter-spacing: 0.01em;
+	cursor: progress;
+}
+
+.composer-mask-spinner {
+	width: 13px;
+	height: 13px;
+	border-radius: 50%;
+	border: 2px solid rgb(255 255 255 / 16%);
+	border-top-color: var(--accent);
+	animation: composer-spin 0.9s linear infinite;
+}
+
+@keyframes composer-spin {
+	to {
+		transform: rotate(360deg);
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.composer-mask-spinner {
+		animation: none;
+		border-top-color: var(--accent);
+	}
+}
+
 .composer-foot {
 	display: flex;
 	align-items: center;
@@ -782,7 +1036,12 @@ img {
 	transition: background 140ms ease, color 140ms ease, transform 120ms ease;
 }
 
-.send:hover {
+.send:disabled {
+	opacity: 0.4;
+	cursor: not-allowed;
+}
+
+.send:hover:not(:disabled) {
 	background: rgb(255 255 255 / 16%);
 }
 
@@ -942,17 +1201,19 @@ img {
 }
 
 .menu-wrap {
-	position: relative;
+	/* static on purpose: the model menu anchors to .composer-box (position: relative), so it does
+	   not move when the chip's width changes with the reasoning level */
+	position: static;
 	min-width: 0;
 }
 
 .chip {
 	display: flex;
 	align-items: center;
-	gap: 6px;
+	gap: 4px;
 	height: 28px;
 	max-width: 240px;
-	padding: 0 10px;
+	padding: 0 9px;
 	border-radius: 9px;
 	background: rgb(255 255 255 / 4%);
 	color: var(--muted);
@@ -971,6 +1232,48 @@ img {
 	opacity: 0.7;
 }
 
+/* the chevron carries its own 3px inset in the viewBox, so a 4px gap reads as ~7px: pull it back */
+.chip > svg {
+	margin-left: -4px;
+}
+
+/* section label inside a menu, same tone as the sidebar labels */
+.menu-label {
+	padding: 0 0 6px;
+	color: var(--muted);
+	font-size: 11px;
+	letter-spacing: 0.02em;
+}
+
+/* action rows inside the model menu (context compaction) */
+.menu-action {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	width: 100%;
+	padding: 6px 0;
+	border-radius: 6px;
+	font-size: 12px;
+	text-align: left;
+	color: var(--text);
+}
+
+.menu-action:hover:not(:disabled) {
+	background: #2f2f2f;
+}
+
+.menu-action:disabled {
+	opacity: 0.5;
+	cursor: not-allowed;
+}
+
+.menu-action svg {
+	width: 14px;
+	height: 14px;
+	flex: 0 0 auto;
+	color: var(--muted);
+}
+
 .menu {
 	position: absolute;
 	bottom: calc(100% + 8px);
@@ -987,9 +1290,11 @@ img {
 }
 
 .model-menu {
-	left: auto;
-	right: 0;
+	/* aligned with the composer's inner padding, independent of the chip */
+	left: 13px;
+	right: auto;
 	width: 296px;
+	max-width: calc(100vw - 56px);
 	padding: 8px;
 	display: flex;
 	flex-direction: column;
@@ -1002,11 +1307,20 @@ img {
 	flex-direction: column;
 	gap: 1px;
 	min-height: 0;
+	/* a default-width scrollbar would read as extra right padding on every row */
+	scrollbar-width: thin;
+}
+
+.menu-item > .ellipsis,
+.chip > .ellipsis {
+	flex: 1 1 auto;
+	min-width: 0;
 }
 
 .menu-footer {
 	margin-top: 8px;
-	padding: 10px 0 0;
+	/* same 8px inset the model rows use, so Reasoning and Tools start on one vertical line */
+	padding: 10px 8px 0;
 	border-top: 1px solid #333;
 	flex: 0 0 auto;
 }

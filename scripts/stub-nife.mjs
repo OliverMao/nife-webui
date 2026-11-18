@@ -15,3 +15,19 @@ export const SessionManager = {
 		return sessions;
 	},
 };
+
+// Mirrors core/session-manager.ts: an entry becomes the messages it contributes to the context.
+export function sessionEntryToContextMessages(entry) {
+	if (entry.type === "message") return [entry.message];
+	if (entry.type === "compaction") {
+		return [
+			{
+				role: "compactionSummary",
+				summary: entry.summary,
+				tokensBefore: entry.tokensBefore,
+				timestamp: 0,
+			},
+		];
+	}
+	return [];
+}

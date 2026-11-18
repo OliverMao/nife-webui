@@ -28,7 +28,7 @@ const api = {
 		sent.push({ text, opts });
 		// Mirrors agent-session.prompt(): a slash command with expandPromptTemplates runs the
 		// command handler with a command context instead of queueing a user message.
-		if (opts?.expandPromptTemplates && text.startsWith("/")) {
+		if (opts?.expandPromptTemplates && typeof text === "string" && text.startsWith("/")) {
 			const name = text.slice(1).split(/\s+/)[0];
 			const args = text.slice(1 + name.length).trim();
 			const command = commands.get(name);
@@ -47,6 +47,8 @@ const api = {
 	},
 };
 const picked = {};
+const compactCalls = [];
+let compactFail = false;
 
 const message = { role: "user", content: "hello", timestamp: Date.now() };
 const assistant = {
@@ -66,15 +68,19 @@ const assistant = {
 	stopReason: "toolUse",
 	timestamp: Date.now(),
 };
+const branchEntries = [
+	{ type: "message", id: "e0", parentId: null, timestamp: "t", message: { role: "system", content: "you are a helpful agent", timestamp: 0 } },
+	{ type: "message", id: "e1", parentId: null, timestamp: "t", message },
+	{ type: "message", id: "e2", parentId: "e1", timestamp: "t", message: assistant },
+	{ type: "message", id: "e2", parentId: null, timestamp: "t", message: { role: "custom", customType: "hidden", content: "x", display: false, timestamp: 0 } },
+];
+// swappable so a test can put a compaction entry in front
+let contextEntries = branchEntries;
 const sessionManager = {
 	getSessionId: () => "sess-1",
 	getSessionFile: () => "/fake/current.jsonl",
-	getBranch: () => [
-		{ type: "message", id: "e0", parentId: null, timestamp: "t", message: { role: "system", content: "you are a helpful agent", timestamp: 0 } },
-		{ type: "message", id: "e1", parentId: null, timestamp: "t", message },
-		{ type: "message", id: "e2", parentId: "e1", timestamp: "t", message: assistant },
-		{ type: "message", id: "e2", parentId: null, timestamp: "t", message: { role: "custom", customType: "hidden", content: "x", display: false, timestamp: 0 } },
-	],
+	getBranch: () => branchEntries,
+	buildContextEntries: () => contextEntries,
 };
 const ui = {
 	confirm: async (title, msg) => {
@@ -128,6 +134,11 @@ const ctx = {
 				: undefined,
 	},
 	thinkingLevel: "off",
+	compact(options) {
+		compactCalls.push(options);
+		if (compactFail) options?.onError?.(new Error("no tokens"));
+		else options?.onComplete?.({});
+	},
 	isIdle: () => true,
 	getContextUsage: () => ({ tokens: 48200, contextWindow: 200000, percent: 24.1 }),
 	abort: () => notes.push("abort"),
@@ -187,6 +198,16 @@ assert.deepEqual(state.subagents, []);
 assert.equal(state.model.id, "test-model");
 assert.equal(state.usage.percent, 24.1);
 
+// compaction-aware transcript: the summary replaces the messages it squeezed out
+contextEntries = [
+	{ type: "compaction", id: "c1", parentId: null, timestamp: "t", summary: "earlier work", tokensBefore: 1234, firstKeptEntryId: "e4" },
+	{ type: "message", id: "e4", parentId: "c1", timestamp: "t", message: { role: "user", content: "after the summary", timestamp: 1 } },
+];
+const compactedState = await (await fetch(`${base}api/state?t=${token}`)).json();
+assert.deepEqual(compactedState.messages.map((entry) => entry.role), ["compactionSummary", "user"]);
+assert.equal(compactedState.messages[0].summary, "earlier work");
+contextEntries = branchEntries;
+
 
 // auth
 assert.equal((await fetch(`${base}api/state?t=nope`)).status, 401);
@@ -199,6 +220,21 @@ assert.equal((await fetch(`${base}api/prompt?t=${token}`, {
 	body: JSON.stringify({ text: " hi " }),
 })).status, 200);
 assert.deepEqual(sent[0], { text: "hi", opts: undefined });
+
+// compaction: the page waits for the outcome of the summarizing call
+const compactPost = (body) =>
+	fetch(`${base}api/compact?t=${token}`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body ?? {}),
+	});
+assert.equal((await compactPost({ instructions: "keep the API notes" })).status, 200);
+assert.equal(compactCalls.at(-1).customInstructions, "keep the API notes");
+compactFail = true;
+const failedCompact = await compactPost();
+assert.equal(failedCompact.status, 409);
+assert.equal(await failedCompact.text(), "no tokens");
+compactFail = false;
 
 // images are forwarded as ImageContent blocks after the text block
 const png = Buffer.from("not really a png").toString("base64");
@@ -392,6 +428,17 @@ await fetch(`${base}api/dialog?t=${token}`, {
 });
 assert.equal(await confirmPromise, false);
 assert.equal(notes.some((n) => n.startsWith("tui-confirm")), false, "web answer must not fall through to tui");
+
+// compaction events are forwarded too, so threshold compaction is visible without a click
+for (const fn of handlers.get("session_compact") ?? []) {
+	await fn({ type: "session_compact", reason: "threshold" }, ctx);
+}
+let compactionEvent;
+for (let attempt = 0; attempt < 10 && !compactionEvent; attempt += 1) {
+	const event = await nextEvent();
+	if (event?.type === "compaction_end") compactionEvent = event;
+}
+assert.deepEqual(compactionEvent, { type: "compaction_end", ok: true, reason: "threshold" });
 
 // no browser attached -> falls back to terminal dialog
 reader.cancel();

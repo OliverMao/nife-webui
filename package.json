@@ -1,6 +1,6 @@
 {
   "name": "nife-webui",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "private": true,
   "description": "Browser UI attached to a running nife CLI session (same session, same stream, same dialogs)",
   "type": "module",
@@ -20,7 +20,7 @@
     "build": "vite build",
     "dev": "vite",
     "prepack": "npm run build",
-    "smoke": "node scripts/markdown-test.mjs && node scripts/files-test.mjs && node scripts/paste-test.mjs && node scripts/smoke.mjs"
+    "smoke": "node scripts/markdown-test.mjs && node scripts/files-test.mjs && node scripts/paste-test.mjs && node scripts/queue-test.mjs && node scripts/render-test.mjs && node scripts/smoke.mjs"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^6.0.11",

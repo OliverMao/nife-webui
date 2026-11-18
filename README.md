@@ -81,6 +81,18 @@ From the browser:
   (`Delete` / `Cancel`), then the row is removed and every open tab refreshes via the
   `sessions_changed` event. The bridge deletes with the `trash` CLI when it is installed and falls
   back to `unlink`, mirroring the TUI selector, and refuses the session that is currently running
+- sending while a turn is running **queues** the task instead of interrupting it: a strip 20px
+  narrower than the composer sits flush on its top edge, listing FIFO items with a text preview, a
+  `2 images · 1 file` counter, click-to-edit back into the composer and `×` to drop. Limits are 20
+  items / 40MB of queued images. Exactly one item is sent per finished turn (driven by
+  `agent_settled`, plus `compaction_end` because compaction is not an agent turn), and the queue
+  pauses - with a `Resume` button - on `/new`, `/resume`, and on any aborted turn: the bridge
+  forwards `aborted` from `agent_settled`, so Escape in the terminal pauses the page's queue too,
+  and Stop sets the flag before it even asks the bridge, closing the race where the settle event
+  would drain the queue first. Pausing stops the *automatic* continuation only: sending while the
+  session is idle and the queue is paused runs that message immediately and resumes the queue, so
+  the parked items follow that turn. `Resume` continues without a new message, `Clear` drops them; failures stay at the head with a
+  `Retry` action instead of silently disappearing
 - `+` starts a fresh session (`/new`)
 - tool calls collapse into one-line rows (`Ran npm test`), expand for arguments and output,
   failed rows are marked in red
@@ -89,6 +101,13 @@ From the browser:
   the overlay, and resizing back to a wide window clears the open state
 - model chip in the composer lists available/scoped models with a filter, `setModel` runs in the CLI
   session so the terminal switches too; models without credentials are reported, not switched
+- `Compact context` sits in its own divided `Tools` section at the bottom of the model menu (below
+  the Reasoning slider, with the current context percentage) and summarizes the context: `POST /api/compact` calls `ctx.compact()` and waits for the
+  summarization call to finish, so the row shows `Compacting…` and reports the failure text when
+  it fails. It is disabled while a turn streams (compaction aborts it).
+  `session_before_compact` / `session_compact` / `session_compact_failed` are forwarded as
+  `compaction_start` / `compaction_end`, so threshold and overflow compaction refresh the
+  transcript and the context ring without a click
 - reasoning slider lives inside the model menu above the model list
   (visuals follow [dsh-codex-effort-slider](https://github.com/Microqian2th/dsh-codex-effort-slider)):
   blue -> violet -> deep violet fill, white knob, level ticks, and from one third upward an energy
@@ -99,13 +118,17 @@ From the browser:
   the height. Scrolling wins over incoming content: a `scroll` that moves the viewport up (wheel,
   drag, touch, keyboard) clears the follow flag immediately, `wheel` with `deltaY < 0` clears it even
   before the scroll lands, and it only comes back within 64px of the bottom. While detached, a
-  `Latest` pill floats above the composer and jumps back down on click; your own prompt, session
-  load and session switch always re-stick
+  `Latest` pill floats above the composer and jumps back down on click. Your own prompt, session
+  load and session switch always re-stick, and a new user message - typed here, sent from the
+  terminal, or drained from the queue - forces the view down, so a queued task starting is never
+  missed
 - thinking is collapsed by default, live and committed: the streaming block is a closed `Thinking`
   summary with a spinner, and opening it shows the same 132px viewport that eases to the newest
   line with a bottom fade
 - the slider only offers levels the current model supports, and the label is grey for `off`,
   violet at higher efforts; `prefers-reduced-motion` disables the sweep and stardust
+- the level label in the composer chip has a fixed `7ch` box (`minimal` is the widest), so dragging
+  the slider cannot resize the chip - and with it the menu anchored to the chip's right edge
 - Enter sends, Shift+Enter adds a line, the round button stops a run mid-flight
 - composer follows the DSH/Codex pattern: one large rounded box with the controls on a row inside
   it; the dim stats line (`msgs · tools · context x/y (z%) · in/out · cache · cost`) sits inside
@@ -181,7 +204,9 @@ page reloads the transcript of the newly active session. That is why the bridge 
 - `extensions/webui.ts` starts a `node:http` server on `127.0.0.1` when `/webui` runs.
 - Events come from the extension API: `message_start`, `message_update` (deltas only),
   `message_end`, `agent_start`, `agent_settled`, `session_info_changed`, `tool_execution_*`.
-- Initial transcript: `ctx.sessionManager.getBranch()`.
+- Initial transcript: `ctx.sessionManager.buildContextEntries()` projected through
+  `sessionEntryToContextMessages()`, i.e. the same compaction-aware view the TUI renders, so a
+  summary replaces the messages it squeezed out and shows up as a `Context compacted` row.
 - Sending: `pi.sendUserMessage()`; while streaming it is delivered as `steer`.
 - Drops: `POST /api/upload` writes the bytes to the OS temp dir and returns the path, which the page
   inserts as text. The same token and `Origin` checks guard it, and cleanup is described above.
@@ -216,6 +241,8 @@ No build step for the extension itself: plain `node:http` + SSE, no runtime depe
   text paste is unaffected.
 - Dropped files travel as text, so the terminal still shows the `[attached] <path>` lines the web
   UI hides behind chips: nife has no file content block to carry them any other way.
+- The task queue lives in the page, not on the bridge: a reload or a closed tab drops it, and there
+  is no background draining (a paused queue stays paused until you resume it in that tab).
 - Dropped files are temporary: the path in the prompt only resolves while that nife process is
   alive, so a session resumed later sees a dead path.
 - A dropped PDF (or any binary) reaches the model as a path, not as content: nife's `read` treats
@@ -225,7 +252,10 @@ No build step for the extension itself: plain `node:http` + SSE, no runtime depe
 - `ctx.ui.custom()`, `setWidget`, `setFooter`, `setEditorComponent` receive TUI render functions
   and cannot render in a browser. Extensions that draw their own TUI screens (plan mode style)
   stay terminal-only.
-- Built-in TUI commands (`/settings`, `/hotkeys`, ...) are not available through the web.
+- Slash commands are not sent as commands: `/model`, `/tree`, `/settings`, `/compact`, `/export`,
+  `/hotkeys` and friends are handled by interactive-mode, which an extension cannot call, and the
+  page sends text literally. Model, thinking level, compaction, new and resume have their own
+  controls.
 - Dialog timeouts (`opts.timeout`) are not forwarded; a browser dialog waits until answered.
 - If a browser tab closes while a dialog is open, the terminal dialog takes over on the next turn.
 - Markdown is rendered as plain pre-wrapped text. No syntax highlighting yet.
@@ -235,8 +265,13 @@ No build step for the extension itself: plain `node:http` + SSE, no runtime depe
 ## Dev checks
 
 ```bash
-node scripts/smoke.mjs     # fake ExtensionAPI + real HTTP/SSE server, no model needed
+npm run smoke              # markdown/files/paste unit tests, an SSR render of App.vue,
+                           # then the HTTP/SSE bridge against a fake ExtensionAPI
 ```
+
+`scripts/render-test.mjs` builds the real `App.vue` once for SSR and renders it with the initial
+state. It exists because a template expression on a possibly-null computed blanks the page while
+every HTTP test still passes: the palette's `slashMatches.length` did exactly that.
 
 `tsconfig.check.json` type-checks the extension against a nife source checkout; the `paths`
 entry points at `/root/nife`, edit it for your layout:

@@ -18,7 +18,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { getAgentDir, SessionManager } from "nife-coding-agent";
+import { getAgentDir, SessionManager, sessionEntryToContextMessages } from "nife-coding-agent";
 import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "nife-coding-agent";
 
 /** Whatever ctx.model is; the package does not export the model type itself. */
@@ -307,10 +307,11 @@ function isHiddenMessage(message: { role: string; display?: boolean }): boolean 
 
 function snapshot(b: Bridge): unknown {
 	const ctx = b.ctx;
+	// buildContextEntries() is what the TUI renders: it starts at the newest compaction, so a
+	// summary replaces the messages it squeezed out instead of showing the whole old branch.
 	const messages = ctx.sessionManager
-		.getBranch()
-		.filter((entry) => entry.type === "message")
-		.map((entry) => entry.message)
+		.buildContextEntries()
+		.flatMap((entry) => sessionEntryToContextMessages(entry))
 		.filter((message) => !isHiddenMessage(message as { role: string; display?: boolean }));
 	const model = ctx.model;
 	const stats = {
@@ -511,6 +512,35 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		} catch (error) {
 			return send(res, 500, error instanceof Error ? error.message : "upload failed");
 		}
+	}
+
+	if (req.method === "POST" && path === "/api/compact") {
+		let body: Record<string, unknown>;
+		try {
+			body = await readJson(req);
+		} catch {
+			body = {};
+		}
+		const instructions = typeof body.instructions === "string" ? body.instructions.trim() : "";
+		// compact() is fire-and-forget by design, so wrap its callbacks in a promise the page can wait on.
+		const outcome = await new Promise<{ ok: boolean; message: string }>((done) => {
+			const timer = setTimeout(() => done({ ok: false, message: "compaction timed out" }), 300_000);
+			const settle = (result: { ok: boolean; message: string }) => {
+				clearTimeout(timer);
+				done(result);
+			};
+			try {
+				b.ctx.compact({
+					customInstructions: instructions || undefined,
+					onComplete: () => settle({ ok: true, message: "ok" }),
+					onError: (error) => settle({ ok: false, message: error.message }),
+				});
+			} catch (error) {
+				settle({ ok: false, message: error instanceof Error ? error.message : "compaction failed" });
+			}
+		});
+		if (!outcome.ok) return send(res, 409, outcome.message);
+		return send(res, 200, "ok");
 	}
 
 	if (req.method === "POST" && path === "/api/abort") {
@@ -777,8 +807,20 @@ export default function webui(api: ExtensionAPI) {
 	api.on("agent_start", () => {
 		forward({ type: "agent_start" });
 	});
-	api.on("agent_settled", () => {
-		forward({ type: "agent_settled" });
+	api.on("agent_settled", (event) => {
+		// `aborted` matters to the page: an interrupted turn is a deliberate stop, and the UI queue
+		// must hold the next task instead of starting it.
+		forward({ type: "agent_settled", aborted: Boolean(event?.aborted) });
+	});
+	// Threshold and overflow compaction happen without a click; the page needs to know either way.
+	api.on("session_before_compact", (event) => {
+		forward({ type: "compaction_start", reason: event.reason });
+	});
+	api.on("session_compact", (event) => {
+		forward({ type: "compaction_end", ok: true, reason: event.reason });
+	});
+	api.on("session_compact_failed", (event) => {
+		forward({ type: "compaction_end", ok: false, reason: event.reason, message: event.errorMessage });
 	});
 	api.on("session_info_changed", (event) => {
 		forward({ type: "session_info_changed", name: event.name });

@@ -1,13 +1,14 @@
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, triggerRef } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, triggerRef, watch } from "vue";
 import EffortSlider from "./EffortSlider.vue";
 import LiveMessage from "./LiveMessage.vue";
 import MessageItem from "./MessageItem.vue";
 import { prepareImage } from "./images.js";
 import FileIcon from "./FileIcon.vue";
-import { attachedLine, formatBytes } from "./files.js";
+import { formatBytes } from "./files.js";
 import { blocksOf } from "./message-utils.js";
 import { IMAGE_MAX_COUNT, expandPastes, imageFiles, imageMimeType, imageProblem, pasteMarker, readClipboard } from "./paste.js";
+import { metaOf, previewOf, promptTextOf, queueProblem } from "./queue.js";
 
 const token = new URLSearchParams(location.search).get("t") ?? "";
 const api = (path) => `/api/${path}?t=${encodeURIComponent(token)}`;
@@ -26,6 +27,7 @@ const transcript = ref(null);
 const transcriptBody = ref(null);
 let resizeObserver;
 const inputEl = ref(null);
+const composerBox = ref(null);
 const sidebarOpen = ref(false);
 const collapsed = ref(localStorage.getItem("nife-webui.collapsed") === "1");
 const narrow = ref(false);
@@ -33,18 +35,46 @@ const sessions = ref([]);
 const currentFile = ref("");
 // Session awaiting delete confirmation in the sidebar.
 const pendingDelete = ref("");
+// Manual context compaction in flight (the bridge also reports automatic ones).
+const compacting = ref(false);
+// UI task queue: sent one at a time, only after the previous turn settled. Paused on session
+// switches and on Stop, because those are deliberate interruptions.
+const queue = ref([]);
+const queuePaused = ref(false);
+let queueSeq = 0;
+const draining = ref(false);
+// Set between a successful POST and the agent_start/agent_settled that follows it, so a second
+// send cannot slip out while the just-started turn is not visible as streaming yet.
+let turnPending = false;
 const menu = ref(null);
 const modelQuery = ref("");
 const thinkingDraft = ref(null);
 const subagents = ref([]);
 const notice = ref("");
+const noticeStyle = ref({});
+// the bubble animation and the timer that unmounts it share one duration
+const NOTICE_MS = 3000;
 let noticeTimer;
 
+/**
+ * Bubble that surfaces from the middle of the composer box: measure the box so the rise starts
+ * where the user is looking and ends above it, whatever the current composer height is.
+ */
 function showNotice(message) {
 	notice.value = message;
+	const rect = composerBox.value?.getBoundingClientRect();
+	noticeStyle.value = rect
+		? {
+				// horizontally and vertically centred on the input box itself, not the viewport
+				left: `${Math.round(rect.left + rect.width / 2)}px`,
+				bottom: `${Math.round(window.innerHeight - (rect.top + rect.height / 2))}px`,
+				"--rise": `-${Math.round(rect.height / 2 + 22)}px`,
+			}
+		: {};
 	clearTimeout(noticeTimer);
-	noticeTimer = setTimeout(() => (notice.value = ""), 5000);
+	noticeTimer = setTimeout(() => (notice.value = ""), NOTICE_MS);
 }
+
 
 let source;
 let frame = 0;
@@ -150,6 +180,48 @@ const contextPercent = computed(() => {
 
 
 
+// The composer ring. While compaction runs it creeps toward full with a glow (the real number is
+// meaningless mid-summarization), then drops back to the measured percentage when it finishes, and
+// the CSS transition animates that decrease.
+const sweepPercent = ref(0);
+let sweepFrame = 0;
+
+/** Repeating fill while compaction runs: rise -> full -> start over. The bridge decides the end. */
+const SWEEP_PERIOD = 2800;
+const SWEEP_RISE = 0.82; // rest of the cycle holds at 100%
+
+function startSweep() {
+	const base = contextPercent.value ?? 0;
+	cancelAnimationFrame(sweepFrame);
+	const startedAt = performance.now();
+	const step = (now) => {
+		if (!compacting.value) {
+			sweepFrame = 0;
+			return;
+		}
+		const elapsed = now - startedAt;
+		const cycle = Math.floor(elapsed / SWEEP_PERIOD);
+		const phase = (elapsed % SWEEP_PERIOD) / SWEEP_PERIOD;
+		// first cycle grows from the measured usage, later ones from empty
+		const floor = cycle === 0 ? base : 0;
+		const t = Math.min(phase / SWEEP_RISE, 1);
+		sweepPercent.value = floor + (100 - floor) * (1 - (1 - t) ** 3);
+		sweepFrame = requestAnimationFrame(step);
+	};
+	sweepFrame = requestAnimationFrame(step);
+}
+
+watch(compacting, (running) => {
+	if (running) {
+		startSweep();
+		return;
+	}
+	cancelAnimationFrame(sweepFrame);
+	sweepFrame = 0;
+});
+
+const progressPercent = computed(() => (compacting.value ? sweepPercent.value : (contextPercent.value ?? 0)));
+
 const usageLine = computed(() => {
 	const stats = state.value.stats;
 	const usage = state.value.usage;
@@ -214,9 +286,16 @@ function onTranscriptTouch() {
 	if (!nearBottom()) stick.value = false;
 }
 
-/** Scroll to the newest message while sticking; a user who scrolled up keeps their position. */
+/**
+ * Scroll to the newest message while sticking; a user who scrolled up keeps their position.
+ * Batched into one rAF: a send can change the textarea height and add a queue row in the same
+ * frame, and scrolling per change is what made the transcript jump.
+ */
+let followFrame = 0;
 function follow() {
-	nextTick(() => {
+	if (followFrame) return;
+	followFrame = requestAnimationFrame(() => {
+		followFrame = 0;
 		const el = transcript.value;
 		if (!el || !stick.value) return;
 		el.scrollTop = el.scrollHeight;
@@ -227,6 +306,35 @@ function follow() {
 function scrollToBottom() {
 	stick.value = true;
 	follow();
+}
+
+/** Enter sends; Shift+Enter breaks the line. Composition must finish first (IME picks with Enter). */
+function onComposerKeydown(event) {
+	if (event.key !== "Enter" || event.shiftKey || event.altKey || event.ctrlKey || event.metaKey) return;
+	if (event.isComposing) return;
+	event.preventDefault();
+	send();
+}
+
+/** Compact the session context; the bridge resolves with the outcome of the compaction model call. */
+async function compactContext() {
+	if (compacting.value) return;
+	// the ring is the progress indicator from here on, so the menu has no job left
+	menu.value = null;
+	compacting.value = true;
+	const result = await postDetailed("compact", {});
+	if (!result.ok) {
+		compacting.value = false;
+		// Every failure is reported: the ring drops back within a frame when nothing changed, so a
+		// silent "Already compacted" would look like a dead button.
+		showNotice((result.message || "compaction failed").replace(/^error:\s*/i, ""));
+		return;
+	}
+	// no toast on success: the transcript already gains its "Context compacted" row
+	await loadState();
+	compacting.value = false;
+	queuePaused.value = false;
+	void drain();
 }
 
 /** Coalesces streaming deltas into one DOM update per animation frame. */
@@ -281,16 +389,26 @@ function handle(payload) {
 			pendingText = "";
 			pendingThinking = "";
 			push(payload.message);
-			follow();
+			// A user message is your own action - typed here, sent from the terminal, or drained from
+			// the queue - so it brings the view down even if you were reading further up. Assistant
+			// messages only follow while the view is already at the bottom.
+			if (payload.message?.role === "user") scrollToBottom();
+			else follow();
 			break;
 		case "agent_start":
 			streaming.value = true;
 			break;
 		case "agent_settled":
 			streaming.value = false;
+			turnPending = false;
 			// an aborted turn may end without message_end; drop an empty placeholder
 			if (live.value && !live.value.text && !live.value.thinking) live.value = null;
+			// The bridge reports every abort, including Escape in the terminal: a stopped turn must
+			// not be followed by the next queued task without the user asking for it.
+			if (payload.aborted) queuePaused.value = true;
+			clearQueuedErrors();
 			refreshMeta();
+			void drain();
 			break;
 		case "session_info_changed":
 			state.value.name = payload.name;
@@ -307,11 +425,35 @@ function handle(payload) {
 			break;
 		case "session_start":
 		case "session_switch":
+			// a queued task belongs to the conversation it was typed in
+			if (queue.value.length > 0) {
+				queuePaused.value = true;
+				showNotice("queue paused after the session changed");
+			}
 			loadState();
 			loadSessions();
 			break;
 		case "sessions_changed":
 			loadSessions();
+			break;
+		case "compaction_start":
+			compacting.value = true;
+			break;
+		case "compaction_end":
+			if (!payload.ok) {
+				compacting.value = false;
+				break;
+			}
+			// Compacting is an explicit "keep going": continue the queue without waiting for a Resume
+			// click. Refresh before releasing the sweep so the ring animates straight to the new
+			// percentage instead of dropping to the stale one first.
+			queuePaused.value = false;
+			loadState()
+				.catch(() => {})
+				.finally(() => {
+					compacting.value = false;
+					void drain();
+				});
 			break;
 		case "dialog":
 			dialog.value = payload;
@@ -342,6 +484,7 @@ async function loadState() {
 	messages.value = loaded.messages ?? [];
 	triggerRef(messages);
 	streaming.value = Boolean(loaded.streaming);
+	turnPending = false;
 	scrollToBottom();
 }
 
@@ -404,40 +547,142 @@ const dragging = ref(false);
 let imageSeq = 0;
 let fileSeq = 0;
 
+function clearComposer() {
+	text.value = "";
+	attachments.value = [];
+	files.value = [];
+	pastes.clear();
+	// resize() reads the textarea's scrollHeight, so it has to run after Vue wrote the empty value;
+	// measuring in this tick kept the old multi-line height and made the composer shrink later.
+	nextTick(resize);
+	scrollToBottom();
+	inputEl.value?.focus();
+}
+
+/** POSTs one item; resolves with the bridge's answer and marks the turn as in flight on success. */
+async function dispatch(item) {
+	draining.value = true;
+	const result = await postDetailed("prompt", { text: promptTextOf(item), images: item.images });
+	draining.value = false;
+	if (result.ok) turnPending = true;
+	return result;
+}
+
 async function send() {
-	const raw = text.value;
-	const value = expandPastes(raw, pastes).trim();
-	const pendingImages = attachments.value;
-	const pendingFiles = files.value;
-	const images = pendingImages.map(({ mimeType, data }) => ({ mimeType, data }));
-	if (pendingFiles.some((file) => !file.path)) {
+	if (compacting.value) return;
+	const value = expandPastes(text.value, pastes).trim();
+	const images = attachments.value.map(({ name, mimeType, data }) => ({ name, mimeType, data }));
+	const queuedFiles = files.value.map(({ name, path, size }) => ({ name, path, size }));
+	if (files.value.some((file) => !file.path)) {
 		showNotice("still uploading, try again in a moment");
 		return;
 	}
-	// nife has no file block, so dropped files ride along as marker lines the agent can read.
-	const body = [value, ...pendingFiles.map((file) => attachedLine(file))].filter(Boolean).join("\n\n");
-	if (!body && images.length === 0) return;
+	if (!value && images.length === 0 && queuedFiles.length === 0) return;
 	const problem = imageProblem(images);
 	if (problem) {
 		showNotice(problem);
 		return;
 	}
-	text.value = "";
-	attachments.value = [];
-	files.value = [];
-	resize();
-	scrollToBottom();
-	inputEl.value?.focus();
-	const result = await postDetailed("prompt", { text: body, images });
-	if (!result.ok) {
-		text.value = raw;
-		attachments.value = pendingImages;
-		files.value = pendingFiles;
-		resize();
-		showNotice(result.message || "could not send");
+	queueSeq += 1;
+	const item = { id: queueSeq, text: value, images, files: queuedFiles, error: "" };
+	const blocked = queueProblem(queue.value, item);
+	if (blocked) {
+		showNotice(blocked);
 		return;
 	}
-	pastes.clear();
+	clearComposer();
+	// Paused means "do not continue the queued tasks", not "swallow what I type next": an explicit
+	// send while the session is idle starts now and resumes the queue, so the parked items follow
+	// this turn instead of waiting for a Resume click.
+	if (queuePaused.value && !streaming.value && !compacting.value) {
+		const result = await dispatch(item);
+		if (result.ok) {
+			queuePaused.value = false;
+			return;
+		}
+		const message = result.message || "could not send";
+		queue.value = [{ ...item, error: message }, ...queue.value];
+		showNotice(message);
+		return;
+	}
+	queue.value = [...queue.value, item];
+	void drain();
+}
+
+/** Sends the head of the queue when the session is idle; called from settle/compaction events. */
+async function drain() {
+	if (draining.value || queuePaused.value || streaming.value || compacting.value) return;
+	if (turnPending) {
+		// The bridge is authoritative here: if the turn already ended and its settle event was
+		// missed (reconnect, reload), ask instead of keeping the queue wedged.
+		const response = await fetch(api("state"));
+		if (!response.ok) return;
+		const loaded = await response.json();
+		if (loaded.streaming) return;
+		turnPending = false;
+	}
+	const head = queue.value[0];
+	if (!head) return;
+	const result = await dispatch(head);
+	if (!result.ok) {
+		// keep it at the head so nothing is lost, and stop: retrying every turn would spam the notice
+		const message = result.message || "could not send";
+		queue.value = queue.value.map((item, index) => (index === 0 ? { ...item, error: message } : item));
+		showNotice(message);
+		return;
+	}
+	queue.value = queue.value.slice(1);
+}
+
+/** A busy/aborted bridge is a temporary condition: clear stale failures so Retry stays reachable. */
+function clearQueuedErrors() {
+	if (!queue.value.some((item) => item.error)) return;
+	queue.value = queue.value.map((item) => (item.error ? { ...item, error: "" } : item));
+}
+
+function resumeQueue() {
+	queuePaused.value = false;
+	if (queue.value[0]?.error) {
+		queue.value = queue.value.map((item, index) => (index === 0 ? { ...item, error: "" } : item));
+	}
+	void drain();
+}
+
+function removeQueued(index) {
+	queue.value = queue.value.filter((_, position) => position !== index);
+	// an empty queue has nothing to hold, so do not leave the next task paused
+	if (queue.value.length === 0) queuePaused.value = false;
+}
+
+function clearQueue() {
+	queue.value = [];
+	queuePaused.value = false;
+}
+
+/** Pull a queued item back into the composer (it leaves the queue). */
+function editQueued(index) {
+	const item = queue.value[index];
+	if (!item) return;
+	removeQueued(index);
+	text.value = item.text;
+	attachments.value = item.images.map((image, position) => {
+		imageSeq += 1;
+		return {
+			id: imageSeq,
+			name: image.name || `image ${position + 1}`,
+			mimeType: image.mimeType,
+			data: image.data,
+			url: `data:${image.mimeType};base64,${image.data}`,
+		};
+	});
+	files.value = item.files.map((file) => {
+		fileSeq += 1;
+		return { id: fileSeq, name: file.name, size: file.size, progress: 1, path: file.path };
+	});
+	nextTick(() => {
+		inputEl.value?.focus();
+		resize();
+	});
 }
 
 async function attachFiles(incoming) {
@@ -519,6 +764,12 @@ function removeFile(id) {
 
 /** Files dropped anywhere in the page: images attach inline, everything else becomes a path. */
 function onDrop(event) {
+	if (compacting.value) {
+		// the textarea is disabled mid-compaction; dropping would desync the queue
+		event.preventDefault();
+		dragging.value = false;
+		return;
+	}
 	const files = [...(event.dataTransfer?.files ?? [])];
 	if (files.length === 0) return;
 	event.preventDefault();
@@ -562,6 +813,7 @@ function insertAtCursor(snippet) {
 }
 
 function onPaste(event) {
+	if (compacting.value) return;
 	const files = imageFiles([...(event.clipboardData?.items ?? [])])
 		.map((item) => item.getAsFile())
 		.filter(Boolean);
@@ -581,6 +833,11 @@ function onPaste(event) {
 }
 
 async function abort() {
+	// Pause before the request: abort() settles the turn almost immediately, and agent_settled would
+	// drain the queue before we ever saw the response. Always pause, so a message typed right after
+	// Stop waits instead of starting a new turn the moment the abort lands. No toast: the queue
+	// strip already shows the paused state.
+	queuePaused.value = true;
 	await post("abort");
 }
 
@@ -700,6 +957,7 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
+	cancelAnimationFrame(sweepFrame);
 	resizeObserver?.disconnect();
 	window.removeEventListener("dragover", onDragOver);
 	window.removeEventListener("dragleave", onDragLeave);
@@ -803,9 +1061,6 @@ onBeforeUnmount(() => {
 
 					<LiveMessage v-if="live" :live="live" />
 				</div>
-			</main>
-
-			<form class="composer" @submit.prevent="send">
 				<button
 					v-if="!stick"
 					type="button"
@@ -816,9 +1071,59 @@ onBeforeUnmount(() => {
 					<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3.5v9M4 8.5l4 4 4-4" /></svg>
 					Latest
 				</button>
-				<p v-if="notice" class="notice">{{ notice }}</p>
-				<div class="composer-box" :class="{ dragging }">
-					<svg class="box-progress" aria-hidden="true" :title="contextPercent !== null ? `context ${Math.round(contextPercent)}%` : undefined">
+			</main>
+
+			<form class="composer" @submit.prevent="send">
+				<p v-if="notice" class="composer-notice" :style="noticeStyle">{{ notice }}</p>
+
+				<!-- queue strip: narrower than the composer box and flush against its top edge -->
+				<div v-if="queue.length > 0 || queuePaused" class="queue" :class="{ paused: queuePaused }">
+					<div class="queue-head">
+						<span class="queue-title">
+							{{ queuePaused ? "Paused" : "Queue" }} · {{ queue.length }}
+						</span>
+						<button
+							v-if="queuePaused || queue[0]?.error"
+							type="button"
+							class="queue-action resume"
+							@click="resumeQueue"
+						>
+							{{ queuePaused ? "Resume" : "Retry" }}
+						</button>
+						<button type="button" class="queue-action" @click="clearQueue">Clear</button>
+					</div>
+					<div v-if="queue.length > 0" class="queue-list">
+						<div v-for="(item, index) in queue" :key="item.id" class="queue-item">
+							<span class="queue-index">{{ index + 1 }}</span>
+							<button
+								type="button"
+								class="queue-text ellipsis"
+								:title="`Edit: ${previewOf(item.text) || metaOf(item) || 'queued item'}`"
+								@click="editQueued(index)"
+							>
+								{{ previewOf(item.text) || metaOf(item) || "empty" }}
+							</button>
+							<span v-if="item.error" class="queue-error" :title="item.error">failed</span>
+							<span v-else-if="draining && index === 0 && !queuePaused" class="queue-state">sending…</span>
+							<span v-else-if="metaOf(item)" class="queue-meta">{{ metaOf(item) }}</span>
+							<button
+								type="button"
+								class="queue-remove"
+								title="Remove from queue"
+								@click="removeQueued(index)"
+							>
+								×
+							</button>
+						</div>
+					</div>
+				</div>
+				<div ref="composerBox" class="composer-box" :class="{ dragging }">
+					<svg
+						class="box-progress"
+						:class="{ compacting }"
+						aria-hidden="true"
+						:title="compacting ? 'compacting context' : contextPercent !== null ? `context ${Math.round(contextPercent)}%` : undefined"
+					>
 						<rect class="progress-track" x="0" y="0" width="100%" height="100%" rx="19" pathLength="100" />
 						<rect
 							class="progress-value"
@@ -828,7 +1133,7 @@ onBeforeUnmount(() => {
 							height="100%"
 							rx="19"
 							pathLength="100"
-							:stroke-dasharray="`${contextPercent ?? 0} 100`"
+							:stroke-dasharray="`${progressPercent} 100`"
 						/>
 					</svg>
 					<div v-if="attachments.length > 0 || files.length > 0" class="attachments">
@@ -857,9 +1162,10 @@ onBeforeUnmount(() => {
 						v-model="text"
 						rows="1"
 						placeholder="Describe a task, or ask a question"
+						:disabled="compacting"
 						@input="resize"
 						@paste="onPaste"
-						@keydown.enter.exact.prevent="send"
+						@keydown="onComposerKeydown"
 					></textarea>
 					<div class="composer-foot">
 						<div class="foot-left">
@@ -899,6 +1205,25 @@ onBeforeUnmount(() => {
 									<div v-if="thinkingLevels.length > 1" class="menu-footer">
 										<EffortSlider :levels="thinkingLevels" :index="thinkingValue" @change="onThinkingChange" />
 									</div>
+									<!-- context tools keep their own section: they are actions, not reasoning settings -->
+									<div class="menu-footer">
+										<div class="menu-label">Tools</div>
+										<button
+											type="button"
+											class="menu-action"
+											:disabled="compacting || streaming"
+											:title="streaming ? 'Stop the current turn first' : 'Summarize the context so the conversation can continue'"
+											@click.stop="compactContext"
+										>
+											<svg viewBox="0 0 16 16" aria-hidden="true">
+												<path d="M3.5 8h9" />
+												<path d="M5.2 3.9L8 6.4l2.8-2.5" />
+												<path d="M5.2 12.1L8 9.6l2.8 2.5" />
+											</svg>
+											<span class="ellipsis">{{ compacting ? "Compacting…" : "Compact context" }}</span>
+											<span v-if="contextPercent !== null" class="menu-hint">{{ Math.round(contextPercent) }}%</span>
+										</button>
+									</div>
 								</div>
 							</div>
 
@@ -910,7 +1235,8 @@ onBeforeUnmount(() => {
 						<button
 							type="button"
 							class="send"
-							:class="{ stop: streaming, ready: (text.trim().length > 0 || attachments.length > 0 || files.length > 0) && !streaming }"
+							:disabled="compacting"
+							:class="{ stop: streaming, ready: (text.trim().length > 0 || attachments.length > 0 || files.length > 0) && !streaming && !compacting }"
 							:title="streaming ? 'Stop' : 'Send'"
 							@click="streaming ? abort() : send()"
 						>
@@ -921,6 +1247,11 @@ onBeforeUnmount(() => {
 								<path d="M8 12V4M4 8l4-4 4 4" />
 							</svg>
 						</button>
+					</div>
+					<!-- compaction owns the session: dim the box and say why it does not take input -->
+					<div v-if="compacting" class="composer-mask">
+						<span class="composer-mask-spinner"></span>
+						<span>Compacting context…</span>
 					</div>
 				</div>
 			</form>
