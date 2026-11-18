@@ -35,6 +35,8 @@ scripts/smoke.mjs     fake ExtensionAPI + real HTTP server, no model needed
 
 ```bash
 nife install https://github.com/OliverMao/nife-webui   # persistent, writes ~/.nife/agent/settings.json
+nife install https://github.com/OliverMao/nife-webui@v0.0.1  # pinned to a tag; update by pinning a newer tag
+nife update --extensions                                # unpinned installs track main
 nife install -l https://github.com/OliverMao/nife-webui # project-local, writes .nife/settings.json
 nife -e https://github.com/OliverMao/nife-webui         # this run only, nothing persisted
 nife install /absolute/path/to/nife-webui              # local checkout
