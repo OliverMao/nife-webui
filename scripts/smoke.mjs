@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 // Requires a nife checkout (any version) only for its bundled jiti, so the TS extension
 // can be imported without a build step. Point NIFE_DIR at your checkout.
@@ -273,6 +276,46 @@ assert.equal((await fetch(`${base}api/state?t=${token}`)).status, 200);
 await commands.get("webui").handler("off", ctx);
 assert.equal(await ctx.ui.select("pick"), "b");
 await assert.rejects(fetch(`${base}api/state?t=${token}`));
+
+// autostart: a plain interactive launch starts the server and hands the url to the browser once
+const agentDir = join(tmpdir(), `nife-webui-smoke-${process.pid}`);
+mkdirSync(agentDir, { recursive: true });
+process.env.NIFE_CODING_AGENT_DIR = agentDir;
+const openedFile = join(agentDir, "opened.txt");
+const hookScript = join(agentDir, "browser.sh");
+writeFileSync(hookScript, `#!/bin/sh\nprintf '%s' "$1" >> '${openedFile}'\n`, { mode: 0o755 });
+process.env.BROWSER = hookScript;
+
+notes.length = 0;
+const tuiCtx = { ...ctx, mode: "tui" };
+for (const fn of handlers.get("session_start") ?? []) await fn({ reason: "startup" }, tuiCtx);
+const autoUrl = notes.find((n) => n.startsWith("notify:webui: "))?.slice("notify:webui: ".length);
+assert.ok(autoUrl, "autostart must print the url");
+assert.equal((await fetch(autoUrl)).status, 200);
+for (let i = 0; i < 60 && !existsSync(openedFile); i++) await new Promise((r) => setTimeout(r, 25));
+assert.equal(readFileSync(openedFile, "utf8").trim(), autoUrl, "browser gets the printed url");
+
+// a reload reuses the process: no second tab, no second server
+notes.length = 0;
+for (const fn of handlers.get("session_start") ?? []) await fn({ reason: "reload" }, tuiCtx);
+assert.equal(notes.filter((n) => n.startsWith("notify:webui")).length, 0);
+assert.equal(readFileSync(openedFile, "utf8").trim(), autoUrl);
+
+// headless modes (subagents, --print) never autostart
+await commands.get("webui").handler("off", tuiCtx);
+notes.length = 0;
+for (const fn of handlers.get("session_start") ?? []) await fn({ reason: "startup" }, { ...ctx, mode: "print" });
+assert.equal(notes.filter((n) => n.startsWith("notify:webui")).length, 0);
+
+// /webui auto off persists and blocks the next launch
+await commands.get("webui").handler("auto off", tuiCtx);
+assert.ok(notes.includes("notify:webui autostart off"));
+assert.deepEqual(JSON.parse(readFileSync(join(agentDir, "webui.json"), "utf8")), { auto: false });
+notes.length = 0;
+for (const fn of handlers.get("session_start") ?? []) await fn({ reason: "startup" }, tuiCtx);
+assert.equal(notes.filter((n) => n.startsWith("notify:webui: ")).length, 0, "auto off must not start");
+await commands.get("webui").handler("auto", tuiCtx);
+assert.ok(notes.includes("notify:webui autostart is off"));
 
 console.log("smoke ok");
 process.exit(0);

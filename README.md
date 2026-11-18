@@ -40,24 +40,32 @@ nife -e https://github.com/OliverMao/nife-webui         # this run only, nothing
 nife install /absolute/path/to/nife-webui              # local checkout
 ```
 
-Then start a session and run `/webui`. nife clones the repo and runs
+Then just run `nife`. The extension starts the bridge on launch and opens the printed URL in your
+default browser, so the web UI is there without typing anything. nife clones the repo and runs
 `npm install --omit=dev --legacy-peer-deps`, so the only thing it resolves is the manifest: there
 are no runtime dependencies, and `web/dist` ships prebuilt. Nothing is compiled on install.
 
-No build step for the user, and no runtime dependencies: the extension is plain `node:http` +
-SSE, the UI is prebuilt into `web/dist`.
+The extension is plain `node:http` + SSE; the UI is prebuilt into `web/dist`.
 
 ## Use
 
 In the CLI session:
 
 ```
-/webui        -> webui: http://127.0.0.1:51234/?t=...
-/webui off
+/webui                 -> webui: http://127.0.0.1:51234/?t=...
+/webui off                stop the bridge and free the port
+/webui auto on|off        autostart + auto-open on the next launch (default on)
+/webui auto               print the current setting
 ```
 
-Open the printed URL. Each running CLI process gets its own port and its own token, so several
-sessions can be open in several tabs at once.
+On launch the bridge starts by itself and the URL is opened once per process; the tab survives
+`/reload`, `/new`, `/resume` and `/fork`, since the bridge keeps its port, token and session
+binding. Autostart is skipped for headless runs (`nife --print`, subagents) and can be turned off
+three ways: `/webui auto off` (persisted in `~/.nife/agent/webui.json`, honors
+`NIFE_CODING_AGENT_DIR`), `NIFE_WEBUI=0` for a single launch, or `/webui off` for the current one.
+
+Each running CLI process gets its own port and its own token, so several sessions can be open in
+several tabs at once.
 
 From the browser:
 

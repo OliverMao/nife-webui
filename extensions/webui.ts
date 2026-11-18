@@ -9,13 +9,14 @@
  * /webui off    stop
  */
 
+import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { dirname, extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { SessionManager } from "nife-coding-agent";
+import { getAgentDir, SessionManager } from "nife-coding-agent";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -59,6 +60,8 @@ interface Bridge {
 	orig: OriginalUI | undefined;
 	/** Subagent dispatches currently running, keyed by tool call id. */
 	children: Map<string, { id: string; agent: string; count: number }>;
+	/** Set once the browser tab was opened for this process, so /reload does not reopen it. */
+	autoOpened: boolean;
 }
 
 // The factory runs again whenever a session is replaced (/new, /resume, /fork). Module state
@@ -382,6 +385,48 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 	return send(res, 404, "not found");
 }
 
+type Prefs = { auto: boolean };
+
+function prefsPath(): string {
+	return join(getAgentDir(), "webui.json");
+}
+
+async function loadPrefs(): Promise<Prefs> {
+	try {
+		const raw = JSON.parse(await readFile(prefsPath(), "utf8")) as { auto?: unknown };
+		return { auto: raw.auto !== false };
+	} catch {
+		return { auto: true };
+	}
+}
+
+async function savePrefs(prefs: Prefs): Promise<void> {
+	await mkdir(getAgentDir(), { recursive: true });
+	await writeFile(prefsPath(), `${JSON.stringify(prefs, null, 2)}\n`, "utf8");
+}
+
+function webuiUrl(b: Bridge): string {
+	return `http://127.0.0.1:${b.port}/?t=${b.token}`;
+}
+
+/** Hand the URL to the desktop. Failures are expected on headless machines: the URL is printed too. */
+function openBrowser(url: string): void {
+	const [command, ...prefix] =
+		process.platform === "win32"
+			? ["cmd", "/c", "start", ""]
+			: process.platform === "darwin"
+				? ["open"]
+				: [process.env.BROWSER?.trim() || "xdg-open"];
+	if (!command) return;
+	try {
+		const child = spawn(command, [...prefix, url], { detached: true, stdio: "ignore" });
+		child.on("error", () => {});
+		child.unref();
+	} catch {
+		// ignore: the printed URL is the fallback
+	}
+}
+
 function start(api: ExtensionAPI, ctx: ExtensionContext): Promise<Bridge> {
 	const token = randomBytes(16).toString("hex");
 	const server = createServer();
@@ -397,6 +442,7 @@ function start(api: ExtensionAPI, ctx: ExtensionContext): Promise<Bridge> {
 		patchedUI: undefined,
 		orig: undefined,
 		children: new Map(),
+		autoOpened: false,
 	};
 
 	server.on("request", (req, res) => {
@@ -430,11 +476,22 @@ function stop(): void {
 
 export default function webui(api: ExtensionAPI) {
 	api.registerCommand("webui", {
-		description: "Serve this session in the browser (/webui off to stop)",
+		description: "Serve this session in the browser. /webui off stops it, /webui auto on|off autostarts",
 		handler: async (args, ctx) => {
-			if (args.trim() === "off") {
+			const [sub, value] = args.trim().split(/\s+/);
+			if (sub === "off") {
 				stop();
 				ctx.ui.notify("webui stopped", "info");
+				return;
+			}
+			if (sub === "auto") {
+				const prefs = await loadPrefs();
+				if (value !== "on" && value !== "off") {
+					ctx.ui.notify(`webui autostart is ${prefs.auto ? "on" : "off"}`, "info");
+					return;
+				}
+				await savePrefs({ auto: value === "on" });
+				ctx.ui.notify(`webui autostart ${value}`, "info");
 				return;
 			}
 			let b = store.__nifeWebui;
@@ -445,11 +502,27 @@ export default function webui(api: ExtensionAPI) {
 			b.ctx = ctx;
 			b.command = ctx;
 			patchDialogs(ctx, b);
-			ctx.ui.notify(`webui: http://127.0.0.1:${b.port}/?t=${b.token}`, "info");
+			ctx.ui.notify(`webui: ${webuiUrl(b)}`, "info");
 		},
 	});
 
 	api.on("session_start", async (event, ctx) => {
+		// Autostart only for a real interactive launch: subagents and --print runs are headless,
+		// and /reload, /new, /resume, /fork must not open a second tab.
+		if (event.reason === "startup" && ctx.mode === "tui" && process.env.NIFE_WEBUI !== "0") {
+			if (!store.__nifeWebui && (await loadPrefs()).auto) {
+				try {
+					const started = await start(api, ctx);
+					ctx.ui.notify(`webui: ${webuiUrl(started)}`, "info");
+					if (!started.autoOpened) {
+						started.autoOpened = true;
+						openBrowser(webuiUrl(started));
+					}
+				} catch (error) {
+					ctx.ui.notify(`webui: failed to start (${error instanceof Error ? error.message : "unknown"})`, "error");
+				}
+			}
+		}
 		const b = store.__nifeWebui;
 		if (!b) return;
 		// New session: same bridge, same port and token, rebound to the live context.
