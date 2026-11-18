@@ -114,6 +114,20 @@ From the browser:
   `session_before_compact` / `session_compact` / `session_compact_failed` are forwarded as
   `compaction_start` / `compaction_end`, so threshold and overflow compaction refresh the
   transcript and the context ring without a click
+- `Proxy` in the menu's `Network` section switches the running session between "through the proxy"
+  and "direct": nife builds its HTTP agent once at startup (`EnvHttpProxyAgent` in
+  `core/http-dispatcher.ts`), so the address is fixed, but undici re-reads `NO_PROXY` on every
+  request, so the bridge sets `no_proxy` and `NO_PROXY` to `*` for direct mode and restores the
+  exact previous values (deleting them when they were unset) on the way back. Child processes
+  inherit the same environment, so `bash` commands follow the same choice. A session started
+  without `HTTP_PROXY`/`HTTPS_PROXY` shows `not set`: nothing to switch, and a plugin cannot add one
+  either, because undici is bundled into nife's CLI build (`dist/bundle/chunks/*` holds its own
+  copy), so `setGlobalDispatcher` from a plugin would touch a different module instance.
+  undici keeps two agents - `http_proxy` for http targets and `https_proxy` for https targets, where
+  https falls back to the http value but not the other way round - so the line under the switch
+  shows both resolved addresses (`http + https host` when they match, `http direct · https host`
+  when only one is set). The switch itself stays single: the bypass list matches hosts, and undici
+  has no per-scheme bypass, so one row toggles both
 - reasoning slider lives inside the model menu above the model list
   (visuals follow [dsh-codex-effort-slider](https://github.com/Microqian2th/dsh-codex-effort-slider)):
   blue -> violet -> deep violet fill, white knob, level ticks, and from one third upward an energy

@@ -124,6 +124,21 @@ const rows = computed(() => groupItems(items.value));
 
 const modelLabel = computed(() => (state.value.model ? (state.value.model.name ?? state.value.model.id) : "model"));
 
+// The bridge can only switch the *bypass* list, not the proxy address: nife builds its HTTP agent
+// once at startup. So the row says what it actually does - direct vs through the proxy.
+const proxy = computed(
+	() => state.value.proxy ?? { configured: false, bypassed: false, http: null, https: null, bypass: "" },
+);
+
+/** undici keeps http and https apart, so show both; the scheme is the label, the host is the value. */
+const proxyLine = computed(() => {
+	const { http, https } = proxy.value;
+	const host = (url) => url.replace(/^https?:\/\//i, "");
+	if (!http && !https) return "no proxy in this session";
+	if (http && http === https) return `http + https ${host(http)}`;
+	return [http ? `http ${host(http)}` : "http direct", https ? `https ${host(https)}` : "https direct"].join(" · ");
+});
+
 const filteredModels = computed(() => {
 	const query = modelQuery.value.trim().toLowerCase();
 	const models = state.value.models ?? [];
@@ -926,6 +941,18 @@ async function onThinkingChange(index) {
 	if (thinkingDraft.value === index) thinkingDraft.value = null;
 }
 
+/** Turn the proxy off for this session (NO_PROXY=*) or back on, then re-read the truth from nife. */
+async function toggleProxy() {
+	const bypass = !proxy.value.bypassed;
+	const result = await postDetailed("proxy", { bypass });
+	if (!result.ok) {
+		showNotice(result.message || "proxy switch failed");
+		return;
+	}
+	await loadState();
+	showNotice(bypass ? "proxy off · connecting directly" : "proxy on");
+}
+
 async function switchTo(path) {
 	sidebarOpen.value = false;
 	const result = await postDetailed("resume", { path });
@@ -1296,6 +1323,36 @@ onBeforeUnmount(() => {
 											<span class="ellipsis">{{ compacting ? "Compacting…" : "Compact context" }}</span>
 											<span v-if="contextPercent !== null" class="menu-hint">{{ Math.round(contextPercent) }}%</span>
 										</button>
+									</div>
+									<!-- network: the one proxy decision a running session can make (see webui.ts) -->
+									<div class="menu-footer">
+										<div class="menu-label">Network</div>
+										<button
+											type="button"
+											class="menu-action"
+											:disabled="!proxy.configured"
+											:title="
+												proxy.configured
+													? proxy.bypassed
+														? 'Requests go straight to the provider, ignoring both proxies this session started with'
+														: 'Requests go through the http and https proxies below; the bypass list has no per-scheme switch'
+													: 'nife was started without HTTP_PROXY/HTTPS_PROXY, so this session has nothing to switch'
+											"
+											@click.stop="toggleProxy"
+										>
+											<svg viewBox="0 0 16 16" aria-hidden="true">
+												<circle cx="8" cy="8" r="5.2" />
+												<path d="M2.8 8h10.4" />
+												<path d="M8 2.8c1.5 1.6 2.3 3.3 2.3 5.2S9.5 11.6 8 13.2C6.5 11.6 5.7 9.9 5.7 8S6.5 4.4 8 2.8" />
+											</svg>
+											<span class="ellipsis">Proxy</span>
+											<span
+												class="switch"
+												:class="{ on: proxy.configured && !proxy.bypassed, unavailable: !proxy.configured }"
+												aria-hidden="true"
+											></span>
+										</button>
+										<p class="proxy-time">{{ proxyLine }}</p>
 									</div>
 								</div>
 							</div>

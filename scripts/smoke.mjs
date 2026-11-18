@@ -38,6 +38,9 @@ const api = {
 	getSessionName() {
 		return "smoke";
 	},
+	getSettings() {
+		return {};
+	},
 	async setModel(model) {
 		picked.model = model;
 		return true;
@@ -220,6 +223,56 @@ assert.equal((await fetch(`${base}api/prompt?t=${token}`, {
 	body: JSON.stringify({ text: " hi " }),
 })).status, 200);
 assert.deepEqual(sent[0], { text: "hi", opts: undefined });
+
+// proxy switch: nife fixes the proxy address at startup but undici re-reads NO_PROXY per request,
+// so the page can drop to a direct connection and come back without restarting anything
+process.env.HTTPS_PROXY = "http://127.0.0.1:7890";
+delete process.env.NO_PROXY;
+delete process.env.no_proxy;
+const proxyPost = (body) =>
+	fetch(`${base}api/proxy?t=${token}`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+	});
+const bypassed = await proxyPost({ bypass: true });
+assert.equal(bypassed.status, 200);
+assert.equal((await bypassed.json()).bypassed, true);
+assert.equal(process.env.NO_PROXY, "*", "the switch is NO_PROXY=*");
+assert.equal(process.env.no_proxy, "*", "undici prefers the lowercase name, so both are set");
+const proxyState = await (await fetch(`${base}api/state?t=${token}`)).json();
+assert.deepEqual(proxyState.proxy, {
+	configured: true,
+	// only HTTPS_PROXY was set: http targets stay direct, exactly like undici resolves it
+	http: null,
+	https: "http://127.0.0.1:7890",
+	bypassed: true,
+	bypass: "*",
+});
+assert.equal((await proxyPost({ bypass: false })).status, 200);
+assert.equal(process.env.NO_PROXY, undefined, "restoring deletes a name that was not set before");
+assert.equal(process.env.no_proxy, undefined);
+// an existing bypass list comes back exactly as it was, not as an empty string
+process.env.HTTPS_PROXY = "http://127.0.0.1:7890";
+process.env.NO_PROXY = "localhost,.corp";
+await proxyPost({ bypass: true });
+assert.equal(process.env.no_proxy, "*");
+await proxyPost({ bypass: false });
+assert.equal(process.env.NO_PROXY, "localhost,.corp");
+assert.equal(process.env.no_proxy, undefined, "only the name that existed before is restored");
+delete process.env.NO_PROXY;
+delete process.env.HTTPS_PROXY;
+assert.equal((await proxyPost({ bypass: true })).status, 409, "nothing to switch without a proxy");
+
+// http and https are separate agents: HTTPS falls back to HTTP, never the other way round
+process.env.HTTP_PROXY = "http://127.0.0.1:7890";
+assert.deepEqual((await (await fetch(`${base}api/state?t=${token}`)).json()).proxy.http, "http://127.0.0.1:7890");
+assert.deepEqual((await (await fetch(`${base}api/state?t=${token}`)).json()).proxy.https, "http://127.0.0.1:7890");
+process.env.HTTPS_PROXY = "http://127.0.0.1:7891";
+assert.equal((await (await fetch(`${base}api/state?t=${token}`)).json()).proxy.https, "http://127.0.0.1:7891");
+delete process.env.HTTPS_PROXY;
+delete process.env.HTTP_PROXY;
+assert.equal((await proxyPost({ bypass: "yes" })).status, 400);
 
 // compaction: the page waits for the outcome of the summarizing call
 const compactPost = (body) =>

@@ -171,6 +171,8 @@ interface Bridge {
 	switchRequest: ((outcome: SwitchOutcome) => void) | undefined;
 	/** Uploaded drop target for this bridge; created on first drop, removed when the process exits. */
 	uploadDir: string | undefined;
+	/** no_proxy values saved when the page switched the proxy off, so it can be restored. */
+	proxyBypassSaved: { lower: string | undefined; upper: string | undefined } | undefined;
 }
 
 interface SwitchOutcome {
@@ -305,6 +307,61 @@ function isHiddenMessage(message: { role: string; display?: boolean }): boolean 
 	return message.role === "system" || (message.role === "custom" && message.display === false);
 }
 
+/**
+ * Proxy switch. nife builds its HTTP agent once, at startup (EnvHttpProxyAgent in
+ * core/http-dispatcher.ts), so the proxy address cannot change while the process runs - but undici
+ * re-reads NO_PROXY for every request and `*` means "never proxy". That makes the bypass list the
+ * one lever a running session can pull: the page can stop relaying through the proxy and start
+ * again, without touching nife internals.
+ */
+/**
+ * undici keeps two agents: http_proxy for http targets and https_proxy for https targets, and
+ * https only falls back to the http one when it is not set itself (the reverse is not true, so
+ * "https only" leaves plain http direct). Report both resolved values.
+ */
+const proxyEnv = () => {
+	const http = process.env.http_proxy ?? process.env.HTTP_PROXY;
+	const https = process.env.https_proxy ?? process.env.HTTPS_PROXY ?? http;
+	return {
+		http,
+		https,
+		bypass: process.env.no_proxy ?? process.env.NO_PROXY ?? "",
+	};
+};
+
+function proxyState(b: Bridge) {
+	const env = proxyEnv();
+	// Built once at startup, so these are what the running session relays through.
+	return {
+		configured: env.http !== undefined || env.https !== undefined,
+		http: env.http ?? null,
+		https: env.https ?? null,
+		bypassed: b.proxyBypassSaved !== undefined,
+		bypass: env.bypass,
+	};
+}
+
+function setProxyBypass(b: Bridge, bypass: boolean): void {
+	if (bypass) {
+		if (b.proxyBypassSaved === undefined) {
+			b.proxyBypassSaved = { lower: process.env.no_proxy, upper: process.env.NO_PROXY };
+		}
+		process.env.no_proxy = "*";
+		process.env.NO_PROXY = "*";
+		return;
+	}
+	const saved = b.proxyBypassSaved;
+	if (saved === undefined) return;
+	for (const [key, value] of [
+		["no_proxy", saved.lower],
+		["NO_PROXY", saved.upper],
+	] as const) {
+		if (value === undefined) delete process.env[key];
+		else process.env[key] = value;
+	}
+	b.proxyBypassSaved = undefined;
+}
+
 function snapshot(b: Bridge): unknown {
 	const ctx = b.ctx;
 	// buildContextEntries() is what the TUI renders: it starts at the newest compaction, so a
@@ -356,6 +413,7 @@ function snapshot(b: Bridge): unknown {
 		})),
 		streaming: !ctx.isIdle(),
 		usage: ctx.getContextUsage() ?? null,
+		proxy: proxyState(b),
 		stats,
 		subagents: [...b.children.values()],
 		messages,
@@ -543,6 +601,20 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		return send(res, 200, "ok");
 	}
 
+	if (req.method === "POST" && path === "/api/proxy") {
+		let body: Record<string, unknown>;
+		try {
+			body = await readJson(req, 1024);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : "bad body";
+			return send(res, message === "body too large" ? 413 : 400, message);
+		}
+		if (typeof body.bypass !== "boolean") return send(res, 400, "bypass must be a boolean");
+		if (body.bypass && !proxyState(b).configured) return send(res, 409, "this session was started without a proxy");
+		setProxyBypass(b, body.bypass);
+		return send(res, 200, JSON.stringify(proxyState(b)), "application/json");
+	}
+
 	if (req.method === "POST" && path === "/api/abort") {
 		b.ctx.abort();
 		return send(res, 200, "ok");
@@ -674,6 +746,7 @@ async function start(api: ExtensionAPI, ctx: ExtensionContext): Promise<Bridge> 
 		autoOpened: false,
 		switchRequest: undefined,
 		uploadDir: undefined,
+		proxyBypassSaved: undefined,
 	};
 
 	server.on("request", (req, res) => {
