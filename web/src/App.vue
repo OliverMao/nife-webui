@@ -23,6 +23,8 @@ const text = ref("");
 const dialog = ref(null);
 const dialogText = ref("");
 const transcript = ref(null);
+const transcriptBody = ref(null);
+let resizeObserver;
 const inputEl = ref(null);
 const sidebarOpen = ref(false);
 const collapsed = ref(localStorage.getItem("nife-webui.collapsed") === "1");
@@ -179,25 +181,52 @@ const when = (value) => {
 	return date.toLocaleDateString();
 };
 
-/** Puts the first line of a new reply in view and leaves the viewport alone afterwards. */
-function pinMessageStart() {
+/**
+ * Sticky follow. Scrolling up always wins over an incoming message: any upward movement of the
+ * viewport (wheel, drag, touch, keyboard) clears the flag, and it only comes back once the user is
+ * within FOLLOW_SLACK of the bottom again. The ref also drives the "Latest" button.
+ */
+const stick = ref(true);
+const FOLLOW_SLACK = 64;
+let lastScrollTop = 0;
+
+function nearBottom() {
+	const el = transcript.value;
+	if (!el) return true;
+	return el.scrollHeight - el.scrollTop - el.clientHeight <= FOLLOW_SLACK;
+}
+
+function onTranscriptScroll() {
+	const el = transcript.value;
+	if (!el) return;
+	if (el.scrollTop < lastScrollTop - 2) stick.value = false;
+	else stick.value = nearBottom();
+	lastScrollTop = el.scrollTop;
+}
+
+/** Wheel direction is checked too: a small nudge up must not be undone by the next chunk. */
+function onTranscriptWheel(event) {
+	if (event.deltaY < 0) stick.value = false;
+}
+
+/** iOS can defer scroll events during momentum, so a touch away from the bottom detaches at once. */
+function onTranscriptTouch() {
+	if (!nearBottom()) stick.value = false;
+}
+
+/** Scroll to the newest message while sticking; a user who scrolled up keeps their position. */
+function follow() {
 	nextTick(() => {
-		const container = transcript.value;
-		const node = container?.querySelector(".msg.live");
-		if (!container || !node) return;
-		const containerBox = container.getBoundingClientRect();
-		const nodeBox = node.getBoundingClientRect();
-		const target = nodeBox.top - containerBox.top + container.scrollTop - containerBox.height * 0.22;
-		// only scroll forward: never yank the view away from what the user is reading
-		if (target > container.scrollTop) container.scrollTop = target;
+		const el = transcript.value;
+		if (!el || !stick.value) return;
+		el.scrollTop = el.scrollHeight;
 	});
 }
 
-/** Only used for local actions (own prompt, session load); streaming never moves the view. */
+/** Local actions (own prompt, session load, the Latest button) win over a scrolled-up view. */
 function scrollToBottom() {
-	nextTick(() => {
-		if (transcript.value) transcript.value.scrollTop = transcript.value.scrollHeight;
-	});
+	stick.value = true;
+	follow();
 }
 
 /** Coalesces streaming deltas into one DOM update per animation frame. */
@@ -241,7 +270,7 @@ function handle(payload) {
 				live.value = { text: "", thinking: "" };
 				pendingText = "";
 				pendingThinking = "";
-				pinMessageStart();
+				follow();
 			}
 			break;
 		case "message_update":
@@ -252,6 +281,7 @@ function handle(payload) {
 			pendingText = "";
 			pendingThinking = "";
 			push(payload.message);
+			follow();
 			break;
 		case "agent_start":
 			streaming.value = true;
@@ -662,9 +692,15 @@ onMounted(async () => {
 	await loadSessions();
 	connect();
 	inputEl.value?.focus();
+	// Streaming markdown, collapsing tool rows, loading images and a growing textarea all change the
+	// transcript height after a scroll; watch the boxes instead of scrolling per token.
+	resizeObserver = new ResizeObserver(() => follow());
+	if (transcript.value) resizeObserver.observe(transcript.value);
+	if (transcriptBody.value) resizeObserver.observe(transcriptBody.value);
 });
 
 onBeforeUnmount(() => {
+	resizeObserver?.disconnect();
 	window.removeEventListener("dragover", onDragOver);
 	window.removeEventListener("dragleave", onDragLeave);
 	window.removeEventListener("drop", onDrop);
@@ -747,20 +783,39 @@ onBeforeUnmount(() => {
 				</div>
 			</header>
 
-			<main ref="transcript" class="transcript" @click="onTranscriptClick">
-				<div v-if="messages.length === 0 && !live" class="empty">
-					<h1>What should we build?</h1>
-					<p class="muted">
-						This page drives the session running in your terminal. Anything you send here shows up in the CLI too.
-					</p>
+			<main
+				ref="transcript"
+				class="transcript"
+				@scroll.passive="onTranscriptScroll"
+				@wheel.passive="onTranscriptWheel"
+				@touchstart.passive="onTranscriptTouch"
+				@click="onTranscriptClick"
+			>
+				<div ref="transcriptBody" class="transcript-body">
+					<div v-if="messages.length === 0 && !live" class="empty">
+						<h1>What should we build?</h1>
+						<p class="muted">
+							This page drives the session running in your terminal. Anything you send here shows up in the CLI too.
+						</p>
+					</div>
+
+					<MessageItem v-for="(item, index) in items" :key="index" :item="item" />
+
+					<LiveMessage v-if="live" :live="live" />
 				</div>
-
-				<MessageItem v-for="(item, index) in items" :key="index" :item="item" />
-
-				<LiveMessage v-if="live" :live="live" />
 			</main>
 
 			<form class="composer" @submit.prevent="send">
+				<button
+					v-if="!stick"
+					type="button"
+					class="jump-latest"
+					title="Scroll to the newest message"
+					@click="scrollToBottom"
+				>
+					<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3.5v9M4 8.5l4 4 4-4" /></svg>
+					Latest
+				</button>
 				<p v-if="notice" class="notice">{{ notice }}</p>
 				<div class="composer-box" :class="{ dragging }">
 					<svg class="box-progress" aria-hidden="true" :title="contextPercent !== null ? `context ${Math.round(contextPercent)}%` : undefined">

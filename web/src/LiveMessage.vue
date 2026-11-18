@@ -40,7 +40,9 @@ function onThinkScroll() {
 watch(
 	() => props.live.thinking,
 	() => {
-		if (!followFrame) followFrame = requestAnimationFrame(followTick);
+		// collapsed by default: the body element only exists once the user opens the summary
+		if (!thinkEl.value || followFrame) return;
+		followFrame = requestAnimationFrame(followTick);
 	},
 	{ flush: "post" },
 );
@@ -69,7 +71,7 @@ watch(
 
 <template>
 	<div class="msg assistant live">
-		<details v-if="live.thinking" class="thinking" open>
+		<details v-if="live.thinking" class="thinking">
 			<summary>
 				<svg class="think-icon spinning" viewBox="0 0 16 16" aria-hidden="true">
 					<path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M12.6 3.4l-1.4 1.4M4.8 11.2l-1.4 1.4" />

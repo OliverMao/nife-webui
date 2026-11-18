@@ -94,11 +94,16 @@ From the browser:
   blue -> violet -> deep violet fill, white knob, level ticks, and from one third upward an energy
   layer with sweep light and stardust; the level switches the moment the pointer passes a third of
   a step and needs two thirds back, so the knob does not chatter
-- the streaming thinking block keeps a fixed 132px viewport that follows the newest line with an
-  eased scroll and a bottom fade; scrolling up pauses the follow until you return to the bottom
-- reply text does the opposite: when a reply starts, its first line is pinned about a fifth down
-  the viewport and the transcript does **not** follow while it streams, so you read from the top.
-  The view only moves for local actions: your own prompt, session load, session switch
+- the transcript sticks to the newest line: a `ResizeObserver` on the scroll box and its content
+  re-scrolls whenever streamed markdown, a collapsing row, an image or a growing textarea changes
+  the height. Scrolling wins over incoming content: a `scroll` that moves the viewport up (wheel,
+  drag, touch, keyboard) clears the follow flag immediately, `wheel` with `deltaY < 0` clears it even
+  before the scroll lands, and it only comes back within 64px of the bottom. While detached, a
+  `Latest` pill floats above the composer and jumps back down on click; your own prompt, session
+  load and session switch always re-stick
+- thinking is collapsed by default, live and committed: the streaming block is a closed `Thinking`
+  summary with a spinner, and opening it shows the same 132px viewport that eases to the newest
+  line with a bottom fade
 - the slider only offers levels the current model supports, and the label is grey for `off`,
   violet at higher efforts; `prefers-reduced-motion` disables the sweep and stardust
 - Enter sends, Shift+Enter adds a line, the round button stops a run mid-flight
