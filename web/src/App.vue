@@ -254,13 +254,24 @@ const when = (value) => {
 };
 
 /**
- * Sticky follow. Scrolling up always wins over an incoming message: any upward movement of the
- * viewport (wheel, drag, touch, keyboard) clears the flag, and it only comes back once the user is
- * within FOLLOW_SLACK of the bottom again. The ref also drives the "Latest" button.
+ * Sticky follow. Scrolling up always wins over an incoming message, and it only comes back once the
+ * user is within FOLLOW_SLACK of the bottom again. The ref also drives the "Latest" button.
+ *
+ * The subtlety: the transcript moves the viewport up all by itself. A collapsing thinking block, a
+ * tool row folding back, or the live message being replaced by its final version makes the content
+ * above shrink, and the browser then clamps scrollTop down. Treating every downward scrollTop move
+ * as "the user scrolled up" switched following off for good - that was the "auto-scroll sometimes
+ * stops working" bug. So a scroll only counts as user intent when a gesture happened recently;
+ * a clamp (no gesture, and it lands exactly on the new bottom) keeps following.
  */
 const stick = ref(true);
 const FOLLOW_SLACK = 64;
+// a scroll event this close to the last real gesture is attributed to the user
+const GESTURE_MS = 400;
 let lastScrollTop = 0;
+let lastGestureAt = 0;
+// dragging the scrollbar produces scroll events with no wheel/touch, so the press itself counts
+let pointerHeld = false;
 
 function nearBottom() {
 	const el = transcript.value;
@@ -268,23 +279,56 @@ function nearBottom() {
 	return el.scrollHeight - el.scrollTop - el.clientHeight <= FOLLOW_SLACK;
 }
 
+function atBottom() {
+	const el = transcript.value;
+	if (!el) return true;
+	return el.scrollHeight - el.scrollTop - el.clientHeight <= 1;
+}
+
+function markGesture() {
+	lastGestureAt = performance.now();
+}
+
 function onTranscriptScroll() {
 	const el = transcript.value;
 	if (!el) return;
-	if (el.scrollTop < lastScrollTop - 2) stick.value = false;
-	else stick.value = nearBottom();
+	const movedUp = el.scrollTop < lastScrollTop - 2;
 	lastScrollTop = el.scrollTop;
+	if (!movedUp) {
+		stick.value = nearBottom();
+		return;
+	}
+	const fromUser = pointerHeld || performance.now() - lastGestureAt < GESTURE_MS;
+	if (!fromUser) {
+		// the browser clamped us (content shrank) or an image finished loading above: keep following
+		if (stick.value) follow();
+		return;
+	}
+	stick.value = false;
 }
 
 /** Wheel direction is checked too: a small nudge up must not be undone by the next chunk. */
 function onTranscriptWheel(event) {
+	markGesture();
 	if (event.deltaY < 0) stick.value = false;
 }
 
 /** iOS can defer scroll events during momentum, so a touch away from the bottom detaches at once. */
 function onTranscriptTouch() {
+	markGesture();
 	if (!nearBottom()) stick.value = false;
 }
+
+function onTranscriptPointerDown() {
+	pointerHeld = true;
+	markGesture();
+}
+
+function onPointerRelease() {
+	pointerHeld = false;
+}
+
+const SCROLL_KEYS = new Set(["PageUp", "PageDown", "ArrowUp", "ArrowDown", "Home", "End", " "]);
 
 /**
  * Scroll to the newest message while sticking; a user who scrolled up keeps their position.
@@ -292,6 +336,7 @@ function onTranscriptTouch() {
  * frame, and scrolling per change is what made the transcript jump.
  */
 let followFrame = 0;
+let followTries = 0;
 function follow() {
 	if (followFrame) return;
 	followFrame = requestAnimationFrame(() => {
@@ -299,6 +344,10 @@ function follow() {
 		const el = transcript.value;
 		if (!el || !stick.value) return;
 		el.scrollTop = el.scrollHeight;
+		// content can grow between reading scrollHeight and writing scrollTop (a markdown delta, an
+		// image decoding); one more frame settles it instead of leaving the view a line short
+		if (atBottom() || ++followTries > 2) followTries = 0;
+		else follow();
 	});
 }
 
@@ -938,7 +987,11 @@ onMounted(async () => {
 	window.addEventListener("dragover", onDragOver);
 	window.addEventListener("dragleave", onDragLeave);
 	window.addEventListener("drop", onDrop);
+	window.addEventListener("pointerup", onPointerRelease);
+	window.addEventListener("pointercancel", onPointerRelease);
 	window.addEventListener("keydown", (event) => {
+		// keyboard scrolling is a gesture too, otherwise PageUp/ArrowUp would be read as a clamp
+		if (SCROLL_KEYS.has(event.key)) markGesture();
 		if (event.key !== "Escape") return;
 		menu.value = null;
 		if (narrow.value) sidebarOpen.value = false;
@@ -962,6 +1015,8 @@ onBeforeUnmount(() => {
 	window.removeEventListener("dragover", onDragOver);
 	window.removeEventListener("dragleave", onDragLeave);
 	window.removeEventListener("drop", onDrop);
+	window.removeEventListener("pointerup", onPointerRelease);
+	window.removeEventListener("pointercancel", onPointerRelease);
 });
 </script>
 
@@ -1047,6 +1102,7 @@ onBeforeUnmount(() => {
 				@scroll.passive="onTranscriptScroll"
 				@wheel.passive="onTranscriptWheel"
 				@touchstart.passive="onTranscriptTouch"
+				@pointerdown.passive="onTranscriptPointerDown"
 				@click="onTranscriptClick"
 			>
 				<div ref="transcriptBody" class="transcript-body">
