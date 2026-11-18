@@ -154,7 +154,7 @@ svg {
 .session {
 	display: flex;
 	align-items: center;
-	gap: 8px;
+	gap: 4px;
 	width: 100%;
 	padding: 5px 8px;
 	border-radius: 6px;
@@ -162,6 +162,21 @@ svg {
 	font-size: 13px;
 	line-height: 1.45;
 	color: var(--text);
+}
+
+.session-main {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	flex: 1;
+	min-width: 0;
+	padding: 0;
+	border: 0;
+	background: none;
+	color: inherit;
+	font: inherit;
+	text-align: left;
+	cursor: pointer;
 }
 
 .session:hover {
@@ -172,15 +187,70 @@ svg {
 	background: var(--active);
 }
 
-.session-icon {
-	width: 13px;
-	height: 13px;
-	flex: 0 0 auto;
+/* delete affordance: dim until the row is hovered, always reachable by keyboard */
+.session-delete {
+	width: 20px;
+	height: 20px;
+	display: grid;
+	place-items: center;
+	padding: 0;
+	border: 0;
+	border-radius: 5px;
+	background: none;
+	color: var(--dim);
+	opacity: 0;
+	cursor: pointer;
+	transition: opacity 120ms ease, color 120ms ease, background 120ms ease;
+}
+
+.session:hover .session-delete,
+.session-delete:focus-visible {
+	opacity: 1;
+}
+
+.session-delete:hover:not(:disabled) {
+	background: rgb(255 255 255 / 8%);
+	color: var(--error);
+}
+
+.session-delete:disabled {
+	cursor: not-allowed;
+	opacity: 0.3;
+}
+
+.session:hover .session-delete:disabled:hover {
+	background: none;
 	color: var(--dim);
 }
 
-.session.current .session-icon {
-	color: var(--accent);
+.session-delete svg {
+	width: 12px;
+	height: 12px;
+	fill: none;
+	stroke: currentColor;
+	stroke-width: 1.3;
+	stroke-linecap: round;
+	stroke-linejoin: round;
+}
+
+.session-confirm,
+.session-cancel {
+	flex: 0 0 auto;
+	padding: 1px 7px;
+	border: 0;
+	border-radius: 5px;
+	font-size: 11px;
+	cursor: pointer;
+}
+
+.session-confirm {
+	background: var(--error);
+	color: #fff;
+}
+
+.session-cancel {
+	background: rgb(255 255 255 / 10%);
+	color: var(--text);
 }
 
 .session-name {
@@ -308,6 +378,31 @@ svg {
 	color: #dcdcdc;
 }
 
+.bubble-files {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+}
+
+.bubble-file {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	max-width: 100%;
+	padding: 4px 9px;
+	border-radius: 8px;
+	background: rgb(255 255 255 / 10%);
+	font-size: 12px;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.bubble-file svg {
+	width: 13px;
+	height: 13px;
+}
+
 .text {
 	white-space: pre-wrap;
 	overflow-wrap: anywhere;
@@ -432,6 +527,12 @@ img {
 	--track: rgb(255 255 255 / 14%);
 }
 
+/* dropping files anywhere turns the context outline into the drop target */
+.composer-box.dragging {
+	--track: var(--accent);
+	background: #26262b;
+}
+
 /*
  * Absolute children are laid out against the padding box, which sits 2px
  * inside the border box. -1px puts the svg viewport edge at 1px from the
@@ -463,6 +564,141 @@ img {
 	stroke: var(--accent);
 	stroke-linecap: butt;
 	transition: stroke-dasharray 400ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.attachments {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	padding: 2px 4px 8px;
+}
+
+.file-chip {
+	position: relative;
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	max-width: 240px;
+	padding: 6px 10px;
+	border: 1px solid var(--line);
+	border-radius: 8px;
+}
+
+.file-icon {
+	width: 14px;
+	height: 14px;
+	flex: 0 0 auto;
+	fill: none;
+	stroke: var(--dim);
+	stroke-width: 1.3;
+	stroke-linecap: round;
+	stroke-linejoin: round;
+}
+
+/* one accent per file category, matching the icon shapes */
+.file-image {
+	stroke: #56b6c2;
+}
+
+.file-pdf {
+	stroke: #e06c75;
+}
+
+.file-doc {
+	stroke: #61afef;
+}
+
+.file-sheet {
+	stroke: #98c379;
+}
+
+.file-slides {
+	stroke: #e5c07b;
+}
+
+.file-archive {
+	stroke: #d19a66;
+}
+
+.file-code {
+	stroke: #c678dd;
+}
+
+.file-text {
+	stroke: #abb2bf;
+}
+
+.file-audio {
+	stroke: #f78fb3;
+}
+
+.file-video {
+	stroke: #b48ead;
+}
+
+.file-meta {
+	display: flex;
+	flex-direction: column;
+	min-width: 0;
+	line-height: 1.3;
+}
+
+.file-name {
+	font-size: 12px;
+}
+
+.file-size {
+	color: var(--dim);
+	font-size: 11px;
+	font-variant-numeric: tabular-nums;
+}
+
+.file-progress {
+	position: absolute;
+	left: 0;
+	bottom: 0;
+	height: 2px;
+	border-radius: 2px;
+	background: var(--accent);
+	transition: width 120ms linear;
+}
+
+.attachment {
+	position: relative;
+	margin: 0;
+}
+
+.attachment img {
+	display: block;
+	width: 56px;
+	height: 56px;
+	object-fit: cover;
+	border: 1px solid var(--line);
+	border-radius: 8px;
+}
+
+.attachment-remove {
+	position: absolute;
+	top: -5px;
+	right: -5px;
+	width: 17px;
+	height: 17px;
+	display: grid;
+	place-items: center;
+	padding: 0;
+	border: 0;
+	border-radius: 50%;
+	background: #111;
+	box-shadow: 0 0 0 1px var(--line);
+	color: #cfd3d6;
+	font-size: 12px;
+	line-height: 1;
+	cursor: pointer;
+}
+
+.attachment-remove:hover {
+	background: var(--error);
+	color: #fff;
 }
 
 .composer textarea {
@@ -618,6 +854,22 @@ img {
 }
 
 /* narrow screens: sidebar becomes an overlay */
+
+/* Only rendered while the overlay is open (v-if): sits under the sidebar (z 25) and takes the tap
+   that should close it. Kept outside the media query so a zoomed viewport cannot leave it bare. */
+.sidebar-backdrop {
+	position: fixed;
+	inset: 0;
+	z-index: 20;
+	background: rgb(0 0 0 / 45%);
+	animation: backdrop-in 140ms ease-out;
+}
+
+@keyframes backdrop-in {
+	from {
+		background: rgb(0 0 0 / 0%);
+	}
+}
 
 @media (max-width: 820px) {
 	.sidebar {

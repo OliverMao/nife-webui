@@ -1,10 +1,13 @@
 <script setup>
-import { computed, nextTick, onMounted, ref, shallowRef, triggerRef } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, triggerRef } from "vue";
 import EffortSlider from "./EffortSlider.vue";
 import LiveMessage from "./LiveMessage.vue";
 import MessageItem from "./MessageItem.vue";
+import { prepareImage } from "./images.js";
+import FileIcon from "./FileIcon.vue";
+import { attachedLine, formatBytes } from "./files.js";
 import { blocksOf } from "./message-utils.js";
-import { expandPastes, pasteMarker, readClipboard } from "./paste.js";
+import { IMAGE_MAX_COUNT, expandPastes, imageFiles, imageMimeType, imageProblem, pasteMarker, readClipboard } from "./paste.js";
 
 const token = new URLSearchParams(location.search).get("t") ?? "";
 const api = (path) => `/api/${path}?t=${encodeURIComponent(token)}`;
@@ -26,6 +29,8 @@ const collapsed = ref(localStorage.getItem("nife-webui.collapsed") === "1");
 const narrow = ref(false);
 const sessions = ref([]);
 const currentFile = ref("");
+// Session awaiting delete confirmation in the sidebar.
+const pendingDelete = ref("");
 const menu = ref(null);
 const modelQuery = ref("");
 const thinkingDraft = ref(null);
@@ -275,6 +280,9 @@ function handle(payload) {
 			loadState();
 			loadSessions();
 			break;
+		case "sessions_changed":
+			loadSessions();
+			break;
 		case "dialog":
 			dialog.value = payload;
 			dialogText.value = payload.prefill ?? "";
@@ -321,6 +329,24 @@ async function loadSessions() {
 	const data = await response.json();
 	sessions.value = data.sessions ?? [];
 	currentFile.value = data.current ?? "";
+	pendingDelete.value = "";
+}
+
+/** Two-step delete: the row turns into a confirm pair, the file never leaves without a second click. */
+async function deleteSession(session) {
+	pendingDelete.value = "";
+	const response = await fetch(api("delete"), {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ path: session.path }),
+	});
+	if (!response.ok) {
+		showNotice((await response.text()).slice(0, 200) || "could not delete the session");
+		return;
+	}
+	const method = (await response.text()).trim();
+	sessions.value = sessions.value.filter((entry) => entry.path !== session.path);
+	showNotice(method === "trash" ? "session moved to trash" : "session deleted");
 }
 
 async function postDetailed(path, body) {
@@ -339,20 +365,155 @@ async function post(path, body) {
 let pasteSeq = 0;
 const pastes = new Map();
 
+// Pasted images waiting to be sent: { id, name, mimeType, data, url }.
+const attachments = ref([]);
+// Dropped non-images waiting to be sent: { id, name, size, progress, path }. No path yet means the
+// upload is still running, which is what the chip's progress bar shows.
+const files = ref([]);
+const dragging = ref(false);
+let imageSeq = 0;
+let fileSeq = 0;
+
 async function send() {
 	const raw = text.value;
 	const value = expandPastes(raw, pastes).trim();
-	if (!value) return;
+	const pendingImages = attachments.value;
+	const pendingFiles = files.value;
+	const images = pendingImages.map(({ mimeType, data }) => ({ mimeType, data }));
+	if (pendingFiles.some((file) => !file.path)) {
+		showNotice("still uploading, try again in a moment");
+		return;
+	}
+	// nife has no file block, so dropped files ride along as marker lines the agent can read.
+	const body = [value, ...pendingFiles.map((file) => attachedLine(file))].filter(Boolean).join("\n\n");
+	if (!body && images.length === 0) return;
+	const problem = imageProblem(images);
+	if (problem) {
+		showNotice(problem);
+		return;
+	}
 	text.value = "";
+	attachments.value = [];
+	files.value = [];
 	resize();
 	scrollToBottom();
 	inputEl.value?.focus();
-	if (!(await post("prompt", { text: value }))) {
+	const result = await postDetailed("prompt", { text: body, images });
+	if (!result.ok) {
 		text.value = raw;
+		attachments.value = pendingImages;
+		files.value = pendingFiles;
 		resize();
+		showNotice(result.message || "could not send");
 		return;
 	}
 	pastes.clear();
+}
+
+async function attachFiles(incoming) {
+	for (const file of incoming) {
+		if (attachments.value.length >= IMAGE_MAX_COUNT) {
+			showNotice(`at most ${IMAGE_MAX_COUNT} images per message`);
+			return;
+		}
+		try {
+			const { mimeType, data } = await prepareImage(file);
+			imageSeq += 1;
+			attachments.value = [
+				...attachments.value,
+				{
+					id: imageSeq,
+					name: file.name || `pasted image ${imageSeq}`,
+					mimeType,
+					data,
+					url: `data:${mimeType};base64,${data}`,
+				},
+			];
+		} catch (error) {
+			showNotice(error instanceof Error ? error.message : "could not read the pasted image");
+		}
+	}
+}
+
+function removeImage(id) {
+	attachments.value = attachments.value.filter((image) => image.id !== id);
+}
+
+/** Bytes -> a file in nife's temp upload dir. XHR instead of fetch so the chip can show progress. */
+function uploadFile(file, onProgress) {
+	return new Promise((resolve, reject) => {
+		const request = new XMLHttpRequest();
+		request.open("POST", api("upload"));
+		request.setRequestHeader("x-file-name", encodeURIComponent(file.name || "file"));
+		request.upload.onprogress = (event) => {
+			if (event.lengthComputable) onProgress(event.loaded / event.total);
+		};
+		request.onload = () => {
+			if (request.status < 200 || request.status >= 300) {
+				reject(new Error((request.responseText || `upload failed (${request.status})`).slice(0, 200)));
+				return;
+			}
+			try {
+				resolve(JSON.parse(request.responseText));
+			} catch {
+				reject(new Error("bad upload response"));
+			}
+		};
+		request.onerror = () => reject(new Error("upload failed"));
+		request.send(file);
+	});
+}
+
+async function uploadFiles(dropped) {
+	for (const file of dropped) {
+		fileSeq += 1;
+		const chip = { id: fileSeq, name: file.name || `file ${fileSeq}`, size: file.size, progress: 0, path: "" };
+		files.value = [...files.value, chip];
+		const update = (patch) => {
+			files.value = files.value.map((entry) => (entry.id === chip.id ? { ...entry, ...patch } : entry));
+		};
+		try {
+			const uploaded = await uploadFile(file, (fraction) => update({ progress: fraction }));
+			// The server keeps its own generated file name and returns the display name separately.
+			update({ progress: 1, path: uploaded.path, name: uploaded.name || chip.name });
+		} catch (error) {
+			files.value = files.value.filter((entry) => entry.id !== chip.id);
+			showNotice(error instanceof Error ? error.message : "upload failed");
+		}
+	}
+}
+
+function removeFile(id) {
+	files.value = files.value.filter((entry) => entry.id !== id);
+}
+
+/** Files dropped anywhere in the page: images attach inline, everything else becomes a path. */
+function onDrop(event) {
+	const files = [...(event.dataTransfer?.files ?? [])];
+	if (files.length === 0) return;
+	event.preventDefault();
+	dragging.value = false;
+	const images = [];
+	const others = [];
+	for (const file of files) {
+		if (imageMimeType(file)) images.push(file);
+		else others.push(file);
+	}
+	if (images.length > 0) void attachFiles(images);
+	if (others.length > 0) void uploadFiles(others);
+}
+
+function onDragOver(event) {
+	if (!event.dataTransfer?.types.includes("Files")) return;
+	event.preventDefault();
+	event.dataTransfer.dropEffect = "copy";
+	dragging.value = true;
+}
+
+function onDragLeave(event) {
+	// Ignore the move between child elements; only clear when the pointer leaves the window.
+	if (event.relatedTarget) return;
+	dragging.value = false;
 }
 
 function insertAtCursor(snippet) {
@@ -371,6 +532,15 @@ function insertAtCursor(snippet) {
 }
 
 function onPaste(event) {
+	const files = imageFiles([...(event.clipboardData?.items ?? [])])
+		.map((item) => item.getAsFile())
+		.filter(Boolean);
+	if (files.length > 0) {
+		// Stop the browser from inserting the image's file name or alt text as well.
+		event.preventDefault();
+		void attachFiles(files);
+		return;
+	}
 	const clip = event.clipboardData?.getData("text/plain");
 	if (!clip || !readClipboard(clip).large) return;
 	event.preventDefault();
@@ -472,13 +642,19 @@ onMounted(async () => {
 	narrow.value = query.matches;
 	query.addEventListener("change", (event) => {
 		narrow.value = event.matches;
+		// leaving the overlay layout must not leave a hidden "open" sidebar behind
+		if (!event.matches) sidebarOpen.value = false;
 	});
 	window.addEventListener("click", () => {
 		menu.value = null;
 	});
+	window.addEventListener("dragover", onDragOver);
+	window.addEventListener("dragleave", onDragLeave);
+	window.addEventListener("drop", onDrop);
 	window.addEventListener("keydown", (event) => {
 		if (event.key !== "Escape") return;
 		menu.value = null;
+		if (narrow.value) sidebarOpen.value = false;
 		// Answer, don't just hide: an unanswered dialog would block the agent on both sides.
 		if (dialog.value) answer(undefined);
 	});
@@ -486,6 +662,12 @@ onMounted(async () => {
 	await loadSessions();
 	connect();
 	inputEl.value?.focus();
+});
+
+onBeforeUnmount(() => {
+	window.removeEventListener("dragover", onDragOver);
+	window.removeEventListener("dragleave", onDragLeave);
+	window.removeEventListener("drop", onDrop);
 });
 </script>
 
@@ -512,25 +694,41 @@ onMounted(async () => {
 			<div class="section-label">Recents</div>
 			<div class="session-list">
 				<p v-if="sessions.length === 0" class="muted pad">No sessions in this directory.</p>
-				<button
+				<div
 					v-for="session in sessions"
 					:key="session.path"
-					type="button"
 					:class="['session', session.path === currentFile ? 'current' : '']"
-					@click="switchTo(session.path)"
 				>
-					<svg class="session-icon" viewBox="0 0 16 16" aria-hidden="true">
-						<path d="M4 2h8v12l-4-3-4 3z" />
-					</svg>
-					<span class="session-name">{{ sessionTitle(session) }}</span>
-					<span class="session-when">{{ when(session.modified) }}</span>
-				</button>
+					<button type="button" class="session-main" @click="switchTo(session.path)">
+						<span class="session-name">{{ sessionTitle(session) }}</span>
+						<span class="session-when">{{ when(session.modified) }}</span>
+					</button>
+					<template v-if="pendingDelete === session.path">
+						<button type="button" class="session-confirm" @click="deleteSession(session)">Delete</button>
+						<button type="button" class="session-cancel" @click="pendingDelete = ''">Cancel</button>
+					</template>
+					<button
+						v-else
+						type="button"
+						class="session-delete"
+						:disabled="session.path === currentFile"
+						:title="session.path === currentFile ? 'Cannot delete the session you are in' : 'Delete session'"
+						@click.stop="pendingDelete = session.path"
+					>
+						<svg viewBox="0 0 16 16" aria-hidden="true">
+							<path d="M3 4.5h10M6.5 4.5V2.5h3v2M4.8 4.5l.6 9h5.2l.6-9" />
+						</svg>
+					</button>
+				</div>
 			</div>
 
 			<div class="sidebar-foot">
 				<span class="muted ellipsis">{{ state.cwd }}</span>
 			</div>
 		</nav>
+
+		<!-- Narrow screens: the sidebar is an overlay, so tapping anywhere else closes it. -->
+		<div v-if="narrow && sidebarOpen" class="sidebar-backdrop" @click="sidebarOpen = false"></div>
 
 		<section class="main">
 			<header class="topbar">
@@ -564,7 +762,7 @@ onMounted(async () => {
 
 			<form class="composer" @submit.prevent="send">
 				<p v-if="notice" class="notice">{{ notice }}</p>
-				<div class="composer-box">
+				<div class="composer-box" :class="{ dragging }">
 					<svg class="box-progress" aria-hidden="true" :title="contextPercent !== null ? `context ${Math.round(contextPercent)}%` : undefined">
 						<rect class="progress-track" x="0" y="0" width="100%" height="100%" rx="19" pathLength="100" />
 						<rect
@@ -578,6 +776,27 @@ onMounted(async () => {
 							:stroke-dasharray="`${contextPercent ?? 0} 100`"
 						/>
 					</svg>
+					<div v-if="attachments.length > 0 || files.length > 0" class="attachments">
+						<figure v-for="image in attachments" :key="image.id" class="attachment">
+							<img :src="image.url" :alt="image.name" :title="image.name" />
+							<button type="button" class="attachment-remove" title="Remove image" @click="removeImage(image.id)">
+								×
+							</button>
+						</figure>
+						<div v-for="file in files" :key="file.id" class="file-chip" :title="file.path || file.name">
+							<FileIcon :name="file.name" />
+							<span class="file-meta">
+								<span class="file-name ellipsis">{{ file.name }}</span>
+								<span class="file-size">
+									{{ file.path ? formatBytes(file.size) : `${Math.round(file.progress * 100)}%` }}
+								</span>
+							</span>
+							<button type="button" class="attachment-remove" title="Remove file" @click="removeFile(file.id)">
+								×
+							</button>
+							<span v-if="!file.path" class="file-progress" :style="{ width: `${Math.round(file.progress * 100)}%` }"></span>
+						</div>
+					</div>
 					<textarea
 						ref="inputEl"
 						v-model="text"
@@ -636,7 +855,7 @@ onMounted(async () => {
 						<button
 							type="button"
 							class="send"
-							:class="{ stop: streaming, ready: text.trim().length > 0 && !streaming }"
+							:class="{ stop: streaming, ready: (text.trim().length > 0 || attachments.length > 0 || files.length > 0) && !streaming }"
 							:title="streaming ? 'Stop' : 'Send'"
 							@click="streaming ? abort() : send()"
 						>

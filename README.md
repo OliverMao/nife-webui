@@ -26,8 +26,13 @@ WEBUI_TARGET=http://127.0.0.1:PORT npm run dev
 ```
 extensions/webui.ts   server: HTTP + SSE, ctx.ui interception, event forwarding
 web/src/App.vue       transcript, composer, dialog modal
+web/src/images.js     pasted image -> canvas resize -> base64 ImageContent
+web/src/paste.js      text-paste markers + image mime/size rules (unit tested)
+web/src/files.js      dropped-file marker lines, names, sizes, type icons (unit tested)
+web/src/FileIcon.vue  one stroked 16px glyph per file category
 web/src/style.css     all styling
 web/dist/             built output, served by the extension
+scripts/files-test.mjs, paste-test.mjs, markdown-test.mjs   pure-function tests
 scripts/smoke.mjs     fake ExtensionAPI + real HTTP server, no model needed
 ```
 
@@ -72,10 +77,16 @@ several tabs at once.
 From the browser:
 
 - left sidebar lists sessions for the current working directory, click to switch (`/resume`)
+- hovering a session reveals a delete button: one click asks for confirmation in place
+  (`Delete` / `Cancel`), then the row is removed and every open tab refreshes via the
+  `sessions_changed` event. The bridge deletes with the `trash` CLI when it is installed and falls
+  back to `unlink`, mirroring the TUI selector, and refuses the session that is currently running
 - `+` starts a fresh session (`/new`)
 - tool calls collapse into one-line rows (`Ran npm test`), expand for arguments and output,
   failed rows are marked in red
-- panel button collapses the sidebar (remembered in `localStorage`); it becomes an overlay under 820px
+- panel button collapses the sidebar (remembered in `localStorage`); it becomes an overlay under
+  820px, where a dimmed backdrop covers the page: tapping it, switching sessions, or Escape closes
+  the overlay, and resizing back to a wide window clears the open state
 - model chip in the composer lists available/scoped models with a filter, `setModel` runs in the CLI
   session so the terminal switches too; models without credentials are reported, not switched
 - reasoning slider lives inside the model menu above the model list
@@ -101,6 +112,27 @@ From the browser:
   drift with the box aspect ratio). It starts at the top-left corner and runs clockwise.
 - pasting more than 10 lines or 1000 chars collapses into a `[paste #1 +48 lines]` marker in the
   textarea and is expanded again on send, same thresholds and wording as the TUI editor
+- pasting or dropping an image attaches it to the message instead: png/jpeg/webp/gif plus bmp
+  (converted to png, since no provider takes `image/bmp`), up to 4 per message, shown as removable
+  thumbnails above the textarea and sent as `ImageContent` blocks through `sendUserMessage`.
+  Anything over 2000px or 4.5MB of base64 is redrawn on a canvas first, which is nife's own
+  clipboard-image cap (below the providers' 5MB per-image limit); animated GIFs are passed through
+  unresized and rejected when too big. Images are refused with a notice when the current model's
+  `input` does not include `image`
+- files can be dropped anywhere on the page: the composer outline turns into the drop target, and
+  dropped images land in the same thumbnail row as pasted ones. Any other file is uploaded to
+  `$TMPDIR/nife-webui/<pid>-<token>/` (`POST /api/upload`, 25MB cap) under a **generated** name,
+  `<16 hex><sanitized extension>`; the uploaded name is only a label and never picks a path, a
+  length or a collision. The endpoint returns `{ path, name }`, and the chip shows the name with a
+  type icon (`web/src/files.js`: pdf, image, doc, sheet, slides, archive, code, text, audio,
+  video, generic, each with its own accent colour). While the upload runs the chip shows a
+  percentage and a progress bar, because the drop is sent with `XMLHttpRequest` rather than `fetch`.
+  The textarea is untouched: on send the files are appended to the prompt as one
+  `[attached] {"name":"<label>","path":"<file>"}` line each, which is what a terminal drop means
+  for nife: the agent reads `path` with its own tools. Both the composer chips and the transcript
+  hide the temp path (the message row shows the label; hover for the path).
+  Files are deleted when the nife process exits, and abandoned directories from crashed runs are
+  swept on the next start (a live pid keeps its own files)
 - running subagents show as pills in the top bar (`explorer`, `explorer ×3`) while the `subagent`
   tool call is in flight, and as `Delegated explorer · task` rows in the transcript
 - multi-agent on/off is still `/subagent` (or ctrl+y) in the terminal: the extension API exposes
@@ -146,6 +178,8 @@ page reloads the transcript of the newly active session. That is why the bridge 
   `message_end`, `agent_start`, `agent_settled`, `session_info_changed`, `tool_execution_*`.
 - Initial transcript: `ctx.sessionManager.getBranch()`.
 - Sending: `pi.sendUserMessage()`; while streaming it is delivered as `steer`.
+- Drops: `POST /api/upload` writes the bytes to the OS temp dir and returns the path, which the page
+  inserts as text. The same token and `Origin` checks guard it, and cleanup is described above.
 - Dialogs: all extensions in a session share one mutable `ctx.ui` object, so the bridge wraps
   `confirm` / `select` / `input` / `editor`. With no browser attached, calls fall through to the
   terminal dialog unchanged.
@@ -162,11 +196,27 @@ No build step for the extension itself: plain `node:http` + SSE, no runtime depe
 - Binds `127.0.0.1` only.
 - Every request needs `?t=<token>`; the token is per bridge, 32 hex chars, regenerated each start.
 - `Origin` is checked on requests that carry it, so another page cannot POST to the port.
+- Uploaded bytes always land under a generated name inside `$TMPDIR/nife-webui/<pid>-<token>/`: the
+  request's file name is reduced to a label (directory parts dropped, `<>:"|?*` and control
+  characters replaced, 80 chars max) and only a `[a-z0-9]` extension is carried over, so a header
+  cannot choose a directory, overwrite another drop, or smuggle a name into a shell command.
+- `POST /api/delete` only accepts paths that `SessionManager.list(cwd)` returns for this project and
+  never the active session, so the endpoint cannot be pointed at an arbitrary file.
 - Do not expose the port publicly. For remote access use an SSH tunnel or Tailscale, not a
   reverse proxy with auth you wrote yourself.
 
 ## Known limits
 
+- Pasting both text and an image (rich content from an office app) attaches the image only; plain
+  text paste is unaffected.
+- Dropped files travel as text, so the terminal still shows the `[attached] <path>` lines the web
+  UI hides behind chips: nife has no file content block to carry them any other way.
+- Dropped files are temporary: the path in the prompt only resolves while that nife process is
+  alive, so a session resumed later sees a dead path.
+- A dropped PDF (or any binary) reaches the model as a path, not as content: nife's `read` treats
+  it as UTF-8 text and there is no document block in the message model, so the agent has to run
+  something like `pdftotext` itself. Extracting PDF text in the browser needs `pdfjs-dist` and is
+  not implemented.
 - `ctx.ui.custom()`, `setWidget`, `setFooter`, `setEditorComponent` receive TUI render functions
   and cannot render in a browser. Extensions that draw their own TUI screens (plan mode style)
   stay terminal-only.

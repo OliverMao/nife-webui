@@ -1,9 +1,15 @@
 <script setup>
+import { computed } from "vue";
+import FileIcon from "./FileIcon.vue";
+import { splitAttachments } from "./files.js";
 import { blocksOf, dataUrl, imagesOf, mdOf, textOf, toolArg, toolLabel } from "./message-utils.js";
 
-defineProps({
+const props = defineProps({
 	item: { type: Object, required: true },
 });
+
+// Dropped files travel as `[attached] <path>` lines; show chips instead of temp paths.
+const userContent = computed(() => splitAttachments(textOf(props.item.message.content)));
 
 const noticeLabel = (message) => {
 	if (message.role === "compactionSummary") return "Context compacted";
@@ -20,7 +26,13 @@ const noticeText = (message) => {
 <template>
 	<div v-if="item.kind === 'user'" class="msg user">
 		<div class="bubble">
-			<div class="text">{{ textOf(item.message.content) }}</div>
+			<div v-if="userContent.text" class="text">{{ userContent.text }}</div>
+			<div v-if="userContent.files.length > 0" class="bubble-files">
+				<span v-for="(file, i) in userContent.files" :key="i" class="bubble-file" :title="file.path">
+					<FileIcon :name="file.name" />
+					{{ file.name }}
+				</span>
+			</div>
 			<img v-for="(image, i) in imagesOf(item.message.content)" :key="i" :src="dataUrl(image)" alt="" />
 		</div>
 	</div>

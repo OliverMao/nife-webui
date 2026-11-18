@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 // Requires a nife checkout (any version) only for its bundled jiti, so the TS extension
 // can be imported without a build step. Point NIFE_DIR at your checkout.
@@ -113,6 +113,7 @@ const ctx = {
 		name: "Test",
 		provider: "fake",
 		reasoning: true,
+		input: ["text", "image"],
 		thinkingLevelMap: { xhigh: "xhigh" },
 	},
 	scopedModels: [],
@@ -134,11 +135,23 @@ const ctx = {
 };
 
 mod.default(api);
+
+// an abandoned upload dir (dead pid, old mtime) is swept at startup; a fresh one survives
+const uploadRoot = join(tmpdir(), "nife-webui");
+const staleUpload = join(uploadRoot, "999999-stale");
+const freshUpload = join(uploadRoot, "999999-fresh");
+mkdirSync(staleUpload, { recursive: true });
+writeFileSync(join(staleUpload, "old.pdf"), "x");
+utimesSync(staleUpload, new Date(0), new Date(0));
+mkdirSync(freshUpload, { recursive: true });
+
 for (const fn of handlers.get("session_start") ?? []) await fn({ reason: "startup" }, ctx);
 
 await commands.get("webui").handler("", ctx);
 const url = notes.find((n) => n.startsWith("notify:webui: "))?.slice("notify:webui: ".length);
 assert.ok(url, "no url printed");
+assert.equal(existsSync(staleUpload), false, "stale upload dir must be swept at startup");
+assert.equal(existsSync(freshUpload), true, "recent upload dir must survive the sweep");
 const token = new URL(url).searchParams.get("t");
 const base = url.split("?")[0];
 
@@ -187,6 +200,36 @@ assert.equal((await fetch(`${base}api/prompt?t=${token}`, {
 })).status, 200);
 assert.deepEqual(sent[0], { text: "hi", opts: undefined });
 
+// images are forwarded as ImageContent blocks after the text block
+const png = Buffer.from("not really a png").toString("base64");
+const promptWith = (body) =>
+	fetch(`${base}api/prompt?t=${token}`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+	});
+assert.equal((await promptWith({ text: " look ", images: [{ mimeType: "image/png", data: png }] })).status, 200);
+assert.deepEqual(sent.at(-1).text, [
+	{ type: "text", text: "look" },
+	{ type: "image", mimeType: "image/png", data: png },
+]);
+// an image on its own is a valid prompt
+assert.equal((await promptWith({ images: [{ mimeType: "image/jpeg", data: png }] })).status, 200);
+assert.deepEqual(sent.at(-1).text, [{ type: "image", mimeType: "image/jpeg", data: png }]);
+// empty stays a 400, and bad images never reach the session
+assert.equal((await promptWith({ text: "  " })).status, 400);
+assert.equal((await promptWith({ text: "x", images: [{ mimeType: "image/svg+xml", data: png }] })).status, 400);
+assert.equal((await promptWith({ text: "x", images: [{ mimeType: "image/png", data: "not base64!" }] })).status, 400);
+assert.equal((await promptWith({ text: "x", images: [{ mimeType: "image/png", data: "A".repeat(4.5 * 1024 * 1024 + 1) }] })).status, 400);
+assert.equal((await promptWith({ text: "x", images: "nope" })).status, 400);
+// a text-only model refuses images instead of sending something the provider would reject
+ctx.model = { ...ctx.model, input: ["text"] };
+assert.equal((await promptWith({ text: "x" })).status, 200, "text still works");
+assert.deepEqual(sent.at(-1).text, "x");
+assert.equal((await promptWith({ text: "x", images: [{ mimeType: "image/png", data: png }] })).status, 409);
+assert.deepEqual(sent.at(-1).text, "x", "rejected images are not sent");
+ctx.model = { ...ctx.model, input: ["text", "image"] };
+
 // models + thinking levels ride along in the snapshot
 // xhigh is enabled by thinkingLevelMap, max is not mapped so it is dropped
 assert.deepEqual(state.thinkingLevels, ["off", "minimal", "low", "medium", "high", "xhigh"]);
@@ -217,10 +260,77 @@ assert.equal((await fetch(`${base}api/thinking?t=${token}`, {
 	body: JSON.stringify({ level: "bogus" }),
 })).status, 400);
 
+// uploads: a dropped non-image becomes a temp file whose path is handed back to the page
+const uploadBody = Buffer.from("%PDF-1.4 not really a pdf");
+const uploaded = await fetch(`${base}api/upload?t=${token}`, {
+	method: "POST",
+	headers: { "content-type": "application/pdf", "x-file-name": encodeURIComponent("../报告 v1.pdf") },
+	body: uploadBody,
+});
+assert.equal(uploaded.status, 200);
+const upload = await uploaded.json();
+const uploadPath = upload.path;
+assert.equal(upload.name, "报告 v1.pdf", "the original name comes back as a label only");
+assert.ok(uploadPath.startsWith(join(tmpdir(), "nife-webui")), "upload lands in the temp dir");
+assert.match(uploadPath, /\/[0-9a-f]{16}\.pdf$/, "stored name is generated");
+assert.ok(!uploadPath.includes("报告"), "the user name never reaches the filesystem");
+assert.equal(dirname(dirname(uploadPath)), join(tmpdir(), "nife-webui"));
+assert.deepEqual(readFileSync(uploadPath), uploadBody);
+assert.equal(existsSync(uploadPath), true);
+// the same display name twice yields two generated paths and no overwrite
+const again = await fetch(`${base}api/upload?t=${token}`, {
+	method: "POST",
+	headers: { "x-file-name": encodeURIComponent("报告 v1.pdf") },
+	body: "second",
+});
+const second = await again.json();
+assert.notEqual(second.path, uploadPath);
+assert.equal(second.name, upload.name);
+assert.match(second.path, /\/[0-9a-f]{16}\.pdf$/);
+assert.equal(readFileSync(uploadPath, "utf8"), uploadBody.toString());
+// a traversal-y name stays a label: the file is still written into the same upload dir
+const traversal = await (
+	await fetch(`${base}api/upload?t=${token}`, {
+		method: "POST",
+		headers: { "x-file-name": encodeURIComponent("../../etc/pass wd.sh") },
+		body: "#!/bin/sh",
+	})
+).json();
+assert.equal(traversal.name, "pass wd.sh");
+assert.equal(dirname(traversal.path), dirname(uploadPath));
+assert.match(traversal.path, /\/[0-9a-f]{16}\.sh$/);
+// names with a malformed escape still work, and an empty body is refused
+const weird = await fetch(`${base}api/upload?t=${token}`, { method: "POST", headers: { "x-file-name": "%E0%A4%A" }, body: "x" });
+assert.equal(weird.status, 200);
+assert.equal(existsSync((await weird.json()).path), true);
+assert.equal((await fetch(`${base}api/upload?t=${token}`, { method: "POST", body: "" })).status, 400);
+assert.equal((await fetch(`${base}api/upload?t=nope`, { method: "POST", body: "x" })).status, 401);
+
 // session list
 const listed = await (await fetch(`${base}api/sessions?t=${token}`)).json();
 assert.equal(listed.sessions.length, 1);
 assert.equal(listed.sessions[0].path, "/fake/old.jsonl");
+
+// delete: only listed sessions can go, never the active one, and the file really disappears
+const doomed = join(tmpdir(), `nife-webui-delete-${process.pid}.jsonl`);
+writeFileSync(doomed, '{"type":"session"}\n');
+const deleteSession = (path) =>
+	fetch(`${base}api/delete?t=${token}`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ path }),
+	});
+assert.equal((await deleteSession(doomed)).status, 404, "an unlisted path must not be deletable");
+assert.equal(existsSync(doomed), true);
+process.env.NIFE_SMOKE_SESSION = doomed;
+assert.equal((await deleteSession("/fake/current.jsonl")).status, 409, "the active session stays put");
+assert.equal((await deleteSession("/tmp/not-a-session.txt")).status, 404);
+assert.equal((await deleteSession("")).status, 400);
+const removed = await deleteSession(doomed);
+assert.equal(removed.status, 200);
+assert.match(await removed.text(), /^(trash|unlink)$/);
+assert.equal(existsSync(doomed), false, "the session file is gone");
+delete process.env.NIFE_SMOKE_SESSION;
 
 // resume + new go through the dispatched webui-session command; the bridge keeps port/token
 assert.equal((await fetch(`${base}api/resume?t=${token}`, {
@@ -232,7 +342,7 @@ assert.deepEqual(switched, ["/fake/old.jsonl"]);
 assert.equal((await fetch(`${base}api/new?t=${token}`, { method: "POST" })).status, 200);
 assert.deepEqual(switched, ["/fake/old.jsonl", "<new>"]);
 assert.deepEqual(
-	sent.filter((entry) => entry.text.startsWith("/webui-session")).map((entry) => entry.text),
+	sent.filter((entry) => typeof entry.text === "string" && entry.text.startsWith("/webui-session")).map((entry) => entry.text),
 	["/webui-session resume /fake/old.jsonl", "/webui-session new"],
 );
 
@@ -338,5 +448,6 @@ assert.equal(notes.filter((n) => n.startsWith("notify:webui: ")).length, 0, "aut
 await commands.get("webui").handler("auto", tuiCtx);
 assert.ok(notes.includes("notify:webui autostart is off"));
 
+rmSync(freshUpload, { recursive: true, force: true });
 console.log("smoke ok");
 process.exit(0);

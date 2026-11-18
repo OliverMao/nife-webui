@@ -9,11 +9,13 @@
  * /webui off    stop
  */
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { existsSync, rmSync } from "node:fs";
+import { mkdir, readdir, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
 import { dirname, extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getAgentDir, SessionManager } from "nife-coding-agent";
@@ -41,6 +43,116 @@ const CONTENT_TYPES: Record<string, string> = {
 type DialogKind = "confirm" | "select" | "input" | "editor";
 type OriginalUI = Pick<ExtensionUIContext, "confirm" | "select" | "input" | "editor">;
 
+/**
+ * Image paste. The extension API already takes ImageContent blocks, so the bridge only has to
+ * validate what the page posts: the same mime list nife uses for clipboard images, and nife's
+ * own resize cap of 4.5MB of base64 (below the providers' 5MB per-image limit). web/src/paste.js
+ * mirrors the numbers for early feedback; the checks live here too because the endpoint must not
+ * trust the page.
+ */
+const IMAGE_MIME_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
+const MAX_IMAGES = 4;
+const MAX_IMAGE_BASE64 = Math.floor(4.5 * 1024 * 1024);
+const BASE64 = /^[A-Za-z0-9+/]+={0,2}$/;
+/** Four just-under-limit images plus the text. */
+const PROMPT_MAX_BODY = MAX_IMAGES * MAX_IMAGE_BASE64 + 256 * 1024;
+
+type ImageBlock = { type: "image"; mimeType: string; data: string };
+type TextBlock = { type: "text"; text: string };
+
+/**
+ * Dropped non-image files. A browser drop never reveals the local path, so the page uploads the
+ * bytes and gets one back: the prompt then carries the path and the agent reads it with a tool,
+ * exactly like a terminal drop. Files live in the OS temp dir and are removed when this process
+ * exits (plus a sweep of abandoned directories from crashed runs).
+ */
+const UPLOAD_ROOT = join(tmpdir(), "nife-webui");
+const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
+const UPLOAD_STALE_MS = 12 * 60 * 60 * 1000;
+
+/** Directories to remove on exit, kept module-wide so a reloaded extension still cleans up. */
+const trackedUploadDirs = new Set<string>();
+
+function trackUploadDir(dir: string): void {
+	trackedUploadDirs.add(dir);
+	if (trackedUploadDirs.size !== 1) return;
+	process.once("exit", () => {
+		for (const path of trackedUploadDirs) rmSync(path, { recursive: true, force: true });
+	});
+}
+
+function pidAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** Remove upload dirs from earlier runs; a live pid keeps its files even when they are old. */
+async function sweepUploads(): Promise<void> {
+	const entries = await readdir(UPLOAD_ROOT).catch(() => [] as string[]);
+	const cutoff = Date.now() - UPLOAD_STALE_MS;
+	for (const name of entries) {
+		const pid = Number(name.split("-")[0]);
+		if (Number.isInteger(pid) && pid > 0 && pidAlive(pid)) continue;
+		const path = join(UPLOAD_ROOT, name);
+		try {
+			if ((await stat(path)).mtimeMs < cutoff) await rm(path, { recursive: true, force: true });
+		} catch {
+			// another process may have removed it first
+		}
+	}
+}
+
+async function ensureUploadDir(b: Bridge): Promise<string> {
+	if (b.uploadDir) return b.uploadDir;
+	const dir = join(UPLOAD_ROOT, `${process.pid}-${b.token.slice(0, 8)}`);
+	await mkdir(dir, { recursive: true });
+	trackUploadDir(dir);
+	b.uploadDir = dir;
+	return dir;
+}
+
+/**
+ * The name shown in the UI. The original is only a label, so it keeps unicode and spaces, loses any
+ * directory parts, and is capped; nothing here reaches the filesystem.
+ */
+function sanitizeFileName(name: string): string {
+	const base = name.split(/[\\/]/).pop() ?? "";
+	const cleaned = base.replace(/[\u0000-\u001f\u007f<>:"|?*]+/g, " ").replace(/^\.+/, "").trim();
+	return cleaned.slice(0, 80) || "file";
+}
+
+/**
+ * Stored names are generated, never taken from the request: the user's name cannot pick a path, a
+ * length, a collision or a suffix that some tool later interprets. Only a harmless extension is
+ * carried over so external commands still infer the type from the path.
+ */
+function storedFileName(displayName: string): string {
+	const extension = extname(displayName).toLowerCase();
+	return `${randomBytes(8).toString("hex")}${/^\.[a-z0-9]{1,8}$/.test(extension) ? extension : ""}`;
+}
+
+/** Image blocks from the request, or a message saying why they were rejected. */
+function parseImages(value: unknown): ImageBlock[] | string {
+	if (value === undefined) return [];
+	if (!Array.isArray(value)) return "images must be an array";
+	if (value.length > MAX_IMAGES) return `at most ${MAX_IMAGES} images per message`;
+	const blocks: ImageBlock[] = [];
+	for (const entry of value) {
+		const image = (entry ?? {}) as { mimeType?: unknown; data?: unknown };
+		const mimeType = typeof image.mimeType === "string" ? image.mimeType : "";
+		const data = typeof image.data === "string" ? image.data : "";
+		if (!IMAGE_MIME_TYPES.includes(mimeType)) return `unsupported image type ${mimeType || "(none)"}`;
+		if (!BASE64.test(data)) return "malformed image data";
+		if (data.length > MAX_IMAGE_BASE64) return "image is too large (limit 4.5MB)";
+		blocks.push({ type: "image", mimeType, data });
+	}
+	return blocks;
+}
+
 interface Bridge {
 	api: ExtensionAPI;
 	ctx: ExtensionContext;
@@ -57,6 +169,8 @@ interface Bridge {
 	autoOpened: boolean;
 	/** Resolver for the session switch currently in flight, settled by the webui-session command. */
 	switchRequest: ((outcome: SwitchOutcome) => void) | undefined;
+	/** Uploaded drop target for this bridge; created on first drop, removed when the process exits. */
+	uploadDir: string | undefined;
 }
 
 interface SwitchOutcome {
@@ -149,15 +263,19 @@ function send(res: ServerResponse, status: number, body: string | Buffer, type =
 	res.end(body);
 }
 
-async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
+async function readBody(req: IncomingMessage, limit: number): Promise<Buffer> {
 	const chunks: Buffer[] = [];
 	let size = 0;
 	for await (const chunk of req) {
 		size += (chunk as Buffer).length;
-		if (size > 256 * 1024) throw new Error("body too large");
+		if (size > limit) throw new Error("body too large");
 		chunks.push(chunk as Buffer);
 	}
-	return JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+	return Buffer.concat(chunks);
+}
+
+async function readJson(req: IncomingMessage, limit = 256 * 1024): Promise<Record<string, unknown>> {
+	return JSON.parse((await readBody(req, limit)).toString("utf8")) as Record<string, unknown>;
 }
 
 const ALL_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -271,6 +389,24 @@ async function listSessions(b: Bridge): Promise<unknown> {
 	};
 }
 
+/**
+ * Deleting a session mirrors the TUI selector: prefer the `trash` CLI so the file is recoverable,
+ * fall back to unlink. Only paths that SessionManager lists for this cwd are ever passed here.
+ */
+async function deleteSessionFile(
+	sessionPath: string,
+): Promise<{ ok: boolean; method: "trash" | "unlink"; error?: string }> {
+	const args = sessionPath.startsWith("-") ? ["--", sessionPath] : [sessionPath];
+	const trashed = spawnSync("trash", args, { encoding: "utf-8" });
+	if (trashed.status === 0 || !existsSync(sessionPath)) return { ok: true, method: "trash" };
+	try {
+		await unlink(sessionPath);
+		return { ok: true, method: "unlink" };
+	} catch (error) {
+		return { ok: false, method: "unlink", error: error instanceof Error ? error.message : "delete failed" };
+	}
+}
+
 function requestSwitch(b: Bridge, args: string): Promise<SwitchOutcome> {
 	if (!b.ctx.isIdle()) return Promise.resolve({ ok: false, message: "stop the current turn first" });
 	const api = b.api;
@@ -323,15 +459,58 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 	}
 
 	if (req.method === "POST" && path === "/api/prompt") {
-		const body = await readJson(req);
-		const text = typeof body.text === "string" ? body.text.trim() : "";
-		if (!text) return send(res, 400, "empty prompt");
+		let body: Record<string, unknown>;
 		try {
-			b.api.sendUserMessage(text, b.ctx.isIdle() ? undefined : { deliverAs: "steer" });
+			body = await readJson(req, PROMPT_MAX_BODY);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : "bad body";
+			return send(res, message === "body too large" ? 413 : 400, message);
+		}
+		const text = typeof body.text === "string" ? body.text.trim() : "";
+		const images = parseImages(body.images);
+		if (typeof images === "string") return send(res, 400, images);
+		if (!text && images.length === 0) return send(res, 400, "empty prompt");
+		if (images.length > 0 && !b.ctx.model?.input?.includes("image")) {
+			return send(res, 409, `${b.ctx.model?.id ?? "this model"} does not accept images`);
+		}
+		// Text-only prompts stay a string so slash commands and prompt templates keep working.
+		const content: string | (TextBlock | ImageBlock)[] =
+			images.length === 0 ? text : text ? [{ type: "text", text }, ...images] : images;
+		try {
+			b.api.sendUserMessage(content, b.ctx.isIdle() ? undefined : { deliverAs: "steer" });
 		} catch (error) {
 			return send(res, 409, error instanceof Error ? error.message : "send failed");
 		}
 		return send(res, 200, "ok");
+	}
+
+	if (req.method === "POST" && path === "/api/upload") {
+		const header = req.headers["x-file-name"];
+		let name = "file";
+		if (typeof header === "string" && header) {
+			try {
+				name = sanitizeFileName(decodeURIComponent(header));
+			} catch {
+				// a malformed escape is not worth a different status: sanitize the raw header
+				name = sanitizeFileName(header);
+			}
+		}
+		let bytes: Buffer;
+		try {
+			bytes = await readBody(req, MAX_UPLOAD_BYTES);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : "bad upload";
+			return send(res, message === "body too large" ? 413 : 400, message);
+		}
+		if (bytes.length === 0) return send(res, 400, "empty file");
+		try {
+			const dir = await ensureUploadDir(b);
+			const file = join(dir, storedFileName(name));
+			await writeFile(file, bytes);
+			return send(res, 200, JSON.stringify({ path: file, name }), "application/json");
+		} catch (error) {
+			return send(res, 500, error instanceof Error ? error.message : "upload failed");
+		}
 	}
 
 	if (req.method === "POST" && path === "/api/abort") {
@@ -378,6 +557,20 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		if (!outcome.ok) return send(res, 409, outcome.message ?? "switch failed");
 		broadcast(b, { type: "session_switch" });
 		return send(res, 200, "ok");
+	}
+
+	if (req.method === "POST" && path === "/api/delete") {
+		const body = await readJson(req);
+		const target = typeof body.path === "string" ? body.path : "";
+		if (!target) return send(res, 400, "missing path");
+		if (target === b.ctx.sessionManager.getSessionFile()) return send(res, 409, "cannot delete the active session");
+		// Never delete arbitrary paths: the target has to be a session this project lists.
+		const known = (await SessionManager.list(b.ctx.cwd)).some((session) => session.path === target);
+		if (!known) return send(res, 404, "unknown session");
+		const result = await deleteSessionFile(target);
+		if (!result.ok) return send(res, 500, result.error ?? "delete failed");
+		broadcast(b, { type: "sessions_changed" });
+		return send(res, 200, result.method);
 	}
 
 	if (req.method === "POST" && path === "/api/new") {
@@ -432,7 +625,9 @@ function openBrowser(url: string): void {
 	}
 }
 
-function start(api: ExtensionAPI, ctx: ExtensionContext): Promise<Bridge> {
+async function start(api: ExtensionAPI, ctx: ExtensionContext): Promise<Bridge> {
+	// Abandoned upload dirs from crashed runs would otherwise accumulate in the temp dir.
+	await sweepUploads();
 	const token = randomBytes(16).toString("hex");
 	const server = createServer();
 	const b: Bridge = {
@@ -448,6 +643,7 @@ function start(api: ExtensionAPI, ctx: ExtensionContext): Promise<Bridge> {
 		children: new Map(),
 		autoOpened: false,
 		switchRequest: undefined,
+		uploadDir: undefined,
 	};
 
 	server.on("request", (req, res) => {
