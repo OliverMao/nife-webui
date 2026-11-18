@@ -1,0 +1,45 @@
+{
+  "name": "nife-webui",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Browser UI attached to a running nife CLI session (same session, same stream, same dialogs)",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "files": [
+    "extensions",
+    "web/dist"
+  ],
+  "peerDependencies": {
+    "nife-coding-agent": "*"
+  },
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite",
+    "prepack": "npm run build",
+    "smoke": "node scripts/markdown-test.mjs && node scripts/paste-test.mjs && node scripts/smoke.mjs"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.11",
+    "vite": "^8.3.8",
+    "vue": "^3.5.45"
+  },
+  "keywords": [
+    "pi-package",
+    "nife",
+    "web-ui",
+    "browser"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OliverMao/nife-webui.git"
+  },
+  "homepage": "https://github.com/OliverMao/nife-webui#readme",
+  "bugs": {
+    "url": "https://github.com/OliverMao/nife-webui/issues"
+  }
+}
