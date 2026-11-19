@@ -637,6 +637,19 @@ async function dispatch(item) {
 	return result;
 }
 
+/**
+ * One retry tick for a bridge that answered "busy": the settle event is the real trigger, this only
+ * covers the case where that event was missed (reconnect) and the strip would otherwise sit still.
+ */
+let drainTimer = 0;
+function scheduleDrain() {
+	if (drainTimer) return;
+	drainTimer = window.setTimeout(() => {
+		drainTimer = 0;
+		void drain();
+	}, 800);
+}
+
 async function send() {
 	if (compacting.value) return;
 	const value = expandPastes(text.value, pastes).trim();
@@ -669,6 +682,14 @@ async function send() {
 			queuePaused.value = false;
 			return;
 		}
+		// "busy" means the session is mid-turn after all: park it again, resumed, and let the settle
+		// drain it - it is not an error the user has to retry
+		if (result.message === "busy") {
+			queuePaused.value = false;
+			queue.value = [item, ...queue.value];
+			scheduleDrain();
+			return;
+		}
 		const message = result.message || "could not send";
 		queue.value = [{ ...item, error: message }, ...queue.value];
 		showNotice(message);
@@ -694,6 +715,12 @@ async function drain() {
 	if (!head) return;
 	const result = await dispatch(head);
 	if (!result.ok) {
+		// a busy bridge is transient: the item stays at the head with no error and the next settle
+		// sends it (this is the only case where the page and nife briefly disagree about being idle)
+		if (result.message === "busy") {
+			scheduleDrain();
+			return;
+		}
 		// keep it at the head so nothing is lost, and stop: retrying every turn would spam the notice
 		const message = result.message || "could not send";
 		queue.value = queue.value.map((item, index) => (index === 0 ? { ...item, error: message } : item));
@@ -1043,6 +1070,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
 	cancelAnimationFrame(sweepFrame);
+	if (drainTimer) clearTimeout(drainTimer);
 	resizeObserver?.disconnect();
 	window.removeEventListener("dragover", onDragOver);
 	window.removeEventListener("dragleave", onDragLeave);

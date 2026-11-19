@@ -532,11 +532,16 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		if (images.length > 0 && !b.ctx.model?.input?.includes("image")) {
 			return send(res, 409, `${b.ctx.model?.id ?? "this model"} does not accept images`);
 		}
+		// The page owns the pending queue. Never deliverAs "steer": that would inject the prompt into
+		// nife's own mid-turn queue, so the browser strip and the session would disagree about what is
+		// still waiting. A busy session is a 409 and the page keeps the item, sending it after the
+		// turn settles.
+		if (!b.ctx.isIdle()) return send(res, 409, "busy");
 		// Text-only prompts stay a string so slash commands and prompt templates keep working.
 		const content: string | (TextBlock | ImageBlock)[] =
 			images.length === 0 ? text : text ? [{ type: "text", text }, ...images] : images;
 		try {
-			b.api.sendUserMessage(content, b.ctx.isIdle() ? undefined : { deliverAs: "steer" });
+			b.api.sendUserMessage(content);
 		} catch (error) {
 			return send(res, 409, error instanceof Error ? error.message : "send failed");
 		}

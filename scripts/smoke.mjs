@@ -224,6 +224,19 @@ assert.equal((await fetch(`${base}api/prompt?t=${token}`, {
 })).status, 200);
 assert.deepEqual(sent[0], { text: "hi", opts: undefined });
 
+// a mid-turn prompt is refused instead of being steered into nife's own queue: the page owns the
+// pending list, so it keeps the item and sends it after the turn settles
+ctx.isIdle = () => false;
+const busyPrompt = await fetch(`${base}api/prompt?t=${token}`, {
+	method: "POST",
+	headers: { "content-type": "application/json" },
+	body: JSON.stringify({ text: "later" }),
+});
+assert.equal(busyPrompt.status, 409);
+assert.equal(await busyPrompt.text(), "busy");
+assert.equal(sent.length, 1, "nothing reaches nife while it is busy");
+ctx.isIdle = () => true;
+
 // proxy switch: nife fixes the proxy address at startup but undici re-reads NO_PROXY per request,
 // so the page can drop to a direct connection and come back without restarting anything
 process.env.HTTPS_PROXY = "http://127.0.0.1:7890";

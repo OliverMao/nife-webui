@@ -227,7 +227,9 @@ page reloads the transcript of the newly active session. That is why the bridge 
 - Initial transcript: `ctx.sessionManager.buildContextEntries()` projected through
   `sessionEntryToContextMessages()`, i.e. the same compaction-aware view the TUI renders, so a
   summary replaces the messages it squeezed out and shows up as a `Context compacted` row.
-- Sending: `pi.sendUserMessage()`; while streaming it is delivered as `steer`.
+- Sending: `pi.sendUserMessage()`. While the session is busy the endpoint answers `409 busy` and
+  the page keeps the item in its own strip - nothing is delivered as `steer`, so nife's mid-turn
+  queue never holds anything the browser is still showing as pending.
 - Drops: `POST /api/upload` writes the bytes to the OS temp dir and returns the path, which the page
   inserts as text. The same token and `Origin` checks guard it, and cleanup is described above.
 - Dialogs: all extensions in a session share one mutable `ctx.ui` object, so the bridge wraps
