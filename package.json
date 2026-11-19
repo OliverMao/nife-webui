@@ -1,7 +1,7 @@
 {
   "name": "nife-webui",
   "version": "0.0.9",
-  "private": false,
+  "private": true,
   "description": "Browser UI attached to a running nife CLI session (same session, same stream, same dialogs)",
   "type": "module",
   "pi": {
