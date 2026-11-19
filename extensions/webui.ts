@@ -362,14 +362,143 @@ function setProxyBypass(b: Bridge, bypass: boolean): void {
 	b.proxyBypassSaved = undefined;
 }
 
-function snapshot(b: Bridge): unknown {
+/**
+ * A long session cannot travel in one response: the page would spend its load time parsing
+ * megabytes of JSON and building the objects before it can paint anything. It gets a tail slice
+ * instead and asks for the previous one as the reader scrolls up, so the cost of a page load stops
+ * depending on how much was said earlier.
+ */
+const PAGE_MIN = 20;
+const PAGE_MAX = 60;
+const PAGE_BYTES = 400 * 1024;
+
+/** Rough serialized size of a message; enough to keep a page inside the byte budget. */
+function messageSize(message: { content?: unknown }): number {
+	const content = message.content;
+	if (typeof content === "string") return content.length;
+	if (!Array.isArray(content)) return 64;
+	let size = 64;
+	for (const block of content as Record<string, unknown>[]) {
+		if (!block || typeof block !== "object") continue;
+		if (typeof block.text === "string") size += block.text.length;
+		else if (typeof block.thinking === "string") size += block.thinking.length;
+		else if (typeof block.data === "string") size += block.data.length;
+		else if (block.arguments) size += JSON.stringify(block.arguments).length;
+	}
+	return size;
+}
+
+/**
+ * The page that ends at `end`. A page starts on a user message when it can, so a tool call is never
+ * separated from the result the transcript pairs it with.
+ */
+function pageOf<T extends { role: string; content?: unknown }>(
+	messages: T[],
+	end: number,
+): { messages: T[]; from: number } {
+	let start = Math.min(end, messages.length);
+	let bytes = 0;
+	while (start > 0 && end - start < PAGE_MAX) {
+		const size = messageSize(messages[start - 1]);
+		// the minimum keeps a page useful even when a single tool result is huge
+		if (end - start >= PAGE_MIN && bytes + size > PAGE_BYTES) break;
+		bytes += size;
+		start -= 1;
+	}
+	while (start > 0 && messages[start].role !== "user" && end - start < 500) start -= 1;
+	return { messages: messages.slice(start, end), from: start };
+}
+
+/**
+ * The rail needs every task in the session, not only the ones whose page is loaded, so the index
+ * travels with the state: a message index plus a label, no content. Absolute indices are stable
+ * when older pages are prepended, which is what makes "jump to task 3" work from a tail page.
+ */
+const TASK_MAX = 300;
+
+function promptLabel(message: { content?: unknown }): string {
+	const content = message.content;
+	let raw = "";
+	if (typeof content === "string") raw = content;
+	else if (Array.isArray(content)) {
+		for (const block of content as { type?: string; text?: string }[]) {
+			if (block?.type === "text" && typeof block.text === "string") raw += `${block.text}\n`;
+		}
+	}
+	const line = raw
+		.split("\n")
+		// dropped files ride along as marker lines; they are not what was asked
+		.filter((part) => part.trim() && !part.trim().startsWith("[attached] "))
+		.map((part) => part.trim().replace(/^#+\s*/, "").replace(/[`*]/g, ""))
+		.find(Boolean);
+	if (!line) return "attachment";
+	return line.length > 80 ? `${line.slice(0, 80)}…` : line;
+}
+
+function taskIndex(messages: { role: string; content?: unknown }[]): { index: number; label: string }[] {
+	const tasks: { index: number; label: string }[] = [];
+	for (let index = 0; index < messages.length; index += 1) {
+		const message = messages[index];
+		if (message.role !== "user") continue;
+		tasks.push({ index, label: promptLabel(message) });
+	}
+	const trimmed = tasks.slice(-TASK_MAX);
+	// The rail has to cover the whole transcript, or the top mark leaves rows above it that no mark
+	// points at. After compaction the first row is the summary, not a prompt, so label it as such.
+	const head = messages[0];
+	// A session that starts on a prompt needs no extra mark: the first task already is the top.
+	if (!head || head.role === "user") return trimmed;
+	const label = head?.role === "compactionSummary" ? "Compacted context" : head?.role === "branchSummary" ? "Branch summary" : "Session start";
+	return [{ index: 0, label }, ...trimmed];
+}
+
+/**
+ * What the transcript shows: the whole active branch, not the compaction-aware context. Compaction
+ * drops old messages from the model's context, but the reader still wants to scroll back through
+ * them, so the session history stays complete and each compaction becomes a marker row in place.
+ */
+interface TranscriptMessage {
+	role: string;
+	display?: boolean;
+	content?: unknown;
+	summary?: string;
+	tokensBefore?: number;
+	timestamp?: string;
+	customType?: string;
+	usage?: {
+		input: number;
+		output: number;
+		cacheRead: number;
+		cacheWrite: number;
+		cost?: { total?: number };
+	};
+}
+
+function contextMessages(b: Bridge): TranscriptMessage[] {
+	const out: TranscriptMessage[] = [];
+	for (const entry of b.ctx.sessionManager.getBranch()) {
+		if (entry.type === "compaction") {
+			// A row where the context was rewritten, so the missing messages are explained in place.
+			out.push({
+				role: "compactionMarker",
+				summary: entry.summary,
+				tokensBefore: entry.tokensBefore,
+				timestamp: entry.timestamp,
+			});
+			continue;
+		}
+		for (const message of sessionEntryToContextMessages(entry)) {
+			const row = message as unknown as TranscriptMessage;
+			if (!isHiddenMessage(row)) out.push(row);
+		}
+	}
+	return out;
+}
+
+function snapshot(b: Bridge, metaOnly = false): unknown {
 	const ctx = b.ctx;
-	// buildContextEntries() is what the TUI renders: it starts at the newest compaction, so a
-	// summary replaces the messages it squeezed out instead of showing the whole old branch.
-	const messages = ctx.sessionManager
-		.buildContextEntries()
-		.flatMap((entry) => sessionEntryToContextMessages(entry))
-		.filter((message) => !isHiddenMessage(message as { role: string; display?: boolean }));
+	const messages = contextMessages(b);
+	const page = pageOf(messages, messages.length);
 	const model = ctx.model;
 	const stats = {
 		messages: messages.length,
@@ -416,7 +545,11 @@ function snapshot(b: Bridge): unknown {
 		proxy: proxyState(b),
 		stats,
 		subagents: [...b.children.values()],
-		messages,
+		// the transcript reads `messages` and asks for older pages with `loadedFrom` as the cursor
+		messages: metaOnly ? [] : page.messages,
+		messageCount: messages.length,
+		loadedFrom: page.from,
+		tasks: taskIndex(messages),
 	};
 }
 
@@ -496,7 +629,17 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 	if (url.searchParams.get("t") !== b.token) return send(res, 401, "bad token");
 
 	if (req.method === "GET" && path === "/api/state") {
-		return send(res, 200, JSON.stringify(snapshot(b)), "application/json");
+		// the header refresh runs on every event and only reads counts: no reason to ship the page
+		return send(res, 200, JSON.stringify(snapshot(b, url.searchParams.get("meta") === "1")), "application/json");
+	}
+
+	// one page of older messages, ending right before `before`
+	if (req.method === "GET" && path === "/api/messages") {
+		const before = Number(url.searchParams.get("before"));
+		if (!Number.isInteger(before) || before <= 0) return send(res, 400, "before must be a positive index");
+		const messages = contextMessages(b);
+		const page = pageOf(messages, Math.min(before, messages.length));
+		return send(res, 200, JSON.stringify({ messages: page.messages, from: page.from, total: messages.length }), "application/json");
 	}
 
 	if (req.method === "GET" && path === "/api/sessions") {

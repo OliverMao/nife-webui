@@ -82,7 +82,8 @@ let contextEntries = branchEntries;
 const sessionManager = {
 	getSessionId: () => "sess-1",
 	getSessionFile: () => "/fake/current.jsonl",
-	getBranch: () => branchEntries,
+	// the transcript now walks the whole branch: pre-compaction messages stay visible
+	getBranch: () => contextEntries,
 	buildContextEntries: () => contextEntries,
 };
 const ui = {
@@ -198,17 +199,129 @@ assert.deepEqual(state.stats, {
 	cost: 0.0042,
 });
 assert.deepEqual(state.subagents, []);
+assert.equal(state.messageCount, 2);
+assert.equal(state.loadedFrom, 0, "a short session is one page");
+
+// a long session travels as a tail page: the browser must not parse the whole history on load
+const turn = (index) => ({
+	type: "message",
+	id: `p${index}`,
+	parentId: null,
+	timestamp: "t",
+	message:
+		index % 2 === 0
+			? { role: "user", content: `question ${index}`, timestamp: index }
+			: { role: "assistant", content: [{ type: "text", text: `answer ${index}` }], timestamp: index },
+});
+contextEntries = Array.from({ length: 130 }, (_, index) => turn(index));
+const paged = await (await fetch(`${base}api/state?t=${token}`)).json();
+assert.equal(paged.messageCount, 130);
+assert.ok(paged.loadedFrom > 0, "the page starts inside the history");
+assert.ok(paged.messages.length <= 60, `a page stays bounded (${paged.messages.length})`);
+assert.equal(paged.messages[0].role, "user", "a page starts on a turn, never between a tool call and its result");
+assert.equal(paged.messages[0].content, `question ${paged.loadedFrom}`);
+
+// walking the cursor back rebuilds the whole history exactly once, in order
+const seen = paged.messages.map((message) => message.content);
+let cursor = paged.loadedFrom;
+while (cursor > 0) {
+	const page = await (await fetch(`${base}api/messages?before=${cursor}&t=${token}`)).json();
+	assert.equal(page.total, 130);
+	assert.ok(page.from < cursor, "each page moves the cursor back");
+	assert.equal(page.messages[0].role, "user");
+	seen.unshift(...page.messages.map((message) => message.content));
+	cursor = page.from;
+}
+assert.equal(seen.length, 130);
+assert.equal(seen[0], "question 0");
+assert.equal(seen.at(-1)[0].text, "answer 129");
+
+// meta=1 is the header refresh: same counts, no transcript payload
+const meta = await (await fetch(`${base}api/state?meta=1&t=${token}`)).json();
+assert.deepEqual(meta.messages, []);
+assert.equal(meta.messageCount, 130);
+
+// the rail covers the whole session, not just the loaded page
+assert.equal(paged.tasks.length, 65, "one mark per prompt, even ones in unloaded pages");
+assert.deepEqual(paged.tasks[0], { index: 0, label: "question 0" }, "a prompt at index 0 is not duplicated");
+assert.equal(paged.tasks.at(-1).index, 128);
+assert.equal(meta.tasks.length, 65, "the header refresh carries the rail too");
+
+// labels are the first real line: marker lines, headings and emphasis are noise in a tooltip
+contextEntries = [
+	{
+		type: "message",
+		id: "l0",
+		parentId: null,
+		timestamp: "t",
+		message: { role: "user", content: '[attached] {"name":"a.pdf","path":"/tmp/a.pdf"}\n\n## Fix the **scroll** bug', timestamp: 0 },
+	},
+	{
+		type: "message",
+		id: "l1",
+		parentId: null,
+		timestamp: "t",
+		message: { role: "user", content: [{ type: "image", data: "x", mimeType: "image/png" }], timestamp: 1 },
+	},
+	{
+		type: "message",
+		id: "l2",
+		parentId: null,
+		timestamp: "t",
+		message: { role: "user", content: "z".repeat(300), timestamp: 2 },
+	},
+];
+const labelled = await (await fetch(`${base}api/state?t=${token}`)).json();
+assert.deepEqual(
+	labelled.tasks.map((task) => task.label),
+	["Fix the scroll bug", "attachment", `${"z".repeat(80)}…`],
+);
+
+// the bike-shed case: a session with more prompts than the index carries keeps the newest
+contextEntries = Array.from({ length: 700 }, (_, index) => ({
+	type: "message",
+	id: `m${index}`,
+	parentId: null,
+	timestamp: "t",
+	message: { role: "user", content: `ask ${index}`, timestamp: index },
+}));
+const many = await (await fetch(`${base}api/state?t=${token}`)).json();
+assert.equal(many.tasks.length, 300, "the task index is capped");
+assert.equal(many.tasks.at(-1).label, "ask 699", "and it is the newest end that is kept");
+
+// the byte budget wins over the message count when the tail is heavy
+contextEntries = Array.from({ length: 45 }, (_, index) => ({
+	type: "message",
+	id: `b${index}`,
+	parentId: null,
+	timestamp: "t",
+	message:
+		index % 2 === 0
+			? { role: "user", content: "x".repeat(30_000), timestamp: index }
+			: { role: "assistant", content: [{ type: "text", text: "y".repeat(30_000) }], timestamp: index },
+}));
+const heavy = await (await fetch(`${base}api/state?t=${token}`)).json();
+assert.ok(heavy.messages.length <= 21, `heavy tail is cut by bytes, not only by count (${heavy.messages.length})`);
+assert.ok(heavy.messages.length >= 20, "but a page is never truncated into something useless");
+assert.equal((await fetch(`${base}api/messages?before=0&t=${token}`)).status, 400);
+assert.equal((await fetch(`${base}api/messages?before=abc&t=${token}`)).status, 400);
+contextEntries = branchEntries;
 assert.equal(state.model.id, "test-model");
 assert.equal(state.usage.percent, 24.1);
 
-// compaction-aware transcript: the summary replaces the messages it squeezed out
+// compaction keeps the whole history: the squeezed-out turn stays readable and the compaction is a
+// marker row in the place where it happened
 contextEntries = [
-	{ type: "compaction", id: "c1", parentId: null, timestamp: "t", summary: "earlier work", tokensBefore: 1234, firstKeptEntryId: "e4" },
-	{ type: "message", id: "e4", parentId: "c1", timestamp: "t", message: { role: "user", content: "after the summary", timestamp: 1 } },
+	{ type: "message", id: "e1", parentId: null, timestamp: "t", message: { role: "user", content: "before the summary", timestamp: 1 } },
+	{ type: "message", id: "e2", parentId: "e1", timestamp: "t", message: { role: "assistant", content: [{ type: "text", text: "old answer" }], timestamp: 2 } },
+	{ type: "compaction", id: "c1", parentId: "e2", timestamp: "t", summary: "earlier work", tokensBefore: 1234, firstKeptEntryId: "e4" },
+	{ type: "message", id: "e4", parentId: "c1", timestamp: "t", message: { role: "user", content: "after the summary", timestamp: 3 } },
 ];
 const compactedState = await (await fetch(`${base}api/state?t=${token}`)).json();
-assert.deepEqual(compactedState.messages.map((entry) => entry.role), ["compactionSummary", "user"]);
-assert.equal(compactedState.messages[0].summary, "earlier work");
+assert.deepEqual(compactedState.messages.map((entry) => entry.role), ["user", "assistant", "compactionMarker", "user"]);
+assert.equal(compactedState.messages[2].summary, "earlier work");
+assert.equal(compactedState.messages[2].tokensBefore, 1234);
+assert.deepEqual(compactedState.tasks.map((task) => task.label), ["before the summary", "after the summary"]);
 contextEntries = branchEntries;
 
 

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { countItems, failedTool, groupBlocks, groupItems, isProcessItem, stepLabel } from "../web/src/transcript.js";
+import { countItems, failedTool, groupBlocks, groupItems, isProcessItem, railMarks, stepLabel } from "../web/src/transcript.js";
 
 const thinking = (text) => ({ type: "thinking", thinking: text });
 const toolCall = (id) => ({ type: "toolCall", id, name: "bash", arguments: { command: "ls" } });
@@ -91,3 +91,14 @@ assert.equal(countItems([{ kind: "result", message: { toolName: "grep", isError:
 assert.equal(countItems([failedCall]).failed, true);
 
 console.log("transcript ok");
+
+// Long sessions thin the rail but never drop the newest task.
+const many = Array.from({ length: 101 }, (_, index) => ({ index: index * 2, label: `task ${index}` }));
+const thinned = railMarks(many, 40);
+assert.ok(thinned.length <= 40, `the rail stays a readable column (${thinned.length})`);
+assert.ok(thinned.length > 30, "thinning drops dots instead of collapsing the rail to a handful");
+assert.equal(thinned.at(-1).label, "task 100");
+assert.equal(thinned[0], many[0], "the first task keeps its dot");
+assert.ok(thinned.every((mark, index) => index === 0 || mark.index > thinned[index - 1].index), "dots stay in order");
+const few = many.slice(0, 40);
+assert.equal(railMarks(few, 40), few, "a short rail is passed through untouched");

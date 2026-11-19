@@ -278,6 +278,7 @@ svg {
 /* main */
 
 .main {
+	position: relative;
 	flex: 1;
 	min-width: 0;
 	min-height: 0;
@@ -336,7 +337,9 @@ svg {
 	min-height: 0;
 	overflow-y: auto;
 	padding: 8px 24px 24px;
-	scrollbar-gutter: stable;
+	/* the task rail below replaces the scrollbar: one dot per prompt is how a long session is
+	   navigated, and dragging a thumb over thousands of rows was never precise anyway */
+	scrollbar-width: none;
 	/* we drive scrollTop from follow(); the browser's own anchoring fights it when the composer or
 	   the queue strip changes the container height */
 	overflow-anchor: none;
@@ -675,6 +678,143 @@ img {
  * Appears only while the view is scrolled away from the newest message. Sticky inside the
  * transcript, so it pins to the bottom of the reading area whatever the composer or queue does.
  */
+.transcript::-webkit-scrollbar {
+	width: 0;
+	height: 0;
+}
+
+/* spacer standing in for the rows outside the window, so the scroll position stays honest */
+.window-pad {
+	width: 100%;
+}
+
+/*
+ * Task rail: one dot per prompt, in a window that scrolls instead of running the height of the
+ * screen. Dots stay dots - the task being read is marked by colour and size, never by growing into
+ * a bar - and the arrow buttons page the window when a session has more prompts than fit.
+ */
+.rail {
+	position: absolute;
+	right: 6px;
+	top: 50%;
+	transform: translateY(-50%);
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: 4px;
+	max-height: min(60vh, 520px);
+	z-index: 2;
+}
+
+.rail-list {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: 4px;
+	overflow-y: auto;
+	overscroll-behavior: contain;
+	scrollbar-width: none;
+}
+
+.rail-list::-webkit-scrollbar {
+	width: 0;
+	height: 0;
+}
+
+.rail-list:focus-visible {
+	outline: 1px solid var(--accent);
+	outline-offset: 2px;
+	border-radius: 8px;
+}
+
+/* the button is a wider hit target than the dot it draws */
+.rail-dot {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	flex: 0 0 auto;
+	width: 16px;
+	height: 12px;
+	padding: 0;
+	background: none;
+}
+
+.rail-dot::before {
+	content: "";
+	width: 6px;
+	height: 6px;
+	border-radius: 50%;
+	background: #4a4a4f;
+	transition:
+		width 140ms ease,
+		height 140ms ease,
+		background 140ms ease;
+}
+
+.rail-dot:hover::before {
+	background: var(--muted);
+}
+
+.rail-dot.active::before {
+	width: 8px;
+	height: 8px;
+	background: var(--accent);
+}
+
+/* hover preview: fixed, so the rail window's own scroll clipping cannot cut it off */
+.rail-tip {
+	position: fixed;
+	right: 44px;
+	transform: translateY(-50%);
+	max-width: 300px;
+	padding: 6px 9px;
+	border: 1px solid var(--line);
+	border-radius: 8px;
+	background: #2b2b2d;
+	color: var(--text);
+	font-size: 12px;
+	line-height: 1.35;
+	overflow: hidden;
+	display: -webkit-box;
+	-webkit-line-clamp: 3;
+	-webkit-box-orient: vertical;
+	box-shadow: 0 6px 18px rgb(0 0 0 / 40%);
+	pointer-events: none;
+	z-index: 30;
+}
+
+.rail-nav {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	flex: 0 0 auto;
+	width: 16px;
+	height: 14px;
+	padding: 0;
+	background: none;
+	color: var(--dim);
+}
+
+.rail-nav:hover {
+	color: var(--text);
+}
+
+.rail-nav svg {
+	width: 11px;
+	height: 11px;
+	fill: none;
+	stroke: currentColor;
+	stroke-width: 1.6;
+	stroke-linecap: round;
+	stroke-linejoin: round;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.rail-dot::before {
+		transition: none;
+	}
+}
+
 .jump-latest {
 	position: sticky;
 	bottom: 4px;
@@ -1227,6 +1367,11 @@ img {
 	/* on narrow screens the sidebar is an overlay, so `collapsed` must not hide it */
 	.app.collapsed .sidebar {
 		display: flex;
+	}
+
+	/* a phone has no room for a rail next to the text; the wheel/touch scroll is the only nav */
+	.rail {
+		display: none;
 	}
 
 	.transcript,

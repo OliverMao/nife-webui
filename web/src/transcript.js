@@ -98,3 +98,16 @@ export const groupBlocks = (blocks) => {
 	flush();
 	return segments;
 };
+
+/**
+ * A hundred tasks would be an unreadable column of dots, so long sessions thin the rail out - but
+ * the newest task always keeps its dot, since that is the one people jump to.
+ */
+export function railMarks(marks, max) {
+	if (marks.length <= max) return marks;
+	const step = Math.ceil(marks.length / max);
+	const picked = marks.filter((_, index) => index % step === 0);
+	const last = marks[marks.length - 1];
+	if (picked[picked.length - 1] !== last) picked.push(last);
+	return picked;
+}

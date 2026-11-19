@@ -224,9 +224,12 @@ page reloads the transcript of the newly active session. That is why the bridge 
 - `extensions/webui.ts` starts a `node:http` server on `127.0.0.1` when `/webui` runs.
 - Events come from the extension API: `message_start`, `message_update` (deltas only),
   `message_end`, `agent_start`, `agent_settled`, `session_info_changed`, `tool_execution_*`.
-- Initial transcript: `ctx.sessionManager.buildContextEntries()` projected through
-  `sessionEntryToContextMessages()`, i.e. the same compaction-aware view the TUI renders, so a
-  summary replaces the messages it squeezed out and shows up as a `Context compacted` row.
+- Initial transcript: `ctx.sessionManager.getBranch()` projected through
+  `sessionEntryToContextMessages()`, i.e. the whole active branch. Compaction only removes messages
+  from the model's context - the reader can still scroll through them - so a `compaction` entry
+  becomes a `compactionMarker` row in the place where the rewrite happened
+  (`Context compacted · 300.2k tokens`, summary expandable). The rail therefore starts on the first
+  prompt of the session, not on the newest summary.
 - Sending: `pi.sendUserMessage()`. While the session is busy the endpoint answers `409 busy` and
   the page keeps the item in its own strip - nothing is delivered as `steer`, so nife's mid-turn
   queue never holds anything the browser is still showing as pending.
@@ -257,12 +260,47 @@ No build step for the extension itself: plain `node:http` + SSE, no runtime depe
 - Do not expose the port publicly. For remote access use an SSH tunnel or Tailscale, not a
   reverse proxy with auth you wrote yourself.
 
+## Long sessions
+
+The transcript is windowed, not fully mounted: only the newest 60 rows are in the DOM, and the
+height of everything above them is carried by a spacer, so the browser lays out a page, not a
+session. Scrolling up renders 24 older rows at a time and gives their real height back to the
+spacer, which is why nothing shifts under the cursor. Two things that were easy to get wrong:
+
+- trimming only happens for rows that are already out of sight (`firstVisible()` bounds it), and the
+  spacer grows by exactly the height that left the flow, measured before the update;
+- jumping into old history parks the window around the target (`runEnd`), otherwise a jump to task 3
+  of a 2000-row session would mount every row below it.
+
+The history is paged as well as windowed: `/api/state` ships a tail slice of the context (at most
+60 messages, ~400 KB, always starting on a user message so a tool call never loses its result),
+together with `messageCount` and `loadedFrom`. Scrolling to the oldest loaded row asks
+`/api/messages?before=<loadedFrom>` for the previous page, and the rows it brings in land above the
+window, so nothing on screen moves. A megabyte of JSON used to be serialized, shipped and parsed
+before the page could paint anything; now a page load costs the same whether the session has 30
+messages or 3000. `/api/state?meta=1` returns the same header fields with an empty `messages` array,
+which is what the event-driven refresh uses.
+
+The scrollbar is hidden and replaced by a rail on the right with one dot per user prompt, since a
+thumb over thousands of pixels was never precise. The rail is built from `state.tasks` - a message
+index plus a label per prompt, no content - so it lists tasks whose messages are not loaded yet;
+clicking such a dot pulls the pages it needs and only then scrolls. Message indices are absolute, so
+they stay valid when a page is prepended (row indices do not, and the window shifts those). The rail
+is a window of its own: a long session has hundreds of prompts, so the dots scroll inside
+`max-height: min(60vh, 520px)` and two arrow buttons page it, with the active dot scrolled into view
+as you read. Dots stay round - the task being read is marked by accent colour and a larger dot, never
+by growing into a bar - and while the view follows the newest message that mark sits on the last
+task, so opening the page shows the current prompt rather than something from the middle. The rail hides on narrow screens.
+
 ## Known limits
 
 - Pasting both text and an image (rich content from an office app) attaches the image only; plain
   text paste is unaffected.
 - Dropped files travel as text, so the terminal still shows the `[attached] <path>` lines the web
   UI hides behind chips: nife has no file content block to carry them any other way.
+- The rail marks user prompts only: a jump lands on what you asked, not on a particular answer, and
+  it carries the newest 300 prompts (older ones fall out of `state.tasks`). A window parked inside
+  the history shows an approximate scroll height until those rows are rendered again.
 - The task queue lives in the page, not on the bridge: a reload or a closed tab drops it, and there
   is no background draining (a paused queue stays paused until you resume it in that tab).
 - Dropped files are temporary: the path in the prompt only resolves while that nife process is

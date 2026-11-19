@@ -12,11 +12,14 @@ import { metaOf, previewOf, promptTextOf, queueProblem } from "./queue.js";
 import { groupItems, stepLabel } from "./transcript.js";
 
 const token = new URLSearchParams(location.search).get("t") ?? "";
-const api = (path) => `/api/${path}?t=${encodeURIComponent(token)}`;
+const api = (path) => `/api/${path}${path.includes("?") ? "&" : "?"}t=${encodeURIComponent(token)}`;
 
 // Committed messages live in a shallowRef: objects are plain (not deep-proxied) and the list is
 // only invalidated on message boundaries, never per streaming token.
 const messages = shallowRef([]);
+// Index of messages[0] in the session's full context: the page loads a tail slice, so this is the
+// cursor for the previous one, and 0 means the whole history is loaded.
+const loadedFrom = ref(0);
 const live = ref(null); // { text, thinking } for the message currently streaming
 const streaming = ref(false);
 const online = ref(true);
@@ -90,7 +93,10 @@ const items = computed(() => {
 	}
 	const list = [];
 	const used = new Set();
-	for (const message of messages.value) {
+	for (let position = 0; position < messages.value.length; position += 1) {
+		const message = messages.value[position];
+		// absolute index in the session context: with paging, messages[0] is not message 0
+		const index = loadedFrom.value + position;
 		if (message.role === "toolResult") continue;
 		if (message.role === "assistant") {
 			const own = {};
@@ -100,19 +106,20 @@ const items = computed(() => {
 					used.add(block.id);
 				}
 			}
-			list.push({ kind: "assistant", message, results: own });
+			list.push({ kind: "assistant", message, results: own, index });
 		} else if (message.role === "user") {
-			list.push({ kind: "user", message, results: {} });
+			list.push({ kind: "user", message, results: {}, index });
 		} else if (message.role === "bashExecution") {
-			list.push({ kind: "bash", message, results: {} });
+			list.push({ kind: "bash", message, results: {}, index });
 		} else {
 			// custom / branchSummary / compactionSummary
-			list.push({ kind: "notice", message, results: {} });
+			list.push({ kind: "notice", message, results: {}, index });
 		}
 	}
-	for (const message of messages.value) {
+	for (let position = 0; position < messages.value.length; position += 1) {
+		const message = messages.value[position];
 		if (message.role === "toolResult" && !used.has(message.toolCallId)) {
-			list.push({ kind: "result", message, results: {} });
+			list.push({ kind: "result", message, results: {}, index: loadedFrom.value + position });
 		}
 	}
 	return list;
@@ -121,6 +128,385 @@ const items = computed(() => {
 // Thinking and tool calls between answers collapse into one row: the transcript shows the answers,
 // and the how-it-got-there stays one click away.
 const rows = computed(() => groupItems(items.value));
+
+/**
+ * Windowing. Mounting every message of a long session costs the browser its layout budget, and the
+ * scroll then crawls. Only the tail is rendered: older rows leave the DOM while their exact height
+ * moves into a spacer above, so nothing shifts visually. Scrolling up renders WIN_STEP more rows at
+ * a time, and the rail on the right jumps task by task instead of dragging a scrollbar thumb.
+ */
+const WIN_MAX = 60;
+const WIN_STEP = 24;
+// nothing above the window has been measured yet, so the first open guesses. Every mounted page
+// then feeds its measured height back in, so the spacer tracks the real rows instead of drifting
+// tens of thousands of pixels away from them on a session full of tool output.
+const WIN_ESTIMATE = 88;
+const rowHeight = ref(WIN_ESTIMATE);
+function learnRowHeight(measured, count) {
+	if (!(measured > 0) || count <= 0) return;
+	const sample = Math.min(600, Math.max(16, measured / count));
+	rowHeight.value = rowHeight.value * 0.5 + sample * 0.5;
+}
+const runStart = ref(0);
+// End of the window. Infinity means "down to the newest row", which is the normal tail view; jumping
+// back into history makes it finite so the thousands of rows below the jump target stay unmounted.
+const runEnd = ref(Number.POSITIVE_INFINITY);
+const padPx = ref(0);
+// message index at the top of the viewport, for the highlighted mark; message indices do not move
+// when an older page is prepended, row indices do
+const topMessage = ref(0);
+// true while the view follows the newest message; declared here because the rail's active dot
+// depends on it (at the bottom the newest task is the one being read)
+const stick = ref(true);
+const visibleRows = computed(() => rows.value.slice(runStart.value, runEnd.value));
+// the spacer below a parked window: rows after runEnd are not rendered, only their estimated height
+const tailPad = computed(() =>
+	runEnd.value === Number.POSITIVE_INFINITY ? 0 : Math.max(0, rows.value.length - runEnd.value) * rowHeight.value,
+);
+// Every task in the session comes from the bridge, so the rail is complete even though only one
+// page of messages is loaded: the rail is a map of the whole session, one dot per prompt.
+const tasks = computed(() => state.value.tasks ?? []);
+const railMarks = computed(() => tasks.value);
+// The rail is a window, not the whole list: a long session has hundreds of prompts, and a column
+// that tall is unusable. Dots scroll inside it and the arrow buttons page it.
+const railList = ref(null);
+const railOverflow = ref(false);
+
+function updateRailOverflow() {
+	const el = railList.value;
+	railOverflow.value = !!el && el.scrollHeight > el.clientHeight + 2;
+}
+
+function scrollRail(direction) {
+	const el = railList.value;
+	if (!el) return;
+	const page = Math.max(90, Math.round(el.clientHeight * 0.8));
+	el.scrollBy({ top: direction * page, behavior: "smooth" });
+}
+
+/** Hover/focus preview for a rail dot: the first line of that prompt, next to the dot. */
+const railTip = ref(null);
+
+function showRailTip(event, task) {
+	const rect = event.currentTarget.getBoundingClientRect();
+	const top = Math.min(Math.max(rect.top + rect.height / 2, 56), window.innerHeight - 56);
+	railTip.value = { text: task.label, top };
+}
+
+function hideRailTip() {
+	railTip.value = null;
+}
+
+/** Keeps the dot of the task being read inside the rail window. */
+function revealActiveTask() {
+	const el = railList.value;
+	if (!el) return;
+	const dot = el.querySelector(".rail-dot.active");
+	if (!(dot instanceof HTMLElement)) return;
+	const view = el.getBoundingClientRect();
+	const rect = dot.getBoundingClientRect();
+	if (rect.top < view.top) el.scrollTop -= view.top - rect.top + 8;
+	else if (rect.bottom > view.bottom) el.scrollTop += rect.bottom - view.bottom + 8;
+}
+
+const activeTaskIndex = computed(() => {
+	const list = tasks.value;
+	if (list.length === 0) return -1;
+	// Following the tail means the newest message is on screen, not the one at the top of the window:
+	// opening the page marks the last task, and scrolling up hands the mark back to the viewport.
+	if (stick.value) return list[list.length - 1].index;
+	let index = -1;
+	for (const task of list) {
+		if (task.index > topMessage.value) break;
+		index = task.index;
+	}
+	return index;
+});
+
+watch(activeTaskIndex, () => nextTick(revealActiveTask));
+// a session switch replaces the whole list: remeasure the window and bring the active dot into it
+watch(railMarks, () =>
+	nextTick(() => {
+		updateRailOverflow();
+		revealActiveTask();
+	}),
+);
+
+// row index for the message a task starts at, so a rail click can land on the row
+const rowByMessage = computed(() => {
+	const map = new Map();
+	rows.value.forEach((row, index) => {
+		const first = row.kind === "process" ? row.steps[0] : row;
+		if (typeof first?.index === "number") map.set(first.index, index);
+	});
+	return map;
+});
+
+/**
+ * Stable identity for a row. `runStart + index` changes on every expansion, and a changed key makes
+ * Vue tear the row down and rebuild it - the whole window would remount (and reload its images) on
+ * each page of history, which is the flicker that looked like missing content.
+ */
+const rowKey = (row) => {
+	const first = row.kind === "process" ? row.steps[0] : row;
+	return `${row.kind}:${typeof first?.index === "number" ? first.index : -1}`;
+};
+
+const messageOfRow = (index) => {
+	const row = rows.value[index];
+	const first = row?.kind === "process" ? row.steps[0] : row;
+	return typeof first?.index === "number" ? first.index : -1;
+};
+
+const rowOf = (index) => transcriptBody.value?.querySelector(`[data-row="${index}"]`) ?? null;
+const topOf = (el) => el.getBoundingClientRect().top;
+
+/** The row the reader is looking at: the first one whose bottom is below the viewport top. */
+function firstVisible() {
+	const el = transcript.value;
+	if (!el) return null;
+	const limit = topOf(el);
+	for (const node of transcriptBody.value?.querySelectorAll("[data-row]") ?? []) {
+		const rect = node.getBoundingClientRect();
+		if (rect.bottom > limit + 1) {
+			const index = Number(node.dataset.row);
+			return { index, message: messageOfRow(index), top: rect.top };
+		}
+	}
+	return null;
+}
+
+/** Opens the window on the tail of a freshly loaded session. */
+function openWindow() {
+	const count = rows.value.length;
+	runStart.value = Math.max(0, count - WIN_MAX);
+	runEnd.value = Number.POSITIVE_INFINITY;
+	padPx.value = runStart.value * rowHeight.value;
+	topMessage.value = messageOfRow(runStart.value);
+}
+
+/**
+ * Settled rows leave the DOM and their height moves into the spacer above. Only rows that are
+ * already out of sight go: the spacer keeps everything below them exactly where it was, so this is
+ * invisible whether the reader sits at the bottom or somewhere in the middle of the history.
+ */
+function trimWindow() {
+	const limit = firstVisible()?.index ?? runStart.value;
+	const excess = Math.min(rows.value.length - runStart.value - WIN_MAX, limit - runStart.value);
+	if (excess <= 0) return;
+	const anchor = rowOf(runStart.value);
+	const dropped = rowOf(runStart.value + excess);
+	// measured before the update, so the spacer takes exactly the height that leaves the flow
+	if (!anchor || !dropped) return;
+	const measured = topOf(dropped) - topOf(anchor);
+	if (measured > 0) learnRowHeight(measured, excess);
+	padPx.value += measured;
+	runStart.value += excess;
+}
+
+// A long turn keeps appending while the reader is somewhere in the history: follow() is parked in
+// that case, so the window would grow back to the whole session without this.
+watch(
+	() => rows.value.length,
+	() => {
+		if (!stick.value) trimWindow();
+	},
+);
+
+let loadingOlder = false;
+const hasOlder = computed(() => loadedFrom.value > 0);
+
+/**
+ * Pulls the previous page of messages. Every row index has to shift by the number of rows that
+ * arrived, and the spacer takes their estimated height: the page lands above the window, so what is
+ * on screen does not move.
+ */
+async function loadOlder() {
+	if (loadingOlder || loadedFrom.value === 0) return 0;
+	loadingOlder = true;
+	try {
+		const response = await fetch(api(`messages?before=${loadedFrom.value}`));
+		if (!response.ok) return 0;
+		const page = await response.json();
+		const older = page.messages ?? [];
+		const before = rows.value.length;
+		messages.value = [...older, ...messages.value];
+		loadedFrom.value = page.from ?? 0;
+		const added = rows.value.length - before;
+		if (added === 0) return 0;
+		const grow = added * rowHeight.value;
+		runStart.value += added;
+		if (runEnd.value !== Number.POSITIVE_INFINITY) runEnd.value += added;
+		padPx.value += grow;
+		await nextTick();
+		// the page lands above the window as a spacer, so the scroll offset has to grow by the same
+		// amount: otherwise the rows on screen are pushed down by the new spacer and the reader sees
+		// the empty part of it
+		const el = transcript.value;
+		if (el) {
+			writeScrollTop(el, el.scrollTop + grow);
+			lastScrollTop = el.scrollTop;
+		}
+		return added;
+	} finally {
+		loadingOlder = false;
+	}
+}
+
+let expanding = false;
+const PAD_MARGIN = 600;
+
+/**
+ * True while the spacer above the window is in view, or close enough to it that one more scroll
+ * would expose it. The lower bound matters as much as the upper one: once the spacer is far above
+ * the viewport the reader is inside the rendered rows, and expanding there would mount the whole
+ * history on every scroll event.
+ */
+function padVisible() {
+	const el = transcript.value;
+	if (!el || runStart.value === 0) return false;
+	// how much spacer still sits below the top of the viewport: 0 = the window starts right there
+	const behind = padPx.value - el.scrollTop;
+	return behind > -PAD_MARGIN && behind < el.clientHeight + PAD_MARGIN;
+}
+
+/** True while the unrendered rows below a parked window reach into the viewport. */
+function tailPadVisible() {
+	const el = transcript.value;
+	const body = transcriptBody.value;
+	if (!el || !body || runEnd.value === Number.POSITIVE_INFINITY) return false;
+	const bottom = body.getBoundingClientRect().bottom - el.getBoundingClientRect().top + el.scrollTop;
+	return bottom - (el.scrollTop + el.clientHeight) < PAD_MARGIN;
+}
+
+/**
+ * Nothing is above the window any more, so the spacer has to go: the estimate it accumulated while
+ * rows were unrendered would otherwise show as a gap above the first row. The scroll offset gives
+ * the same height back, so the reader keeps looking at the same row.
+ */
+function settlePad() {
+	const el = transcript.value;
+	if (runStart.value !== 0 || padPx.value <= 0) return;
+	const leftover = padPx.value;
+	padPx.value = 0;
+	if (el) {
+		writeScrollTop(el, Math.max(0, el.scrollTop - leftover));
+		lastScrollTop = el.scrollTop;
+	}
+}
+
+/**
+ * Reveals older rows on scroll-up and keeps the row under the cursor exactly where it was.
+ *
+ * The spacer is an estimate, so it can be taller than the rows it stands for and a reader who
+ * scrolls fast can reach it before a single scroll event mounts rows: that is the gap that looked
+ * empty. Each pass mounts a page and gives its measured height back to the spacer, and the loop
+ * repeats while the spacer is still in view, so the viewport never sits on top of it.
+ */
+async function expandWindow() {
+	if (expanding) return;
+	// the window is sitting on the oldest loaded row: the history above it has to arrive first
+	if (runStart.value === 0) {
+		settlePad();
+		if (!hasOlder.value) return;
+		if ((await loadOlder()) === 0) return;
+	}
+	expanding = true;
+	try {
+		const el = transcript.value;
+		if (el) {
+			// A drag can drop the reader in the middle of the spacer, so the page that has to be
+			// mounted is sized from the gap, not from a fixed step: one pass then covers the screen.
+			for (let pass = 0; pass < 3; pass += 1) {
+				const behind = padPx.value - el.scrollTop;
+				if (behind < -PAD_MARGIN) break;
+				const need = behind > 0 ? Math.ceil(behind / rowHeight.value) + WIN_STEP : WIN_STEP;
+				const step = Math.min(need, WIN_MAX * 3);
+				const anchor = firstVisible();
+				const before = runStart.value;
+				runStart.value = Math.max(0, before - step);
+				const mounted = before - runStart.value;
+				if (mounted === 0) break;
+				await nextTick();
+				const after = anchor && rowOf(anchor.index);
+				if (!after || !anchor) break;
+				// the rows that entered the window now hold real height: the spacer gives it back,
+				// which returns the anchor row to its old position without touching scrollTop
+				const delta = topOf(after) - anchor.top;
+				learnRowHeight(delta, mounted);
+				const taken = Math.min(padPx.value, delta);
+				padPx.value -= taken;
+				const deficit = delta - taken;
+				if (deficit > 0) {
+					// the rows were taller than the spacer standing in for them: scroll down by the
+					// rest instead of clamping the spacer to 0, which would delete the space above
+					// the window and make the browser clamp the scroll position to the new bottom
+					writeScrollTop(el, el.scrollTop + deficit);
+					lastScrollTop = el.scrollTop;
+				}
+			}
+		}
+		settlePad();
+	} finally {
+		expanding = false;
+	}
+}
+
+let extending = false;
+/** Scrolling down inside a parked window renders the next page of rows below, until the tail is real. */
+async function extendWindow() {
+	if (extending || runEnd.value === Number.POSITIVE_INFINITY) return;
+	extending = true;
+	try {
+		for (let pass = 0; pass < 4; pass += 1) {
+			const end = Math.min(rows.value.length, runEnd.value + WIN_STEP);
+			if (end <= runEnd.value) break;
+			// nothing above runEnd moves: the tail spacer just gives up the rows that become real
+			runEnd.value = end >= rows.value.length ? Number.POSITIVE_INFINITY : end;
+			await nextTick();
+			trimWindow();
+			if (!tailPadVisible()) break;
+		}
+	} finally {
+		extending = false;
+	}
+}
+
+/**
+ * Rail click. The task may sit in a page that is not loaded yet, so pull pages until it is; then
+ * park the window around its row, so a jump into ancient history does not mount every row below it,
+ * and align it with the viewport top.
+ */
+async function jumpToTask(task) {
+	let row = rowByMessage.value.get(task.index);
+	if (row === undefined) {
+		// the rail knows every prompt, the transcript only knows the loaded ones
+		for (let guard = 0; loadedFrom.value > task.index && guard < 40; guard += 1) {
+			if ((await loadOlder()) === 0) break;
+		}
+		row = rowByMessage.value.get(task.index);
+	}
+	if (row !== undefined) await jumpToRow(row);
+}
+
+async function jumpToRow(target) {
+	const el = transcript.value;
+	if (!el) return;
+	const windowEnd = Math.min(runEnd.value, rows.value.length);
+	if (target < runStart.value || target >= windowEnd - 2) {
+		runStart.value = Math.max(0, target - 4);
+		const end = Math.min(rows.value.length, target + WIN_STEP + 8);
+		runEnd.value = end >= rows.value.length ? Number.POSITIVE_INFINITY : end;
+		padPx.value = runStart.value * rowHeight.value;
+		await nextTick();
+	}
+	const node = rowOf(target);
+	if (!node) return;
+	writeScrollTop(el, el.scrollTop + (topOf(node) - topOf(el)));
+	lastScrollTop = el.scrollTop;
+	topMessage.value = messageOfRow(target);
+	stick.value = nearBottom();
+}
 
 const modelLabel = computed(() => (state.value.model ? (state.value.model.name ?? state.value.model.id) : "model"));
 
@@ -284,12 +670,19 @@ const when = (value) => {
  * stops working" bug. So a scroll only counts as user intent when a gesture happened recently;
  * a clamp (no gesture, and it lands exactly on the new bottom) keeps following.
  */
-const stick = ref(true);
 const FOLLOW_SLACK = 64;
 // a scroll event this close to the last real gesture is attributed to the user
 const GESTURE_MS = 400;
 let lastScrollTop = 0;
 let lastGestureAt = 0;
+// Our own scrollTop writes (anchoring a page, aligning a jump) fire scroll events too. Without this
+// they look like the reader scrolling, and a "scroll up" attributed to the browser can call follow()
+// and yank the view back to the bottom.
+let selfScrollAt = 0;
+function writeScrollTop(el, value) {
+	selfScrollAt = performance.now();
+	el.scrollTop = value;
+}
 // dragging the scrollbar produces scroll events with no wheel/touch, so the press itself counts
 let pointerHeld = false;
 
@@ -312,6 +705,20 @@ function markGesture() {
 function onTranscriptScroll() {
 	const el = transcript.value;
 	if (!el) return;
+	if (performance.now() - selfScrollAt < 120) {
+		// a scroll we caused: the position is already where the windowing wanted it
+		lastScrollTop = el.scrollTop;
+		return;
+	}
+	const first = firstVisible();
+	topMessage.value = first?.message ?? messageOfRow(runStart.value);
+	// measured against the rendered window, not the scroll container: the spacers themselves are
+	// tens of thousands of pixels tall, so an absolute threshold would leave the reader inside one
+	if (padVisible()) void expandWindow();
+	// runStart 0 means the window sits on the oldest loaded row: there is no spacer to watch, so the
+	// scroll position itself is the signal that the history above has to arrive
+	else if (hasOlder.value && runStart.value === 0 && el.scrollTop < 400) void expandWindow();
+	else if (tailPadVisible()) void extendWindow();
 	const movedUp = el.scrollTop < lastScrollTop - 2;
 	lastScrollTop = el.scrollTop;
 	if (!movedUp) {
@@ -363,7 +770,8 @@ function follow() {
 		followFrame = 0;
 		const el = transcript.value;
 		if (!el || !stick.value) return;
-		el.scrollTop = el.scrollHeight;
+		trimWindow();
+		writeScrollTop(el, el.scrollHeight);
 		// content can grow between reading scrollHeight and writing scrollTop (a markdown delta, an
 		// image decoding); one more frame settles it instead of leaving the view a line short
 		if (atBottom() || ++followTries > 2) followTries = 0;
@@ -373,6 +781,8 @@ function follow() {
 
 /** Local actions (own prompt, session load, the Latest button) win over a scrolled-up view. */
 function scrollToBottom() {
+	// the window may be parked in the middle of the history; reopen it on the tail before following
+	if (runEnd.value !== Number.POSITIVE_INFINITY || rows.value.length - runStart.value > WIN_MAX * 2) openWindow();
 	stick.value = true;
 	follow();
 }
@@ -552,14 +962,17 @@ async function loadState() {
 	subagents.value = loaded.subagents ?? [];
 	messages.value = loaded.messages ?? [];
 	triggerRef(messages);
+	loadedFrom.value = loaded.loadedFrom ?? 0;
 	streaming.value = Boolean(loaded.streaming);
 	turnPending = false;
+	openWindow();
 	scrollToBottom();
 }
 
 /** Refreshes header fields only; reloading messages would fight the user's scroll. */
 async function refreshMeta() {
-	const response = await fetch(api("state"));
+	// meta=1 skips the transcript page: this runs on every event and only reads header fields
+	const response = await fetch(api("state?meta=1"));
 	if (!response.ok) return;
 	const loaded = await response.json();
 	state.value = { ...state.value, ...loaded, messages: state.value.messages };
@@ -1048,6 +1461,14 @@ onMounted(async () => {
 	window.addEventListener("drop", onDrop);
 	window.addEventListener("pointerup", onPointerRelease);
 	window.addEventListener("pointercancel", onPointerRelease);
+	// the rail window depends on layout, so it can only be measured once the app is on screen
+	await nextTick();
+	updateRailOverflow();
+	revealActiveTask();
+	window.addEventListener("resize", () => {
+		hideRailTip();
+		updateRailOverflow();
+	});
 	window.addEventListener("keydown", (event) => {
 		// keyboard scrolling is a gesture too, otherwise PageUp/ArrowUp would be read as a clamp
 		if (SCROLL_KEYS.has(event.key)) markGesture();
@@ -1173,8 +1594,20 @@ onBeforeUnmount(() => {
 						</p>
 					</div>
 
-					<template v-for="(row, index) in rows" :key="index">
-						<details v-if="row.kind === 'process'" class="process" :class="{ failed: row.counts.failed }">
+					<div
+						v-if="padPx > 0 || runStart > 0"
+						class="window-pad"
+						:style="{ height: `${padPx}px` }"
+						aria-hidden="true"
+					></div>
+
+					<template v-for="(row, index) in visibleRows" :key="rowKey(row)">
+						<details
+							v-if="row.kind === 'process'"
+							class="process"
+							:class="{ failed: row.counts.failed }"
+							:data-row="runStart + index"
+						>
 							<summary>
 								<span class="chev"></span>
 								<span class="tool-verb">Worked</span>
@@ -1184,11 +1617,57 @@ onBeforeUnmount(() => {
 								<MessageItem v-for="(step, i) in row.steps" :key="i" :item="step" flat />
 							</div>
 						</details>
-						<MessageItem v-else :item="row" />
+						<MessageItem v-else :item="row" :data-row="runStart + index" />
 					</template>
 
 					<LiveMessage v-if="live" :live="live" />
+
+					<div v-if="tailPad > 0" class="window-pad" :style="{ height: `${tailPad}px` }" aria-hidden="true"></div>
 				</div>
+
+				<nav v-if="tasks.length > 1" class="rail" aria-label="Tasks">
+					<button
+						v-if="railOverflow"
+						type="button"
+						class="rail-nav"
+						title="Earlier tasks"
+						@click="scrollRail(-1)"
+					>
+						<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 10l4-4 4 4" /></svg>
+					</button>
+					<div
+						ref="railList"
+						class="rail-list"
+						tabindex="0"
+						aria-label="Task list, scrollable"
+						@scroll.passive="hideRailTip"
+						@keydown.esc="railList?.blur()"
+					>
+						<button
+							v-for="task in railMarks"
+							:key="task.index"
+							type="button"
+							class="rail-dot"
+							:class="{ active: task.index === activeTaskIndex }"
+							:aria-label="task.label"
+							@mouseenter="showRailTip($event, task)"
+							@mouseleave="hideRailTip"
+							@focus="showRailTip($event, task)"
+							@blur="hideRailTip"
+							@click="jumpToTask(task)"
+						></button>
+					</div>
+					<button
+						v-if="railOverflow"
+						type="button"
+						class="rail-nav"
+						title="Later tasks"
+						@click="scrollRail(1)"
+					>
+						<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 6l4 4 4-4" /></svg>
+					</button>
+				</nav>
+				<div v-if="railTip" class="rail-tip" :style="{ top: `${railTip.top}px` }">{{ railTip.text }}</div>
 				<button
 					v-if="!stick"
 					type="button"

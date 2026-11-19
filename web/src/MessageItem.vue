@@ -25,7 +25,16 @@ const segments = computed(() => {
 /** The collapsed row warns when a hidden step failed; the details stay closed otherwise. */
 const segmentFailed = (segment) => failedTool(segment.blocks, props.item.results);
 
+const compactCount = (value) => {
+	const count = Number(value) || 0;
+	if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
+	if (count >= 1000) return `${(count / 1000).toFixed(1)}k`;
+	return String(count);
+};
+
 const noticeLabel = (message) => {
+	// the marker sits where the rewrite happened; the summary it carries is expandable below
+	if (message.role === "compactionMarker") return `Context compacted · ${compactCount(message.tokensBefore)} tokens`;
 	if (message.role === "compactionSummary") return "Context compacted";
 	if (message.role === "branchSummary") return "Branch summary";
 	return message.customType ? `Note (${message.customType})` : "Note";
