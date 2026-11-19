@@ -2,7 +2,8 @@ import { blocksOf } from "./message-utils.js";
 
 // Everything that is not the answer itself: what the model thought and what it ran. Grouping these
 // runs keeps the transcript readable for people who do not care how the answer was produced; the
-// blocks stay expandable, so nothing is lost.
+// blocks stay expandable, so nothing is lost. The answer text is the only thing shown outside a
+// collapsed run - a thought or a tool call is never a row of its own.
 
 export const isProcessBlock = (block) => block?.type === "thinking" || block?.type === "toolCall";
 
@@ -57,13 +58,15 @@ export const stepLabel = ({ tools, thoughts }) => {
 	return parts.join(" · ");
 };
 
-/** Runs of two or more process-only items become one collapsed row; singles stay as they are. */
+/**
+ * Every run of process-only items becomes one collapsed row, a single step included: the transcript
+ * shows the answer, and the working out - even one thought - stays inside the row that produced it.
+ */
 export const groupItems = (items) => {
 	const rows = [];
 	let run = [];
 	const flush = () => {
-		if (run.length > 1) rows.push({ kind: "process", steps: run, counts: countItems(run) });
-		else rows.push(...run);
+		if (run.length > 0) rows.push({ kind: "process", steps: run, counts: countItems(run) });
 		run = [];
 	};
 	for (const item of items) {
@@ -83,8 +86,7 @@ export const groupBlocks = (blocks) => {
 	const segments = [];
 	let run = [];
 	const flush = () => {
-		if (run.length > 1) segments.push({ kind: "process", blocks: run, counts: countSteps(run) });
-		else if (run.length === 1) segments.push({ kind: "block", block: run[0] });
+		if (run.length > 0) segments.push({ kind: "process", blocks: run, counts: countSteps(run) });
 		run = [];
 	};
 	for (const block of blocks) {

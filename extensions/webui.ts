@@ -9,9 +9,10 @@
  * /webui off    stop
  */
 
-import { spawn, spawnSync } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, rmSync } from "node:fs";
+import { readdirSync, readFileSync, readlinkSync } from "node:fs";
 import { mkdir, readdir, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -27,6 +28,8 @@ type AnyModel = NonNullable<ExtensionContext["model"]>;
 // Built by `npm run build` (Vite). Extensions load TS through jiti, but the browser needs
 // real files, so the Vue app is prebuilt instead of served from source.
 const DIST_DIR = resolve(join(dirname(fileURLToPath(import.meta.url)), "..", "web", "dist"));
+/** NIFE_WEBUI_DEBUG=1: log what arrived versus what the bridge routed (tunnel prefix debugging). */
+const DEBUG = process.env.NIFE_WEBUI_DEBUG === "1";
 const CONTENT_TYPES: Record<string, string> = {
 	".html": "text/html; charset=utf-8",
 	".js": "text/javascript; charset=utf-8",
@@ -69,6 +72,9 @@ type TextBlock = { type: "text"; text: string };
 const UPLOAD_ROOT = join(tmpdir(), "nife-webui");
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 const UPLOAD_STALE_MS = 12 * 60 * 60 * 1000;
+
+/** Recents renders a title, not a transcript: a pasted log must not ride along in the payload. */
+const SESSION_TITLE_MAX = 100;
 
 /** Directories to remove on exit, kept module-wide so a reloaded extension still cleans up. */
 const trackedUploadDirs = new Set<string>();
@@ -173,6 +179,18 @@ interface Bridge {
 	uploadDir: string | undefined;
 	/** no_proxy values saved when the page switched the proxy off, so it can be restored. */
 	proxyBypassSaved: { lower: string | undefined; upper: string | undefined } | undefined;
+	/** port -> public URL, for every port this bridge published (its own page included). */
+	publicUrls: Map<number, string>;
+	/** nifetun is holding the tunnel for the approval mail: no URL yet, but something is happening. */
+	tunnelPending: boolean;
+	/** Rebuilds since the client last worked, so a flapping tunnel cannot respawn forever. */
+	tunnelRevives: number;
+	/** An `up` is in flight: /webui, the heartbeat and the startup path must not stack them. */
+	tunnelBusy: boolean;
+	/** The handler of the module serving this bridge: /reload swaps it here so routing changes apply. */
+	handle: (req: IncomingMessage, res: ServerResponse) => Promise<void>;
+	/** Waiting for the approval mail, so a tunnel that comes up later still gets announced. */
+	tunnelTimer: ReturnType<typeof setTimeout> | undefined;
 }
 
 interface SwitchOutcome {
@@ -543,6 +561,14 @@ function snapshot(b: Bridge, metaOnly = false): unknown {
 		streaming: !ctx.isIdle(),
 		usage: ctx.getContextUsage() ?? null,
 		proxy: proxyState(b),
+		// the footer button only exists when a tunnel can actually be made
+		tunnelAvailable: hasTunnel(b.api),
+		// the page shows the published port in the sidebar footer, or that approval is pending
+		tunnel: tunnelState(b),
+		// ports this session's own processes are listening on, offered in the footer
+		services: listServices(b),
+		// what the tunnel menu shows, already split and already without this page's own port
+		ports: portRows(b),
 		stats,
 		subagents: [...b.children.values()],
 		// the transcript reads `messages` and asks for older pages with `loadedFrom` as the cursor
@@ -556,16 +582,17 @@ function snapshot(b: Bridge, metaOnly = false): unknown {
 async function serveStatic(pathname: string, res: ServerResponse): Promise<void> {
 	const relative = pathname === "/" ? "index.html" : decodeURIComponent(pathname).replace(/^\/+/, "");
 	const file = resolve(DIST_DIR, relative);
-	if (!file.startsWith(DIST_DIR + sep)) return send(res, 404, "not found");
+	if (!file.startsWith(DIST_DIR + sep)) return send(res, 404, `not found: ${pathname}`);
 	try {
 		const body = await readFile(file);
 		send(res, 200, body, CONTENT_TYPES[extname(file)] ?? "application/octet-stream");
 	} catch {
-		send(res, 404, "not found");
+		send(res, 404, `not found: ${pathname}`);
 	}
 }
 
 async function listSessions(b: Bridge): Promise<unknown> {
+	// SessionManager.list parses only what was appended since the previous listing of these files.
 	const sessions = await SessionManager.list(b.ctx.cwd);
 	return {
 		current: b.ctx.sessionManager.getSessionFile(),
@@ -576,7 +603,8 @@ async function listSessions(b: Bridge): Promise<unknown> {
 			cwd: session.cwd,
 			modified: session.modified,
 			messageCount: session.messageCount,
-			firstMessage: session.firstMessage,
+			// Whitespace collapsed here, not in the page: a title is one line, whatever was pasted.
+			firstMessage: session.firstMessage.replace(/\s+/g, " ").trim().slice(0, SESSION_TITLE_MAX),
 		})),
 	};
 }
@@ -617,15 +645,54 @@ function requestSwitch(b: Bridge, args: string): Promise<SwitchOutcome> {
 	});
 }
 
+/**
+ * The path this bridge should answer, whatever the tunnel did to it.
+ *
+ * nifetun strips `/t/<id>` before forwarding and names what it stripped in `X-Forwarded-Prefix`,
+ * but a request can also arrive with the mount still attached (a client that did not strip, an old
+ * page that prefixes its own calls) or with a doubled slash. Both used to fall through to a 404 that
+ * says nothing, so the prefix is removed here as well instead of trusting the edge.
+ */
+function routePath(req: IncomingMessage, pathname: string): { path: string; mount: string } {
+	const header = req.headers["x-forwarded-prefix"];
+	let mount = (typeof header === "string" ? header : "").replace(/\/+$/, "");
+	let path = pathname.replace(/\/{2,}/g, "/");
+	// An edge that does not strip (older nifetun, or `strip_prefix: false`) sends no header and leaves
+	// /t/<id> on the path. Nothing else here starts with that shape, so the mount is readable from the
+	// path itself; without it every request lands on a 404 that looks like a broken API.
+	if (!mount) {
+		const inferred = /^\/t\/[a-z0-9][a-z0-9_-]{0,63}(?=\/|$)/i.exec(path);
+		if (inferred) mount = inferred[0];
+	}
+	// the mount can appear more than once when a page prefixed an already-prefixed request
+	while (mount && (path === mount || path.startsWith(`${mount}/`))) path = path.slice(mount.length) || "/";
+	return { path: path.startsWith("/") ? path : `/${path}`, mount };
+}
+
 async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Promise<void> {
-	const url = new URL(req.url ?? "/", `http://127.0.0.1:${b.port}`);
-	const path = url.pathname;
+	// `new URL("//x/y")` parses as a scheme-relative host, so the leading slash is collapsed first:
+	// a doubled slash must stay a path, not become a hostname.
+	const url = new URL((req.url ?? "/").replace(/^\/+/, "/"), `http://127.0.0.1:${b.port}`);
+	const { path, mount } = routePath(req, url.pathname);
+	// NIFE_WEBUI_DEBUG=1 shows what a tunnel actually forwarded, prefix included.
+	if (DEBUG && (mount || req.url !== path)) console.error(`webui ${req.method} ${req.url} -> ${path}`);
 
 	// Static assets carry no session data and are requested without the token.
 	if (req.method === "GET" && !path.startsWith("/api/")) return serveStatic(path, res);
 
 	const origin = req.headers.origin;
-	if (origin && origin !== `http://127.0.0.1:${b.port}`) return send(res, 403, "forbidden");
+	if (origin) {
+		// Same origin wherever the page is served from: 127.0.0.1 directly, or the nifetun URL once
+		// the port is published. Anything else is another site trying to drive this session.
+		const host = req.headers.host ?? "";
+		const sameOrigin = [
+			`http://127.0.0.1:${b.port}`,
+			`http://localhost:${b.port}`,
+			`http://${host}`,
+			`https://${host}`,
+		];
+		if (!sameOrigin.includes(origin)) return send(res, 403, "forbidden");
+	}
 	if (url.searchParams.get("t") !== b.token) return send(res, 401, "bad token");
 
 	if (req.method === "GET" && path === "/api/state") {
@@ -634,6 +701,38 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 	}
 
 	// one page of older messages, ending right before `before`
+	// Publishing is the page's call (the "tunnel" button in the sidebar footer), not the bridge's:
+	// an extension that quietly opened a public URL at startup was not what anyone asked for.
+	if (req.method === "POST" && path === "/api/tunnel") {
+		let body: Record<string, unknown>;
+		try {
+			body = await readJson(req, 1024);
+		} catch (error) {
+			return send(res, 400, error instanceof Error ? error.message : "bad body");
+		}
+		if (!hasTunnel(b.api)) return send(res, 409, "no tunnel extension in this session");
+		if (body.action === "up") {
+			const port = Number(body.port);
+			await attachTunnel(b, [Number.isInteger(port) && port > 0 ? port : b.port]);
+			return send(res, 200, JSON.stringify({ tunnel: tunnelState(b), ports: portRows(b) }), "application/json");
+		}
+		if (body.action === "down") {
+			const port = Number(body.port);
+			const target = Number.isInteger(port) && port > 0 ? port : b.port;
+			// only this port: other tunnels of the same client belong to whatever else you were doing
+			await tunnelRequest(b.api, { kind: "down", tunnels: [`127.0.0.1:${target}`] }, 10_000);
+			b.publicUrls.delete(target);
+			if (target === b.port) {
+				clearTunnelTimer(b);
+				b.tunnelPending = false;
+				b.tunnelRevives = 0;
+			}
+			pushTunnel(b);
+			return send(res, 200, JSON.stringify({ tunnel: tunnelState(b), ports: portRows(b) }), "application/json");
+		}
+		return send(res, 400, "action must be up or down");
+	}
+
 	if (req.method === "GET" && path === "/api/messages") {
 		const before = Number(url.searchParams.get("before"));
 		if (!Number.isInteger(before) || before <= 0) return send(res, 400, "before must be a positive index");
@@ -830,7 +929,7 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		return send(res, 200, "ok");
 	}
 
-	return send(res, 404, "not found");
+	return send(res, 404, `not found: ${path}`);
 }
 
 type Prefs = { auto: boolean };
@@ -855,6 +954,589 @@ async function savePrefs(prefs: Prefs): Promise<void> {
 
 function webuiUrl(b: Bridge): string {
 	return `http://127.0.0.1:${b.port}/?t=${b.token}`;
+}
+
+/**
+ * Tunnel (nifetun). The tunnel extension owns the client process; this extension only asks it, over
+ * nife's event bus, to publish the webui port, and then prints the public URL. The trigger is the
+ * same signal a person has: a /tunnel command in the session (or its tunnel_up tool). Without the
+ * tunnel package nothing changes: the bridge stays on 127.0.0.1.
+ */
+/**
+ * Services the session started: the ports that processes under this CLI are listening on. A dev
+ * server, a preview, an API started with `bash` - those are what someone wants to hand out, and the
+ * page can offer them instead of asking the user to find the port. Only the process tree counts, so
+ * whatever else runs on the machine never shows up here.
+ *
+ * The scan is asynchronous and cached: `netstat` plus PowerShell on Windows takes about a second, and
+ * a state request must never wait for it. Callers get the last list; a scan that changed something
+ * broadcasts `services`.
+ */
+type Service = { port: number; cmd: string };
+
+const SERVICES_TTL_MS = 3_000;
+let servicesCache: { at: number; services: Service[] } | undefined;
+let servicesScan: Promise<void> | undefined;
+
+function listServices(b: Bridge): Service[] {
+	// nothing to offer without nifetun, so nothing to scan for either
+	if (!hasTunnel(b.api)) return [];
+	const stale = !servicesCache || Date.now() - servicesCache.at > SERVICES_TTL_MS;
+	if (stale && !servicesScan) {
+		servicesScan = scanServices(b).finally(() => {
+			servicesScan = undefined;
+		});
+	}
+	return servicesCache?.services ?? [];
+}
+
+/** Force a fresh scan (a tool just finished and may have started a server). */
+function refreshServices(b: Bridge): void {
+	if (!hasTunnel(b.api)) return;
+	servicesCache = undefined;
+	void scanServices(b);
+}
+
+async function scanServices(b: Bridge): Promise<void> {
+	let services: Service[];
+	try {
+		services = await detectServices(b.port);
+	} catch {
+		services = [];
+	}
+	const before = servicesCache?.services;
+	if (before && sameServices(before, services)) {
+		servicesCache = { at: Date.now(), services: before };
+		return;
+	}
+	servicesCache = { at: Date.now(), services };
+	broadcast(b, { type: "services", services, ports: portRows(b) });
+}
+
+const sameServices = (left: Service[], right: Service[]): boolean =>
+	left.length === right.length && left.every((service, index) => service.port === right[index].port);
+
+function detectServices(ownPort: number): Promise<Service[]> {
+	if (process.platform === "linux") return Promise.resolve(detectProcServices(ownPort));
+	if (process.platform === "darwin") return detectLsofServices(ownPort);
+	return detectWindowsServices(ownPort);
+}
+
+function run(command: string, args: string[]): Promise<string> {
+	return new Promise((resolve, reject) => {
+		execFile(command, args, { maxBuffer: 4 * 1024 * 1024, windowsHide: true }, (error, stdout) => {
+			if (error) reject(error);
+			else resolve(stdout);
+		});
+	});
+}
+
+// ---------- Linux: /proc ----------
+
+/** Listening port -> inode, from /proc/net/tcp{,6}; only loopback/any-address listeners can be tunneled. */
+function listenInodes(): Map<number, number> {
+	const out = new Map<number, number>();
+	for (const file of ["/proc/net/tcp", "/proc/net/tcp6"]) {
+		let text: string;
+		try {
+			text = readFileSync(file, "utf8");
+		} catch {
+			continue;
+		}
+		for (const line of text.split("\n").slice(1)) {
+			const cols = line.trim().split(/\s+/);
+			if (cols.length < 10 || cols[3] !== "0A") continue; // 0A = LISTEN
+			const [address, port] = cols[1].split(":");
+			if (!isLoopbackBinding(address)) continue;
+			const inode = Number(cols[9]);
+			if (inode) out.set(inode, Number.parseInt(port, 16));
+		}
+	}
+	return out;
+}
+
+/** `0100007F` (127.0.0.1), `00000000` (any), `::1` and `::` are reachable as 127.0.0.1. */
+function isLoopbackBinding(address: string): boolean {
+	const value = address.padStart(8, "0").toUpperCase();
+	return value === "0100007F" || value === "00000000" || /^0{31}1$/.test(value) || /^0{32}$/.test(value);
+}
+
+function detectProcServices(ownPort: number): Service[] {
+	const inodes = listenInodes();
+	if (!inodes.size) return [];
+	const tree = procTree(process.pid);
+	const out: Service[] = [];
+	for (const pid of tree) {
+		if (pid === process.pid) continue;
+		let fds: string[];
+		try {
+			fds = readdirSync(`/proc/${pid}/fd`);
+		} catch {
+			continue;
+		}
+		const found: number[] = [];
+		for (const fd of fds) {
+			let target: string;
+			try {
+				target = readlinkSync(`/proc/${pid}/fd/${fd}`);
+			} catch {
+				continue;
+			}
+			const match = /^socket:\[(\d+)\]$/.exec(target);
+			const port = match ? inodes.get(Number(match[1])) : undefined;
+			if (port && port !== ownPort && !found.includes(port)) found.push(port);
+		}
+		if (!found.length) continue;
+		let cmd = "";
+		try {
+			cmd = readFileSync(`/proc/${pid}/comm`, "utf8").trim();
+		} catch {
+			// gone already
+		}
+		for (const port of found) out.push({ port, cmd });
+	}
+	return sortServices(out);
+}
+
+/** `ppid` from /proc/<pid>/stat; the command name in parentheses may contain spaces and parens. */
+function parentOf(pid: number): number | undefined {
+	try {
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+		const rest = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+		const ppid = Number(rest[1]);
+		return Number.isInteger(ppid) ? ppid : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function procTree(root: number): Set<number> {
+	const parents = new Map<number, number>();
+	for (const name of readdirSync("/proc")) {
+		if (!/^\d+$/.test(name)) continue;
+		const pid = Number(name);
+		const ppid = parentOf(pid);
+		if (ppid !== undefined) parents.set(pid, ppid);
+	}
+	return descend(root, parents);
+}
+
+/** pids that are `root` or descend from it. */
+function descend(root: number, parents: Map<number, number>): Set<number> {
+	const tree = new Set([root]);
+	let grew = true;
+	while (grew) {
+		grew = false;
+		for (const [pid, ppid] of parents) {
+			if (tree.has(pid) || !tree.has(ppid)) continue;
+			tree.add(pid);
+			grew = true;
+		}
+	}
+	return tree;
+}
+
+// ---------- macOS: lsof + ps ----------
+
+async function detectLsofServices(ownPort: number): Promise<Service[]> {
+	const [lsof, ps] = await Promise.all([
+		run("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"]),
+		run("ps", ["-A", "-o", "pid=,ppid=,comm="]),
+	]);
+	const parents = new Map<number, number>();
+	const named = new Map<number, string>();
+	for (const line of ps.split("\n")) {
+		const parts = line.trim().split(/\s+/);
+		if (parts.length < 2 || !/^\d+$/.test(parts[0])) continue;
+		parents.set(Number(parts[0]), Number(parts[1]));
+		if (parts[2]) named.set(Number(parts[0]), parts[2].split("/").pop() ?? parts[2]);
+	}
+	const tree = descend(process.pid, parents);
+	const out: Service[] = [];
+	let pid = 0;
+	let cmd = "";
+	for (const line of lsof.split("\n")) {
+		if (line.startsWith("p")) pid = Number(line.slice(1));
+		else if (line.startsWith("c")) cmd = line.slice(1);
+		else if (line.startsWith("n")) {
+			const port = Number(line.slice(line.lastIndexOf(":") + 1));
+			if (!pid || pid === process.pid || !tree.has(pid) || !port || port === ownPort) continue;
+			out.push({ port, cmd: cmd || named.get(pid) || "" });
+		}
+	}
+	return sortServices(out);
+}
+
+// ---------- Windows: netstat -ano + PowerShell ----------
+
+/**
+ * `netstat -ano` lists the listening sockets with their owning pid; `Get-CimInstance Win32_Process`
+ * lists every process with its parent, which is what turns "what is listening" into "what this CLI
+ * started". Both are one call each, wrapped here so a missing or restricted shell just yields [].
+ */
+async function detectWindowsServices(ownPort: number): Promise<Service[]> {
+	const [netstat, table] = await Promise.all([
+		run("netstat", ["-ano"]),
+		run("powershell", [
+			"-NoProfile",
+			"-NonInteractive",
+			"-Command",
+			"Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId) $($_.ParentProcessId) $($_.Name)\" }",
+		]),
+	]);
+	const parents = new Map<number, number>();
+	const named = new Map<number, string>();
+	for (const line of table.split(/\r?\n/)) {
+		const parts = line.trim().split(/\s+/);
+		if (parts.length < 3 || !/^\d+$/.test(parts[0])) continue;
+		parents.set(Number(parts[0]), Number(parts[1]));
+		named.set(Number(parts[0]), parts[2]);
+	}
+	if (!parents.size) return [];
+	const tree = descend(process.pid, parents);
+	const out: Service[] = [];
+	for (const line of netstat.split(/\r?\n/)) {
+		const cols = line.trim().split(/\s+/);
+		if (cols.length < 5 || cols[0].toUpperCase() !== "TCP" || cols[3] !== "LISTENING") continue;
+		const address = cols[1].slice(0, cols[1].lastIndexOf(":"));
+		if (!isWindowsLoopback(address)) continue;
+		const port = Number(cols[1].slice(cols[1].lastIndexOf(":") + 1));
+		const pid = Number(cols[4]);
+		if (!port || !pid || pid === process.pid || !tree.has(pid) || port === ownPort) continue;
+		out.push({ port, cmd: (named.get(pid) ?? "").replace(/\.exe$/i, "") });
+	}
+	return sortServices(out);
+}
+
+function isWindowsLoopback(address: string): boolean {
+	const value = address.replace(/^\[|\]$/g, "").toLowerCase();
+	return value === "0.0.0.0" || value === "127.0.0.1" || value === "::" || value === "::1";
+}
+
+/** pids under this CLI, deepest first: that is what a shutdown has to take down. */
+function descendantPids(): number[] {
+	if (process.platform === "linux") return [...procTree(process.pid)].filter((pid) => pid !== process.pid).reverse();
+	const command =
+		process.platform === "darwin"
+			? ["ps", ["-A", "-o", "pid=,ppid="]]
+			: [
+					"powershell",
+					[
+						"-NoProfile",
+						"-NonInteractive",
+						"-Command",
+						'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId) $($_.ParentProcessId)" }',
+					],
+				];
+	const result = spawnSync(command[0] as string, command[1] as string[], { encoding: "utf8" });
+	if (result.status !== 0 || !result.stdout) return [];
+	const parents = new Map<number, number>();
+	for (const line of result.stdout.split(/\r?\n/)) {
+		const parts = line.trim().split(/\s+/);
+		if (parts.length < 2 || !/^\d+$/.test(parts[0])) continue;
+		parents.set(Number(parts[0]), Number(parts[1]));
+	}
+	return [...descend(process.pid, parents)].filter((pid) => pid !== process.pid).reverse();
+}
+
+/**
+ * The CLI is going away: the servers it started go with it, otherwise every quit leaves a dev server
+ * behind on a port nobody remembers. A reload or a session switch keeps them - the process, and the
+ * tunnels on it, are still there.
+ */
+function killServices(): void {
+	for (const pid of descendantPids()) {
+		try {
+			process.kill(pid);
+		} catch {
+			// already gone
+		}
+	}
+}
+
+/** One row per port (a server often has several sockets on the same one), smallest first. */
+function sortServices(services: Service[]): Service[] {
+	const byPort = new Map<number, Service>();
+	for (const service of services) if (!byPort.has(service.port)) byPort.set(service.port, service);
+	return [...byPort.values()].sort((left, right) => left.port - right.port).slice(0, 8);
+}
+
+const TUNNEL_REQUEST = "nifetun:request";
+const TUNNEL_REPLY = "nifetun:reply";
+/** `up` waits for the edge to assign an id, which can sit behind an approval email. */
+const TUNNEL_UP_TIMEOUT = 40_000;
+/** Waiting for the approval mail: fast enough to feel automatic. */
+const TUNNEL_POLL_MS = 4_000;
+/** Published: how often to notice that the client carrying our port died. */
+const TUNNEL_HEARTBEAT_MS = 20_000;
+/** Rebuilds before the page stops offering a public URL. */
+const TUNNEL_REVIVE_TRIES = 5;
+
+type TunnelEntry = { url: string; local: string };
+type TunnelInstance = { name?: string; pid?: number; alive?: boolean; tunnels?: string[]; entries?: TunnelEntry[] };
+type TunnelReply = {
+	ok?: boolean;
+	error?: string;
+	urls?: string[];
+	entries?: TunnelEntry[];
+	instances?: TunnelInstance[];
+	pending?: boolean;
+};
+
+/** Is a tunnel available? Same signal as a human's: the /tunnel command, or its tool. */
+function hasTunnel(api: ExtensionAPI): boolean {
+	try {
+		return (
+			api.getCommands().some((command) => command.name === "tunnel" && command.source === "extension") ||
+			api.getAllTools().some((tool) => tool.name === "tunnel_up")
+		);
+	} catch {
+		// asked before the runtime was bound
+		return false;
+	}
+}
+
+/** Ask nifetun to act, and wait for the reply with the same id. A tunnel without the event API never answers. */
+function tunnelRequest(api: ExtensionAPI, payload: Record<string, unknown>, timeoutMs: number): Promise<TunnelReply> {
+	return new Promise((resolve) => {
+		const id = randomBytes(6).toString("hex");
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let off: (() => void) | undefined;
+		const settle = (reply: TunnelReply) => {
+			if (timer) clearTimeout(timer);
+			off?.();
+			resolve(reply);
+		};
+		timer = setTimeout(() => settle({ ok: false, error: "nifetun did not answer" }), timeoutMs);
+		off = api.events.on(TUNNEL_REPLY, (raw) => {
+			const reply = raw as (TunnelReply & { id?: unknown }) | undefined;
+			if (!reply || reply.id !== id) return;
+			settle(reply);
+		});
+		api.events.emit(TUNNEL_REQUEST, { id, ...payload });
+	});
+}
+
+/** The public URL nifetun assigned to this port (the `->` side of each entry names the local end). */
+function tunnelUrlForPort(reply: TunnelReply, port: number): string {
+	const names = [`127.0.0.1:${port}`, `localhost:${port}`, String(port)];
+	for (const entry of reply.entries ?? []) {
+		if (names.includes(entry.local)) return entry.url;
+	}
+	return "";
+}
+
+/** The token is this bridge's capability: a public URL is only useful printed with it. */
+function withToken(url: string, token: string): string {
+	try {
+		const parsed = new URL(url);
+		parsed.searchParams.set("t", token);
+		return parsed.toString();
+	} catch {
+		return url;
+	}
+}
+
+/**
+ * What the footer shows: the URL of this page (or "waiting"), the way home, and every port this bridge
+ * has published - the page itself plus whatever services the user asked for.
+ */
+function tunnelState(b: Bridge): {
+	url: string;
+	localUrl: string;
+	port: number;
+	pending: boolean;
+	local: string;
+	entries: { port: number; url: string; local: string }[];
+} | null {
+	const entries = [...b.publicUrls].map(([port, url]) => ({
+		port,
+		// the token belongs to this bridge: another service must not receive it in its query string
+		url: port === b.port ? withToken(url, b.token) : url,
+		local: `127.0.0.1:${port}`,
+	}));
+	if (!entries.length && !b.tunnelPending) return null;
+	return {
+		url: entries.find((entry) => entry.port === b.port)?.url ?? "",
+		// the page needs the way home: disconnecting from the public URL cannot be done over the
+		// tunnel it is tearing down
+		localUrl: webuiUrl(b),
+		port: b.port,
+		pending: b.tunnelPending,
+		local: `127.0.0.1:${b.port}`,
+		entries,
+	};
+}
+
+/**
+ * The ports the menu lists, decided here and nowhere else: `server` for what this session is
+ * listening on, `custom` for what the reader typed in. The bridge's own port is filtered out before
+ * anything leaves this function, so no client-side rule can put it back on screen.
+ */
+function portRows(b: Bridge): { port: number; url: string; kind: "server" | "custom"; cmd: string }[] {
+	if (!hasTunnel(b.api)) return [];
+	const rows = new Map<number, { port: number; url: string; kind: "server" | "custom"; cmd: string }>();
+	for (const service of listServices(b)) {
+		if (service.port === b.port) continue;
+		rows.set(service.port, {
+			port: service.port,
+			url: b.publicUrls.get(service.port) ?? "",
+			kind: "server",
+			cmd: service.cmd,
+		});
+	}
+	for (const [port, url] of b.publicUrls) {
+		if (port === b.port || rows.has(port)) continue;
+		rows.set(port, { port, url, kind: "custom", cmd: "" });
+	}
+	return [...rows.values()].sort((left, right) => left.port - right.port);
+}
+
+function pushTunnel(b: Bridge): void {
+	broadcast(b, { type: "tunnel", tunnel: tunnelState(b), ports: portRows(b) });
+}
+
+/** Take every `local -> url` nifetun reported and keep the ones for ports we asked about. */
+function adoptEntries(b: Bridge, entries: TunnelEntry[] | undefined): Map<number, string> {
+	const fresh = new Map<number, string>();
+	for (const entry of entries ?? []) {
+		const port = Number(entry.local.slice(entry.local.lastIndexOf(":") + 1));
+		if (!Number.isInteger(port) || port <= 0) continue;
+		fresh.set(port, entry.url);
+		b.publicUrls.set(port, entry.url);
+	}
+	return fresh;
+}
+
+/** Announce every new public URL in the terminal and in the page. */
+function publishTunnel(b: Bridge, reply: TunnelReply): void {
+	const fresh = adoptEntries(b, reply.entries);
+	b.tunnelPending = false;
+	pushTunnel(b);
+	for (const [port, url] of fresh) {
+		if (port === b.port) b.ctx.ui.notify(`webui public: ${withToken(url, b.token)}`, "info");
+		else b.ctx.ui.notify(`webui public: 127.0.0.1:${port} -> ${url}`, "info");
+	}
+	// published does not mean alive: keep an eye on the client that carries the ports
+	scheduleTunnel(b, TUNNEL_HEARTBEAT_MS);
+}
+
+/** No URL yet: say so instead of leaving the terminal silent for the minutes an approval takes. */
+function pendingTunnel(b: Bridge): void {
+	if (b.tunnelPending) return;
+	b.tunnelPending = true;
+	pushTunnel(b);
+	b.ctx.ui.notify(`webui: waiting for tunnel approval for 127.0.0.1:${b.port} (check your mail)`, "info");
+}
+
+/**
+ * Publish a port through nifetun (this page's port plus whatever the user picked in the footer). The
+ * first connection on a machine waits for an approval email, so a pending reply keeps asking: the URL
+ * shows up on its own once someone clicks it.
+ */
+async function attachTunnel(b: Bridge, ports: number[]): Promise<void> {
+	// pending means an approval is in flight: a second `up` would restart the client for nothing
+	if (b.tunnelBusy || b.tunnelPending || store.__nifeWebui !== b || !hasTunnel(b.api)) return;
+	// exactly the ports asked for: publishing a service must not drag this page's token with it
+	const wanted = [...new Set(ports)].filter((port) => port > 0);
+	if (!wanted.length) return;
+	b.tunnelBusy = true;
+	try {
+		await requestTunnel(b, wanted);
+	} finally {
+		b.tunnelBusy = false;
+	}
+}
+
+async function requestTunnel(b: Bridge, ports: number[]): Promise<void> {
+	// Say something before asking: the first start spawns a client and can sit for seconds.
+	b.ctx.ui.notify(
+		`webui: publishing ${ports.map((port) => `127.0.0.1:${port}`).join(", ")} through nifetun…`,
+		"info",
+	);
+	const reply = await tunnelRequest(
+		b.api,
+		{ kind: "up", tunnels: ports.map((port) => `127.0.0.1:${port}`) },
+		TUNNEL_UP_TIMEOUT,
+	);
+	if (store.__nifeWebui !== b) return; // stopped while the tunnel was starting
+	if (ports.some((port) => tunnelUrlForPort(reply, port))) return publishTunnel(b, reply);
+	// no answer at all: the tunnel extension has no event API (or was unloaded), polling will not help
+	if (!reply.ok) return;
+	pendingTunnel(b);
+	scheduleTunnel(b, TUNNEL_POLL_MS);
+}
+
+/** Is one of nifetun's live clients carrying this port? */
+function tunnelAlive(reply: TunnelReply, port: number): boolean {
+	const names = [`127.0.0.1:${port}`, `localhost:${port}`, String(port)];
+	for (const instance of reply.instances ?? []) {
+		if (instance.alive && (instance.tunnels ?? []).some((tunnel) => names.includes(tunnel))) return true;
+	}
+	return false;
+}
+
+function clearTunnelTimer(b: Bridge): void {
+	if (!b.tunnelTimer) return;
+	clearTimeout(b.tunnelTimer);
+	b.tunnelTimer = undefined;
+}
+
+function scheduleTunnel(b: Bridge, delay: number): void {
+	if (b.tunnelTimer) return;
+	b.tunnelTimer = setTimeout(() => void tunnelTick(b).catch(() => {}), delay);
+	b.tunnelTimer.unref?.();
+}
+
+/**
+ * The tunnel lives in another process, so the bridge keeps asking: while the approval is pending, and
+ * then every so often to notice that the client is gone. A dead client used to leave the page pointing
+ * at a 404 that looked like a broken API.
+ */
+async function tunnelTick(b: Bridge): Promise<void> {
+	b.tunnelTimer = undefined;
+	if (store.__nifeWebui !== b) return;
+	const reply = await tunnelRequest(b.api, { kind: "status" }, 10_000);
+	if (store.__nifeWebui !== b) return;
+	if (!reply.ok) {
+		// nobody answered: the tunnel extension is gone, so stop offering URLs that cannot work
+		b.publicUrls.clear();
+		b.tunnelPending = false;
+		pushTunnel(b);
+		return;
+	}
+
+	adoptEntries(b, reply.entries);
+	const mine = b.publicUrls.get(b.port) ?? "";
+	if (mine) {
+		b.tunnelRevives = 0;
+		if (tunnelUrlForPort(reply, b.port) !== mine) {
+			// the edge handed out a new URL (a rebuilt client can do that): adopt it and show it
+			b.publicUrls.set(b.port, tunnelUrlForPort(reply, b.port));
+			pushTunnel(b);
+		}
+		return scheduleTunnel(b, TUNNEL_HEARTBEAT_MS);
+	}
+	// alive but no URL yet: the approval mail has not been clicked
+	if (tunnelAlive(reply, b.port)) return scheduleTunnel(b, TUNNEL_POLL_MS);
+
+	// nothing is carrying the ports any more: drop the dead links before trying to rebuild them
+	const missing = [...b.publicUrls.keys()];
+	b.publicUrls.clear();
+	pushTunnel(b);
+	b.tunnelRevives += 1;
+	if (b.tunnelRevives > TUNNEL_REVIVE_TRIES) {
+		b.tunnelPending = false;
+		pushTunnel(b);
+		b.ctx.ui.notify(`webui: tunnel for 127.0.0.1:${b.port} is gone (nifetun stopped answering)`, "warning");
+		return;
+	}
+	b.ctx.ui.notify(
+		`webui: tunnel dropped, republishing ${missing.map((port) => `127.0.0.1:${port}`).join(", ")} (${b.tunnelRevives}/${TUNNEL_REVIVE_TRIES})`,
+		"warning",
+	);
+	await attachTunnel(b, missing);
+	scheduleTunnel(b, TUNNEL_POLL_MS);
 }
 
 /** Hand the URL to the desktop. Failures are expected on headless machines: the URL is printed too. */
@@ -895,10 +1577,19 @@ async function start(api: ExtensionAPI, ctx: ExtensionContext): Promise<Bridge> 
 		switchRequest: undefined,
 		uploadDir: undefined,
 		proxyBypassSaved: undefined,
+		publicUrls: new Map(),
+		tunnelPending: false,
+		tunnelRevives: 0,
+		tunnelBusy: false,
+		tunnelTimer: undefined,
+		// `b` is only read when a request arrives, after the literal is assigned
+		handle: (req, res) => handle(b, req, res),
 	};
 
 	server.on("request", (req, res) => {
-		void handle(b, req, res).catch((error: unknown) => {
+		// Read through the bridge: a reloaded module replaces `handle`, so routing fixes apply without
+		// restarting the port (the listener itself belongs to whichever module created the server).
+		void b.handle(req, res).catch((error: unknown) => {
 			send(res, 500, error instanceof Error ? error.message : "internal error");
 		});
 	});
@@ -917,6 +1608,7 @@ function stop(): void {
 	const b = store.__nifeWebui;
 	if (!b) return;
 	store.__nifeWebui = undefined;
+	clearTunnelTimer(b);
 	unpatchDialogs(b);
 	for (const resolve of b.pending.values()) resolve(undefined);
 	b.pending.clear();
@@ -927,6 +1619,17 @@ function stop(): void {
 }
 
 export default function webui(api: ExtensionAPI) {
+	// One synchronous hook for the whole process: /reload rebuilds the module, not the exit path.
+	const INSTALLED = Symbol.for("nife-webui.services-exit");
+	const flags = globalThis as unknown as Record<symbol, boolean>;
+	if (!flags[INSTALLED]) {
+		flags[INSTALLED] = true;
+		process.on("exit", killServices);
+	}
+	api.on("session_shutdown", (event) => {
+		if (event.reason === "quit") killServices();
+	});
+
 	api.registerCommand("webui", {
 		description: "Serve this session in the browser. /webui off stops it, /webui auto on|off autostarts",
 		handler: async (args, ctx) => {
@@ -952,8 +1655,15 @@ export default function webui(api: ExtensionAPI) {
 			}
 			b.api = api;
 			b.ctx = ctx;
+			b.handle = (req, res) => handle(b, req, res);
 			patchDialogs(ctx, b);
 			ctx.ui.notify(`webui: ${webuiUrl(b)}`, "info");
+			for (const [port, url] of b.publicUrls) {
+				ctx.ui.notify(
+					`webui public: ${port === b.port ? withToken(url, b.token) : `${url} (127.0.0.1:${port})`}`,
+					"info",
+				);
+			}
 		},
 	});
 
@@ -1011,6 +1721,14 @@ export default function webui(api: ExtensionAPI) {
 		b.api = api;
 		b.ctx = ctx;
 		patchDialogs(ctx, b);
+		// /reload keeps the bridge (globalThis) but not this module's fields, and it drops the timer
+		// that watched the tunnel: fill both back in instead of leaving a dead public URL behind.
+		b.handle = (req, res) => handle(b, req, res);
+		b.publicUrls ??= new Map();
+		b.tunnelPending ??= false;
+		b.tunnelRevives ??= 0;
+		b.tunnelBusy ??= false;
+		if (b.publicUrls.size) scheduleTunnel(b, TUNNEL_HEARTBEAT_MS);
 		broadcast(b, { type: "session_start", reason: event.reason });
 	});
 
@@ -1073,6 +1791,13 @@ export default function webui(api: ExtensionAPI) {
 			toolName: event.toolName,
 			isError: event.isError,
 		});
+		// a command that just finished may have started a server: offer it in the footer, a moment
+		// later so the port is bound by the time /proc is read
+		const timer = setTimeout(() => {
+			const bridge = store.__nifeWebui;
+			if (bridge) refreshServices(bridge);
+		}, 700);
+		timer.unref?.();
 		const b = store.__nifeWebui;
 		if (!b || !b.children.delete(event.toolCallId)) return;
 		broadcast(b, { type: "subagents", running: [...b.children.values()] });

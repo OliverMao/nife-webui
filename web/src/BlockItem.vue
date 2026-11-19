@@ -12,16 +12,8 @@ defineProps({
 <template>
 	<div v-if="block.type === 'text'" class="md" v-html="mdOf(block)"></div>
 	<img v-else-if="block.type === 'image'" :src="dataUrl(block)" alt="" />
-	<details v-else-if="block.type === 'thinking'" class="thinking">
-		<summary>
-			<svg class="think-icon" viewBox="0 0 16 16" aria-hidden="true">
-				<path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M12.6 3.4l-1.4 1.4M4.8 11.2l-1.4 1.4" />
-			</svg>
-			<span class="think-label">Thought</span>
-			<span class="think-preview ellipsis">{{ block.thinking.replace(/\s+/g, " ").slice(0, 80) }}</span>
-		</summary>
-		<div class="think-body">{{ block.thinking }}</div>
-	</details>
+	<!-- One click opens the row; the reasoning must not need a second one, so it is plain text here. -->
+	<div v-else-if="block.type === 'thinking'" class="think-body">{{ block.thinking }}</div>
 	<details v-else-if="block.type === 'toolCall'" class="tool" :class="{ failed: results[block.id]?.isError }">
 		<summary>
 			<span class="chev"></span>

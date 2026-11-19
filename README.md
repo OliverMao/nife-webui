@@ -27,15 +27,14 @@ WEBUI_TARGET=http://127.0.0.1:PORT npm run dev
 extensions/webui.ts   server: HTTP + SSE, ctx.ui interception, event forwarding
 web/src/App.vue       transcript, composer, dialog modal
 web/src/MessageItem.vue  one transcript row; BlockItem.vue one content block
-web/src/transcript.js  collapses thinking/tool runs into one row (unit tested)
+web/src/LiveMessage.vue  the streaming turn: `Working` row (LiveThinking.vue) + answer
+web/src/transcript.js  collapses thinking/tool runs into one row
 web/src/images.js     pasted image -> canvas resize -> base64 ImageContent
-web/src/paste.js      text-paste markers + image mime/size rules (unit tested)
-web/src/files.js      dropped-file marker lines, names, sizes, type icons (unit tested)
+web/src/paste.js      text-paste markers + image mime/size rules
+web/src/files.js      dropped-file marker lines, names, sizes, type icons
 web/src/FileIcon.vue  one stroked 16px glyph per file category
 web/src/style.css     all styling
 web/dist/             built output, served by the extension
-scripts/files-test.mjs, paste-test.mjs, markdown-test.mjs, transcript-test.mjs   pure-function tests
-scripts/smoke.mjs     fake ExtensionAPI + real HTTP server, no model needed
 ```
 
 ## Install
@@ -76,6 +75,79 @@ three ways: `/webui auto off` (persisted in `~/.nife/agent/webui.json`, honors
 Each running CLI process gets its own port and its own token, so several sessions can be open in
 several tabs at once.
 
+## Public URL (nifetun)
+
+With the [nifetun](https://github.com/OliverMao/nife-tunnel) extension installed (`/tunnel` in the
+session, `tunnel_up` in the tool list), the `tunnel` pill in the sidebar footer - right after the
+working directory - opens a menu in the same style as the model selector:
+
+```
+⛓ Nife Web                        publish     <- the page itself; no port is ever named
+SERVER
+  4599 · node                  open    ×       <- what the session is serving right now
+  5173 · node                           +
+CUSTOM PORT
+  4711                         open    ×
+  [ port ]                                    <- type a port nobody detected
+```
+
+- `Nife Web` publishes this page (`POST /api/tunnel` `{"action":"up"}`), turns the pill into a
+  spinner while it waits, and reloads at `https://<domain>/t/<id>/?t=<token>` once the URL is there.
+  While the approval mail is out the spinner stays and the page follows the URL by itself; the verb
+  reads `publish`, `open`, `disconnect` or `waiting…` so the row never needs a second control.
+- viewed publicly, `disconnect` asks for the teardown **from here** (`keepalive`, so the request
+  survives the navigation) and then goes back to the local URL with `&tunnel=off`, where the local
+  page repeats the request in case the first one never made it out of the tunnel it was killing.
+- `Server` is the detection described below; `Custom Port` keeps the ports the reader typed in, and
+  the page's own port is in neither list. Publishing one of them never disturbs the page: nifetun
+  appends the port to the running client's config file (hot reload on the same connections) instead
+  of restarting it, which would drop the page's tunnel - and every other tunnel - for a moment.
+- the pill itself carries the state: link icon and green when this page is public, amber pulse while
+  the approval is pending, `×` once the page is being viewed through the tunnel.
+- quitting nife takes the servers it started with it (`session_shutdown` with reason `quit`, plus a
+  synchronous `process.on("exit")`: the descendants of the CLI get `SIGTERM`, deepest first). A
+  reload or a session switch keeps them, because the process and its tunnels are still there. The
+  tree walk lives here because detection does; nifetun handles the tunnels themselves.
+- nothing is published at startup any more: the bridge never opens a public URL on its own.
+
+The terminal still narrates it: `webui: publishing 127.0.0.1:<port> through nifetun…` when the page
+asks, then either `webui public: <url>` or `webui: waiting for tunnel approval` (nifetun answers as
+soon as its client reports the pending enrollment, not after its 15s URL wait).
+
+**Other services.** Ports that the session itself started - anything listening under this CLI's
+process tree, e.g. a dev server the agent ran with `bash` - show up as dashed `+:3000` chips in the
+same footer. Clicking one publishes **that port only** (`{"action":"up","port":3000}`), so the page
+and its token stay local; the chip turns into a link to the public URL, with a `×` on hover to stop
+publishing it. The terminal says `webui public: 127.0.0.1:3000 -> https://…` for each one, and a new
+port is announced once (`nife started node on 127.0.0.1:3000 — publish it from the sidebar`).
+Detection is restricted to descendants of the CLI process, on every platform: `/proc` (socket inodes
+plus `/proc/<pid>/fd`) on Linux, `lsof` + `ps` on macOS, `netstat -ano` + `Get-CimInstance
+Win32_Process` on Windows. Only loopback or any-address listeners count, because that is what
+`127.0.0.1:<port>` can reach. The scan runs in the background and is cached for 3s - the Windows pair
+of commands takes about a second, so `/api/state` serves the last list and a changed list is pushed
+as `{type:"services"}`; it is refreshed right after a tool finishes (a server needs a moment to bind,
+so 700ms later) and the page ignores ports that were already there for the first 3s.
+- The page works under a path prefix: requests are built from `location.pathname`, not the origin,
+  so `/api/state`, `/api/events` (SSE) and uploads all go through `/t/<id>/`. `web/dist` uses
+  relative asset URLs (`base: "./"`), so nothing depends on the edge rewriting `index.html`.
+- The bridge also strips `/t/<id>` itself, from `X-Forwarded-Prefix` when the edge sends it and from
+  the path when it does not: an edge built before that header existed (or with `strip_prefix` off)
+  forwards `/t/<id>/api/...` untouched, and a doubled prefix still lands on the right route. A 404
+  from the bridge names the path it could not route (`not found: /t/<id>/...`), which is how that
+  case is told apart from the edge's own "no such tunnel" page.
+- `Origin` on POSTs is accepted when it matches the request's own `Host`, which is how the public
+  URL gets through while another site still cannot drive the session.
+- The tunnel client is a separate process owned by `/tunnel`, and it can die on its own. The bridge
+  keeps a 20s heartbeat: a client that vanished is reported (`webui: tunnel dropped, republishing…`),
+  the dead link is dropped from the page, and `up` is asked again - up to five times, and the chip
+  disappears once nifetun stops answering. Without that, a dead client left every request (page and
+  API alike) on the edge's 404 while the bridge kept serving fine on 127.0.0.1.
+- `down` removes only this port from the tunnel: another port served by the same client keeps its
+  tunnel (the client is restarted with what is left), so disconnecting the page never kills someone
+  else's tunnel. `/webui off` still leaves the tunnel alone (`/tunnel down` stops it), and the client
+  process outlives nife anyway.
+- No nifetun, no public URL: everything else is unchanged and the bridge stays on `127.0.0.1`.
+
 From the browser:
 
 - left sidebar lists sessions for the current working directory, click to switch (`/resume`)
@@ -96,12 +168,16 @@ From the browser:
   the parked items follow that turn. `Resume` continues without a new message, `Clear` drops them; failures stay at the head with a
   `Retry` action instead of silently disappearing
 - `+` starts a fresh session (`/new`)
-- thinking and tool calls collapse into one row, not one row per step: consecutive process-only
-  messages (`isProcessItem` in `web/src/transcript.js`) become a single closed `Worked · 3 tools ·
-  1 thought` row, and inside a message that also carries text, adjacent thinking/tool blocks
-  collapse the same way - so the transcript reads as answers only, with the working out one click
-  away. A lone step keeps its own row. Single tool rows are flat one-liners (`Ran npm test`),
-  expand for arguments and output, failed rows are marked in amber
+- the answer text is the only thing shown outside a collapsed run: thinking and tool calls always
+  sit inside a closed `Worked · 3 tools · 1 thought` row, whether they arrived as separate
+  process-only messages (`isProcessItem` in `web/src/transcript.js`) or as adjacent blocks inside a
+  message that also carries text. A single step folds the same way (`Worked · 1 thought`), so the
+  transcript reads as answers only, with the working out one click away. The turn that is still
+  streaming reuses that row: the trailing run turns `Working` and the incoming reasoning grows at the
+  end of its body (`web/src/LiveMessage.vue`, `web/src/LiveThinking.vue`), with the answer below the
+  fold, so committing the turn only swaps the live body for its block and does not move the page.
+  Inside the row, tool steps stay flat one-liners (`Ran npm test`), expand for arguments and output,
+  failed rows are marked in amber
 - panel button collapses the sidebar (remembered in `localStorage`); it becomes an overlay under
   820px, where a dimmed backdrop covers the page: tapping it, switching sessions, or Escape closes
   the overlay, and resizing back to a wide window clears the open state
@@ -240,6 +316,10 @@ page reloads the transcript of the newly active session. That is why the bridge 
   terminal dialog unchanged.
 - Extensions are reloaded on `/new`, `/resume`, `/fork`; the bridge rebinds on `session_start`
   and is *not* torn down on `session_shutdown`, so the URL keeps working across switches.
+- Publishing asks nifetun over nife's event bus (`nifetun:request` / `nifetun:reply`) instead of
+  guessing its state file: `{kind: "up", tunnels: ["127.0.0.1:<port>"]}` comes back with the entry
+  list, and the entry whose local end is this port is the URL. `up` appends to the tunnels that are
+  already running, so starting the web UI never drops a tunnel someone else is using.
 - Session control (`switchSession`, `newSession`) needs a command-capable context. `/webui`
   captures one, and every replacement passes a fresh `withSession` context, so the next switch
   works without re-running `/webui`.
@@ -257,8 +337,9 @@ No build step for the extension itself: plain `node:http` + SSE, no runtime depe
   cannot choose a directory, overwrite another drop, or smuggle a name into a shell command.
 - `POST /api/delete` only accepts paths that `SessionManager.list(cwd)` returns for this project and
   never the active session, so the endpoint cannot be pointed at an arbitrary file.
-- Do not expose the port publicly. For remote access use an SSH tunnel or Tailscale, not a
-  reverse proxy with auth you wrote yourself.
+- There is no login: the URL carries the token, so treat a published URL as a credential. The port
+  itself still binds `127.0.0.1`; the only public path is the nifetun tunnel (`/tunnel down` closes
+  it). For anything else use an SSH tunnel or Tailscale rather than a reverse proxy.
 
 ## Long sessions
 
@@ -271,6 +352,23 @@ spacer, which is why nothing shifts under the cursor. Two things that were easy 
   spacer grows by exactly the height that left the flow, measured before the update;
 - jumping into old history parks the window around the target (`runEnd`), otherwise a jump to task 3
   of a 2000-row session would mount every row below it.
+
+The spacer is an estimate per row, so a row has to stay around one screen tall: an open `Worked`
+run can hold dozens of tool steps, and one that grows for pages makes every jump land at the wrong
+offset. Its body therefore scrolls inside itself (`max-height: 60vh`, see `.process-body` in
+`web/src/style.css`) - the summary stays put and the window keeps measuring rows it can anticipate.
+
+Nothing inside the transcript draws a scrollbar (`.transcript *`), which an open run would otherwise
+show several of: the row body, each tool output and the reasoning are all scroll areas. The wheel
+goes to whatever is under the pointer and chains outward at the end of each area (`wheelTarget` in
+`App.vue`), so the row body, one output inside it and the page behave like one scroller, and an
+upward wheel inside an inner area no longer detaches the view from the newest message.
+
+A row the reader expanded while the turn was streaming stays expanded when the message commits
+(`claimLiveRow` in `App.vue`). The live body and the committed body are different elements, so
+without that hand-over the body collapsed in the same frame the message landed and the page jumped
+by its whole height. The live block is also only mounted once it has something to draw: an empty one
+still carries its margins, which made the page blink at the start of every turn.
 
 The history is paged as well as windowed: `/api/state` ships a tail slice of the context (at most
 60 messages, ~400 KB, always starting on a user message so a tool call never loses its result),
@@ -321,17 +419,13 @@ task, so opening the page shows the current prompt rather than something from th
 - Markdown is rendered as plain pre-wrapped text. No syntax highlighting yet.
 - One bridge per CLI process; no landing page listing sessions across directories.
 - `/webui off` is the only way to close the port; quitting the CLI closes it with the process.
+- A published URL needs a nifetun whose extension answers the event bus (the current `main`); an
+  older install simply gets no public URL. Reloading the page keeps the token in the address bar,
+  but opening the bare `/t/<id>/` URL without `?t=` answers `401 bad token`.
+- SSE through a CDN is only as live as the CDN: a proxy that buffers responses turns the stream
+  into a slow poll. The tunnel itself forwards bytes as they arrive.
 
-## Dev checks
-
-```bash
-npm run smoke              # markdown/files/paste unit tests, an SSR render of App.vue,
-                           # then the HTTP/SSE bridge against a fake ExtensionAPI
-```
-
-`scripts/render-test.mjs` builds the real `App.vue` once for SSR and renders it with the initial
-state. It exists because a template expression on a possibly-null computed blanks the page while
-every HTTP test still passes: the palette's `slashMatches.length` did exactly that.
+## Dev check
 
 `tsconfig.check.json` type-checks the extension against a nife source checkout; the `paths`
 entry points at `/root/nife`, edit it for your layout:

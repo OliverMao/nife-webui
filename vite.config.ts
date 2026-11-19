@@ -8,6 +8,9 @@ const target = process.env.WEBUI_TARGET;
 export default defineConfig({
 	root: "web",
 	plugins: [vue()],
+	// Relative asset URLs: the bundle works at / and under a tunnel prefix (/t/<id>/) without
+	// relying on the edge rewriting index.html.
+	base: "./",
 	build: { outDir: "dist", emptyOutDir: true },
 	server: target ? { proxy: { "/api": { target, changeOrigin: true } } } : undefined,
 });

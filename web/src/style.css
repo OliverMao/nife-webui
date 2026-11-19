@@ -151,6 +151,61 @@ svg {
 	display: flex;
 	flex-direction: column;
 	gap: 1px;
+	/*
+	 * The browser default is a chunky, light system bar that reads as part of the OS rather than
+	 * the sidebar. Use a thin translucent thumb instead; it stays visible so the list does not look
+	 * cut off, and brightens on hover.
+	 *
+	 * Deliberately no scrollbar-width/scrollbar-color here: WebKit (Chrome, Safari) then ignores
+	 * ::-webkit-scrollbar entirely and draws its native bar, which on macOS keeps the track and the
+	 * up/down arrow buttons. Firefox gets the standard properties in the @supports block below.
+	 */
+}
+
+.session-list::-webkit-scrollbar {
+	width: 6px;
+}
+
+.session-list::-webkit-scrollbar-track {
+	background: none;
+}
+
+/* classic webkit scrollbars draw up/down arrow buttons by default; this list needs none */
+.session-list::-webkit-scrollbar-button {
+	display: none;
+	width: 0;
+	height: 0;
+}
+
+.session-list::-webkit-scrollbar-corner {
+	background: none;
+}
+
+.session-list::-webkit-scrollbar-thumb {
+	background: rgb(255 255 255 / 12%);
+	border-radius: 3px;
+}
+
+.session-list:hover::-webkit-scrollbar-thumb,
+.session-list:focus-within::-webkit-scrollbar-thumb {
+	background: rgb(255 255 255 / 18%);
+}
+
+.session-list::-webkit-scrollbar-thumb:hover {
+	background: rgb(255 255 255 / 26%);
+}
+
+/* Firefox has no ::-webkit-scrollbar; give it the standard thin scrollbar instead */
+@supports (-moz-appearance: none) {
+	.session-list {
+		scrollbar-width: thin;
+		scrollbar-color: rgb(255 255 255 / 12%) transparent;
+	}
+
+	.session-list:hover,
+	.session-list:focus-within {
+		scrollbar-color: rgb(255 255 255 / 18%) transparent;
+	}
 }
 
 .session {
@@ -270,9 +325,19 @@ svg {
 }
 
 .sidebar-foot {
+	display: flex;
+	align-items: center;
+	flex-wrap: wrap;
+	gap: 6px 8px;
 	padding: 10px 14px 14px;
 	border-top: 1px solid var(--line);
 	margin-top: 4px;
+}
+
+/* the path keeps the row and yields: the tunnel chip is short and must stay readable */
+.foot-path {
+	min-width: 0;
+	flex: 1;
 }
 
 /* main */
@@ -384,6 +449,55 @@ svg {
 	gap: 8px;
 }
 
+/*
+ * User attachments: one row of uniform thumbnails above the text, right-aligned with the bubble.
+ * The size is fixed and the picture is cropped to fit, because keeping aspect ratio made a
+ * landscape shot next to a portrait one shrink to a stamp. They used to render inside the pill at
+ * full width, so one screenshot could fill the column and push the sentence out of sight.
+ */
+.bubble-images {
+	display: flex;
+	flex-wrap: wrap;
+	justify-content: flex-end;
+	gap: 6px;
+	max-width: 68%;
+}
+
+.bubble-image {
+	padding: 0;
+	border: 0;
+	background: none;
+	cursor: zoom-in;
+}
+
+.bubble-image img {
+	display: block;
+	width: 96px;
+	height: 96px;
+	max-width: none;
+	object-fit: cover;
+	border-radius: 12px;
+}
+
+/* A thumbnail is cropped, so clicking one has to show the picture whole. */
+.image-viewer {
+	position: fixed;
+	inset: 0;
+	z-index: 70;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	padding: 32px;
+	background: rgb(0 0 0 / 82%);
+	cursor: zoom-out;
+}
+
+.image-viewer img {
+	max-width: 100%;
+	max-height: 100%;
+	border-radius: 8px;
+}
+
 .msg.assistant .text {
 	color: #dcdcdc;
 }
@@ -422,7 +536,6 @@ svg {
 	color: var(--warn);
 }
 
-.thinking summary::-webkit-details-marker,
 .tool summary::-webkit-details-marker {
 	display: none;
 }
@@ -525,6 +638,10 @@ svg {
 	color: var(--warn);
 }
 
+.process.working > summary {
+	color: var(--text);
+}
+
 .process[open] > summary > .chev {
 	transform: rotate(45deg);
 }
@@ -537,6 +654,24 @@ svg {
 	flex-direction: column;
 	gap: 6px;
 }
+
+/*
+ * The transcript windows rows by an average height, so a row has to stay around one screen: an open
+ * run can hold dozens of tool steps and grow for pages. Capping it keeps the spacer above the window
+ * truthful (a row that outgrows the viewport makes every page jump land at the wrong offset) and the
+ * working out stays readable in its own scroll area.
+ */
+.process[open] > .process-body {
+	max-height: 60vh;
+	overflow-y: auto;
+}
+
+/*
+ * Inside an open run the levels stay separate - the row body, each tool output, the reasoning - and
+ * the pointer decides which one the wheel moves (see wheelTarget in App.vue). None of them draws a
+ * scrollbar of its own (the `.transcript *` rule above), because several drag bars in one row is
+ * what looked broken.
+ */
 
 .process-body .msg {
 	margin: 0;
@@ -679,6 +814,17 @@ img {
  * transcript, so it pins to the bottom of the reading area whatever the composer or queue does.
  */
 .transcript::-webkit-scrollbar {
+	width: 0;
+	height: 0;
+}
+
+/* No drag bars inside the transcript: an inner area only needs to look like part of the page, and
+   the wheel goes to whatever is under the pointer (see wheelTarget in App.vue). */
+.transcript * {
+	scrollbar-width: none;
+}
+
+.transcript *::-webkit-scrollbar {
 	width: 0;
 	height: 0;
 }
@@ -1938,31 +2084,6 @@ img {
 
 /* thinking + tool rows */
 
-.thinking summary {
-	display: flex;
-	align-items: center;
-	gap: 7px;
-	cursor: pointer;
-	font-size: 13px;
-	color: var(--muted);
-	list-style: none;
-	padding: 2px 0;
-}
-
-.thinking summary::after {
-	content: "";
-	width: 6px;
-	height: 6px;
-	border-right: 1.4px solid currentColor;
-	border-bottom: 1.4px solid currentColor;
-	transform: rotate(-45deg);
-	opacity: 0.6;
-}
-
-.thinking[open] summary::after {
-	transform: rotate(45deg);
-}
-
 .think-icon {
 	width: 13px;
 	height: 13px;
@@ -1979,13 +2100,6 @@ img {
 	to {
 		transform: rotate(360deg);
 	}
-}
-
-.think-preview {
-	flex: 1;
-	min-width: 0;
-	color: var(--dim);
-	font-size: 12px;
 }
 
 .think-body {
@@ -2018,6 +2132,20 @@ img {
 
 .live .md {
 	color: #e2e2e6;
+}
+
+/*
+ * The streaming row has to occupy exactly the space its committed twin will: 6px above the summary,
+ * 6px between the summary and the answer. Otherwise every commit nudges the answer by the difference
+ * and the transcript looks like it is bobbing while the turn runs.
+ */
+.live {
+	margin-top: 6px;
+	gap: 6px;
+}
+
+.live > .process {
+	margin: 0;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -2056,7 +2184,6 @@ img {
 .think-body.streaming {
 	max-height: 132px;
 	overflow-y: auto;
-	scrollbar-width: thin;
 	mask-image: linear-gradient(to bottom, #000 74%, transparent 100%);
 	-webkit-mask-image: linear-gradient(to bottom, #000 74%, transparent 100%);
 }
@@ -2166,6 +2293,221 @@ img {
 }
 
 /* subagent + stats */
+
+.tunnel-chip {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	flex: none;
+	height: 20px;
+	padding: 0 8px;
+	border: 0;
+	border-radius: 999px;
+	background: rgb(120 200 160 / 12%);
+	color: #9fd9b8;
+	font: inherit;
+	font-size: 11px;
+	font-variant-numeric: tabular-nums;
+	text-decoration: none;
+	white-space: nowrap;
+	cursor: pointer;
+}
+
+.tunnel-chip:hover:not(:disabled) {
+	background: rgb(120 200 160 / 20%);
+	color: #c4efd8;
+}
+
+.tunnel-chip:disabled {
+	cursor: default;
+}
+
+/* published: the same pill, a touch brighter, because it now leads somewhere */
+.tunnel-chip.open {
+	background: rgb(120 200 160 / 20%);
+}
+
+/* the icon carries the state: link when idle, × once this page is public */
+.tunnel-chip svg {
+	width: 11px;
+	height: 11px;
+	fill: none;
+	stroke: currentColor;
+	stroke-width: 1.5;
+	stroke-linecap: round;
+	stroke-linejoin: round;
+}
+
+.tunnel-chip.pending {
+	background: rgb(230 190 120 / 12%);
+	color: #d9c49a;
+}
+
+/* approval is pending: no URL yet, so the pill and the rows pulse instead of pretending */
+.tunnel-wait {
+	width: 6px;
+	height: 6px;
+	border-radius: 50%;
+	background: currentColor;
+	display: inline-block;
+	animation: tunnel-wait 1.2s ease-in-out infinite;
+}
+
+@keyframes tunnel-wait {
+	50% {
+		opacity: 0.25;
+	}
+}
+
+.tunnel-menu {
+	/* anchored above the footer pill, not to the composer */
+	bottom: calc(100% + 6px);
+	left: 6px;
+	right: 6px;
+	width: auto;
+	min-width: 0;
+	max-height: 340px;
+	padding: 2px 4px 6px;
+}
+
+.sidebar-foot {
+	position: relative;
+}
+
+/* rows are 26px so the list reads as a list, not as loose text */
+.tunnel-menu .menu-item {
+	padding: 5px 8px;
+	gap: 8px;
+	font-size: 12px;
+}
+
+/* the footer section sits on the same left edge as the rows above it */
+.tunnel-menu .menu-footer {
+	padding: 8px 0 0;
+}
+
+.tunnel-menu .menu-label {
+	padding: 7px 8px 2px;
+	font-size: 10px;
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+	color: var(--dim);
+}
+
+.tunnel-menu .menu-list {
+	max-height: 168px;
+	gap: 0;
+}
+
+/* the page itself: name on the left, its state as a small pill on the right */
+.tunnel-page {
+	gap: 8px;
+}
+
+.tunnel-page svg {
+	width: 12px;
+	height: 12px;
+	flex: none;
+	fill: none;
+	stroke: var(--muted);
+	stroke-width: 1.5;
+	stroke-linecap: round;
+}
+
+/* the row's verb, not a second button: the whole row is the click target */
+.tunnel-action {
+	flex: 0 0 auto;
+	margin-left: auto;
+	color: #9fd9b8;
+	font-size: 11px;
+	white-space: nowrap;
+}
+
+.tunnel-action.waiting {
+	color: #d9c49a;
+}
+
+.tunnel-page:hover .tunnel-action {
+	text-decoration: underline;
+}
+
+.tunnel-row {
+	font-size: 12px;
+}
+
+.tunnel-row .muted {
+	font-variant-numeric: tabular-nums;
+	color: var(--muted);
+}
+
+.tunnel-row-open {
+	flex: none;
+	margin-left: auto;
+	color: #9fd9b8;
+	font-size: 11px;
+	text-decoration: none;
+}
+
+.tunnel-row-open:hover {
+	text-decoration: underline;
+}
+
+.tunnel-row-plus,
+.tunnel-row-x {
+	flex: none;
+	margin-left: auto;
+	width: 18px;
+	height: 18px;
+	padding: 0;
+	border: 1px solid #3a3a3a;
+	border-radius: 50%;
+	background: transparent;
+	color: var(--muted);
+	font: inherit;
+	font-size: 12px;
+	line-height: 15px;
+	cursor: pointer;
+}
+
+.tunnel-row-open + .tunnel-row-x {
+	margin-left: 6px;
+}
+
+.tunnel-row-plus:hover:not(:disabled),
+.tunnel-row-x:hover {
+	border-color: #555;
+	color: var(--text);
+}
+
+.tunnel-row-x:hover {
+	border-color: rgb(230 140 140 / 60%);
+	color: #e8a3a3;
+}
+
+.tunnel-menu .pad {
+	padding: 4px 8px 6px;
+	font-size: 12px;
+}
+
+.tunnel-add.menu-search {
+	margin: 2px 4px 0;
+	width: calc(100% - 8px);
+	height: 22px;
+	padding: 0 8px;
+	border: 1px solid rgb(255 255 255 / 7%);
+	border-radius: 6px;
+	background: rgb(255 255 255 / 3%);
+	font-size: 11px;
+}
+
+.tunnel-add.menu-search:focus {
+	border-color: rgb(159 217 184 / 40%);
+	background: rgb(255 255 255 / 5%);
+}
+
+.tunnel-add::placeholder {
+	color: var(--dim);
+}
 
 .agent-chip {
 	display: inline-flex;

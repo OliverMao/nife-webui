@@ -1,62 +1,29 @@
 <script setup>
 import { onBeforeUnmount, ref, watch } from "vue";
+import LiveThinking from "./LiveThinking.vue";
 import { renderMarkdown } from "./markdown.js";
+import { stepLabel } from "./transcript.js";
 
-// Owns the streaming markdown so the transcript list is not re-rendered per token.
+// The turn that is still streaming. The reasoning goes inside the row that will commit as
+// "Worked · N tools · M thoughts", and the answer stays outside it, so the live turn has the same
+// shape as the committed one instead of leaving the thinking in a block of its own.
 const props = defineProps({
 	live: { type: Object, required: true },
+	// the trailing "Worked" row is hosting the reasoning (see App.vue): only the answer is left here
+	hosted: { type: Boolean, default: false },
 });
 
 const html = ref("");
-const thinkEl = ref(null);
+// the row is this component's own element, so its expanded state lives here until the turn commits
+const opened = ref(false);
 let lastRender = 0;
 let timer = null;
-let followFrame = 0;
-let following = true;
-
-/** Eased follow so the newest thinking line stays visible while it streams. */
-function followTick() {
-	followFrame = 0;
-	const node = thinkEl.value;
-	if (!node || !following) return;
-	const target = node.scrollHeight - node.clientHeight;
-	if (target <= 0) return;
-	const delta = target - node.scrollTop;
-	if (Math.abs(delta) < 1) {
-		node.scrollTop = target;
-		return;
-	}
-	node.scrollTop += delta * 0.3;
-	followFrame = requestAnimationFrame(followTick);
-}
-
-function onThinkScroll() {
-	const node = thinkEl.value;
-	if (!node) return;
-	// the user scrolled up: stop fighting them until they come back down
-	following = node.scrollHeight - node.scrollTop - node.clientHeight < 32;
-}
-
-watch(
-	() => props.live.thinking,
-	() => {
-		// collapsed by default: the body element only exists once the user opens the summary
-		if (!thinkEl.value || followFrame) return;
-		followFrame = requestAnimationFrame(followTick);
-	},
-	{ flush: "post" },
-);
 
 function render() {
 	timer = null;
 	lastRender = performance.now();
 	html.value = renderMarkdown(props.live.text);
 }
-
-onBeforeUnmount(() => {
-	if (timer) clearTimeout(timer);
-	if (followFrame) cancelAnimationFrame(followFrame);
-});
 
 watch(
 	() => props.live.text,
@@ -67,20 +34,32 @@ watch(
 		else if (!timer) timer = setTimeout(render, wait);
 	},
 );
+
+function onToggle(event) {
+	opened.value = event.target.open;
+}
+
+onBeforeUnmount(() => {
+	if (timer) clearTimeout(timer);
+});
 </script>
 
 <template>
 	<div class="msg assistant live">
-		<details v-if="live.thinking" class="thinking">
+		<details v-if="!hosted && live.thinking" class="process working" @toggle="onToggle">
 			<summary>
+				<span class="chev"></span>
 				<svg class="think-icon spinning" viewBox="0 0 16 16" aria-hidden="true">
 					<path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M12.6 3.4l-1.4 1.4M4.8 11.2l-1.4 1.4" />
 				</svg>
-				<span class="think-label">Thinking</span>
+				<span class="tool-verb">Working</span>
+				<span class="tool-arg ellipsis">{{ stepLabel({ tools: 0, thoughts: 1 }) }}</span>
 			</summary>
-			<div ref="thinkEl" class="think-body streaming" @scroll.passive="onThinkScroll">{{ live.thinking }}</div>
+			<div class="process-body">
+				<LiveThinking :live="live" :open="opened" />
+			</div>
 		</details>
 		<div v-if="html" class="md" v-html="html"></div>
-		<div v-else class="text">{{ live.text }}</div>
+		<div v-else-if="live.text" class="text">{{ live.text }}</div>
 	</div>
 </template>

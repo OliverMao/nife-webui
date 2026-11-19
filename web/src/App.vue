@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, triggerRef, watch } from "vue";
 import EffortSlider from "./EffortSlider.vue";
 import LiveMessage from "./LiveMessage.vue";
+import LiveThinking from "./LiveThinking.vue";
 import MessageItem from "./MessageItem.vue";
 import { prepareImage } from "./images.js";
 import FileIcon from "./FileIcon.vue";
@@ -9,10 +10,13 @@ import { formatBytes } from "./files.js";
 import { blocksOf } from "./message-utils.js";
 import { IMAGE_MAX_COUNT, expandPastes, imageFiles, imageMimeType, imageProblem, pasteMarker, readClipboard } from "./paste.js";
 import { metaOf, previewOf, promptTextOf, queueProblem } from "./queue.js";
-import { groupItems, stepLabel } from "./transcript.js";
+import { groupItems, isProcessBlock, stepLabel } from "./transcript.js";
 
 const token = new URLSearchParams(location.search).get("t") ?? "";
-const api = (path) => `/api/${path}${path.includes("?") ? "&" : "?"}t=${encodeURIComponent(token)}`;
+// The page is served from the domain root, or under a tunnel prefix (nifetun publishes it at
+// /t/<id>/): every request stays relative to the page, never to the origin.
+const base = location.pathname.replace(/\/(?:index\.html)?$/, "");
+const api = (path) => `${base}/api/${path}${path.includes("?") ? "&" : "?"}t=${encodeURIComponent(token)}`;
 
 // Committed messages live in a shallowRef: objects are plain (not deep-proxied) and the list is
 // only invalidated on message boundaries, never per streaming token.
@@ -37,6 +41,201 @@ const collapsed = ref(localStorage.getItem("nife-webui.collapsed") === "1");
 const narrow = ref(false);
 const sessions = ref([]);
 const currentFile = ref("");
+// The footer button publishes this page through nifetun and comes back with the public URL; from the
+// public page the same button tears the tunnel down and reloads the local URL. The local origin is
+// the only place a disconnect can be requested, because the request cannot survive the tunnel it kills.
+const localHost = ["127.0.0.1", "localhost", "::1", "[::1]"].includes(location.hostname);
+const connecting = ref(false);
+const tunnelMenu = ref(false);
+const tunnelPending = computed(() => Boolean(state.value.tunnel?.pending) || connecting.value);
+const pageTunnel = computed(() => Boolean(state.value.tunnel?.url));
+const tunnelTitle = computed(() => {
+	if (tunnelPending.value) return "nifetun: waiting for the approval mail";
+	return pageTunnel.value ? "Tunnels (this page is public)" : "Tunnels";
+});
+/** What the "this page" row does, in one word. */
+const pageAction = computed(() => {
+	if (tunnelPending.value) return "waiting…";
+	if (!pageTunnel.value) return "publish";
+	return localHost ? "open" : "disconnect";
+});
+
+// The bridge builds the list (it owns the port numbers and drops its own port there), so the page
+// only splits it: what the session serves, and what the reader typed in.
+const portRows = computed(() => state.value.ports ?? []);
+const serverRows = computed(() => portRows.value.filter((row) => row.kind === "server"));
+const customRows = computed(() => portRows.value.filter((row) => row.kind === "custom"));
+const serviceBusy = ref(0);
+const knownServices = new Set();
+/** The first load only fills the set: ports that were already there are not news. */
+let servicesReady = false;
+
+/** A new port is worth one line, not a dialog: the chip in the footer is the invitation. */
+function noteServices(list) {
+	const ports = (list ?? []).filter((service) => !knownServices.has(service.port));
+	for (const service of ports) knownServices.add(service.port);
+	if (!servicesReady) return;
+	for (const service of ports) {
+		const label = service.cmd ? `${service.cmd} on 127.0.0.1:${service.port}` : `127.0.0.1:${service.port}`;
+		showNotice(`nife started ${label} — publish it from the sidebar`);
+	}
+}
+
+/** Ask nifetun for one more port; the chip turns into a link to the public URL. */
+async function publishService(service) {
+	if (serviceBusy.value) return;
+	serviceBusy.value = service.port;
+	try {
+		const response = await fetch(api("tunnel"), {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ action: "up", port: service.port }),
+		});
+		if (!response.ok) {
+			showNotice((await response.text()).slice(0, 200) || "could not publish");
+			return;
+		}
+		const { tunnel, ports } = await response.json();
+		state.value.tunnel = tunnel;
+		state.value.ports = ports;
+		const url = ports?.find((row) => row.port === service.port)?.url ?? "";
+		if (url) showNotice(`127.0.0.1:${service.port} -> ${url}`);
+		else if (tunnel?.pending) showNotice("waiting for the approval mail");
+	} catch {
+		showNotice("could not publish");
+	} finally {
+		serviceBusy.value = 0;
+	}
+}
+
+// A port nobody detected: the agent may have started a server in a way the tree walk misses, or the
+// port is not listening yet. Typing it in the menu is the same `up` call the rows make.
+const manualValue = ref("");
+const manualBusy = ref(false);
+
+async function publishManual() {
+	const text = manualValue.value.trim();
+	if (!text || manualBusy.value) return;
+	// `3000`, `127.0.0.1:3000` and `localhost:3000` all mean the same tunnel; anything else is refused
+	const match = /^(?:(127\.0\.0\.1|localhost):)?(\d{1,5})$/.exec(text);
+	const port = match ? Number(match[2]) : 0;
+	if (!port || port > 65535) {
+		showNotice("port or 127.0.0.1:port, e.g. 3000");
+		return;
+	}
+	manualBusy.value = true;
+	try {
+		const response = await fetch(api("tunnel"), {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ action: "up", port }),
+		});
+		if (!response.ok) {
+			showNotice((await response.text()).slice(0, 200) || "could not publish");
+			return;
+		}
+		const { tunnel, ports } = await response.json();
+		state.value.tunnel = tunnel;
+		state.value.ports = ports;
+		manualValue.value = "";
+		const url = ports?.find((row) => row.port === port)?.url ?? "";
+		if (url) showNotice(`127.0.0.1:${port} -> ${url}`);
+		else if (tunnel?.pending) showNotice("waiting for the approval mail");
+	} catch {
+		showNotice("could not publish");
+	} finally {
+		manualBusy.value = false;
+	}
+}
+
+/** Unpublish one service: the tunnel is asked for this port only, so the page keeps its own. */
+async function unpublishService(service) {
+	if (serviceBusy.value) return;
+	serviceBusy.value = service.port;
+	try {
+		const response = await fetch(api("tunnel"), {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ action: "down", port: service.port }),
+		});
+		if (!response.ok) {
+			showNotice((await response.text()).slice(0, 200) || "could not unpublish");
+		} else {
+			const payload = await response.json();
+			state.value.tunnel = payload.tunnel;
+			state.value.ports = payload.ports;
+		}
+	} catch {
+		showNotice("could not unpublish");
+	} finally {
+		serviceBusy.value = 0;
+	}
+}
+
+async function toggleTunnel() {
+	const tunnel = state.value.tunnel;
+	if (tunnel?.url) {
+		if (localHost) {
+			location.href = tunnel.url;
+			return;
+		}
+		// Ask for the teardown from here (keepalive survives the navigation), then hop home: the
+		// response cannot come back through the tunnel we are killing, and the local page repeats the
+		// request with `tunnel=off` in case this one never made it out.
+		tunnelMenu.value = false;
+		void fetch(api("tunnel"), {
+			method: "POST",
+			keepalive: true,
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ action: "down" }),
+		}).catch(() => {});
+		location.href = `${tunnel.localUrl}&tunnel=off`;
+		return;
+	}
+	if (tunnelPending.value) return;
+	connecting.value = true;
+	try {
+		const response = await fetch(api("tunnel"), {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ action: "up" }),
+		});
+		if (!response.ok) {
+			showNotice((await response.text()).slice(0, 200) || "could not publish");
+			connecting.value = false;
+			return;
+		}
+		const { tunnel: next } = await response.json();
+		if (next?.url) {
+			location.href = next.url;
+			return;
+		}
+		// no URL yet: the approval mail is out, and the state watch reloads once it is clicked
+		showNotice("waiting for the approval mail");
+	} catch {
+		showNotice("could not publish");
+		connecting.value = false;
+	}
+}
+
+// Approved while the page was waiting: follow the URL as soon as the bridge reports it.
+watch(
+	() => state.value.tunnel?.url,
+	(url) => {
+		if (url && connecting.value) location.href = url;
+	},
+);
+
+/** Back from the public page with "tunnel=off": tearing it down has to happen from here. */
+async function finishTunnelDisconnect() {
+	const params = new URLSearchParams(location.search);
+	if (params.get("tunnel") !== "off") return;
+	params.delete("tunnel");
+	const query = params.toString();
+	history.replaceState(null, "", `${location.pathname}${query ? `?${query}` : ""}`);
+	await postDetailed("tunnel", { action: "down" });
+	await loadState();
+}
 // Session awaiting delete confirmation in the sidebar.
 const pendingDelete = ref("");
 // Manual context compaction in flight (the bridge also reports automatic ones).
@@ -106,7 +305,29 @@ const items = computed(() => {
 					used.add(block.id);
 				}
 			}
-			list.push({ kind: "assistant", message, results: own, index });
+			const blocks = blocksOf(message);
+			const answer = blocks.some((block) => (block?.type === "text" && block.text?.trim()) || block?.type === "image");
+			if (answer && blocks.some(isProcessBlock)) {
+				// A message that reasons and then answers: the reasoning belongs to the run above it, so
+				// the transcript reads "Worked · 2 tools · 2 thoughts" followed by the answer, instead
+				// of leaving one more "Thought" outside the fold.
+				list.push({
+					kind: "assistant",
+					part: "work",
+					message: { ...message, content: blocks.filter(isProcessBlock) },
+					results: own,
+					index,
+				});
+				list.push({
+					kind: "assistant",
+					part: "answer",
+					message: { ...message, content: blocks.filter((block) => !isProcessBlock(block)) },
+					results: own,
+					index,
+				});
+			} else {
+				list.push({ kind: "assistant", message, results: own, index });
+			}
 		} else if (message.role === "user") {
 			list.push({ kind: "user", message, results: {}, index });
 		} else if (message.role === "bashExecution") {
@@ -249,7 +470,63 @@ const rowByMessage = computed(() => {
  */
 const rowKey = (row) => {
 	const first = row.kind === "process" ? row.steps[0] : row;
-	return `${row.kind}:${typeof first?.index === "number" ? first.index : -1}`;
+	const index = typeof first?.index === "number" ? first.index : -1;
+	// a message split into work + answer shares its index, so the part is part of the identity
+	return `${row.kind}:${index}:${first?.part ?? ""}`;
+};
+
+/**
+ * The live turn carries its own "Working" row (see LiveMessage), so a committed row only shows the
+ * indicator in the gap between messages: a tool runs with no assistant message in flight, and the
+ * next streaming row has not appeared yet.
+ */
+const workingRowKey = computed(() => {
+	if (!streaming.value || live.value?.thinking || live.value?.text) return "";
+	const last = visibleRows.value[visibleRows.value.length - 1];
+	return last?.kind === "process" ? rowKey(last) : "";
+});
+
+/**
+ * Where the streaming reasoning goes. When the transcript already ends in a collapsed run, that row
+ * hosts it: the reasoning grows inside the row it will commit into, instead of stacking a second
+ * "Working" row under it and merging the two on commit. A parked window keeps its own rows, so the
+ * live body is only ever injected at the tail.
+ */
+const liveRowKey = computed(() => {
+	if (!streaming.value || !live.value?.thinking || runEnd.value !== Number.POSITIVE_INFINITY) return "";
+	const last = visibleRows.value[visibleRows.value.length - 1];
+	return last?.kind === "process" ? rowKey(last) : "";
+});
+const liveHosted = computed(() => liveRowKey.value !== "");
+// reading live.text in the template would re-render the whole row list on every token, so the
+// condition that only needs "has the answer started" is a computed that turns into a boolean
+const liveHasText = computed(() => Boolean(live.value?.text));
+
+// Which committed rows the reader has open. Bound back onto <details> so a row that the live turn
+// was expanded into can be handed over still open: a body that collapses in the same frame the
+// message lands makes the page jump by its whole height.
+const openRows = ref(new Set());
+function setRowOpen(key, open) {
+	const next = new Set(openRows.value);
+	if (open) next.add(key);
+	else next.delete(key);
+	openRows.value = next;
+}
+
+/** Carry the live row's expanded state over to the committed row it just became. */
+function claimLiveRow() {
+	if (!transcriptBody.value?.querySelector(".msg.live .process[open]")) return;
+	const target = rows.value.filter((row) => row.kind === "process").at(-1);
+	if (!target) return;
+	const next = new Set(openRows.value);
+	next.add(rowKey(target));
+	openRows.value = next;
+}
+
+/** True while a row is the one producing output: the row hosting the live turn, or the last run. */
+const rowWorking = (row) => {
+	const key = rowKey(row);
+	return key === workingRowKey.value || key === liveRowKey.value;
 };
 
 const messageOfRow = (index) => {
@@ -734,9 +1011,32 @@ function onTranscriptScroll() {
 	stick.value = false;
 }
 
+/**
+ * The wheel belongs to whatever is under the pointer. Inner areas have no scrollbar (see the
+ * `.transcript *` rule in style.css), so this decides the level: an output or an open run's body
+ * takes the wheel while it can still move, and the transcript gets it at the ends and everywhere
+ * else. Returns that element, or null when the transcript is next.
+ */
+function wheelTarget(event) {
+	if (!event.deltaY) return null;
+	const start = event.target instanceof Element ? event.target : null;
+	for (let node = start; node && node !== transcript.value; node = node.parentElement) {
+		const overflow = getComputedStyle(node).overflowY;
+		if (overflow !== "auto" && overflow !== "scroll") continue;
+		const canMove =
+			event.deltaY < 0 ? node.scrollTop > 0 : node.scrollTop + node.clientHeight < node.scrollHeight - 1;
+		if (canMove) return node;
+	}
+	return null;
+}
+
 /** Wheel direction is checked too: a small nudge up must not be undone by the next chunk. */
 function onTranscriptWheel(event) {
+	// a real gesture either way: the transcript may take over as soon as the area under the pointer
+	// has nowhere left to scroll, and that hand-over must count as the reader's own scroll
 	markGesture();
+	// an inner area consumed it: the transcript did not move, so following must not detach
+	if (wheelTarget(event)) return;
 	if (event.deltaY < 0) stick.value = false;
 }
 
@@ -868,6 +1168,8 @@ function handle(payload) {
 			pendingText = "";
 			pendingThinking = "";
 			push(payload.message);
+			// the turn just became a committed row: keep it open for the reader who expanded it live
+			if (payload.message?.role === "assistant" && blocksOf(payload.message).some(isProcessBlock)) claimLiveRow();
 			// A user message is your own action - typed here, sent from the terminal, or drained from
 			// the queue - so it brings the view down even if you were reading further up. Assistant
 			// messages only follow while the view is already at the bottom.
@@ -883,8 +1185,9 @@ function handle(payload) {
 			// an aborted turn may end without message_end; drop an empty placeholder
 			if (live.value && !live.value.text && !live.value.thinking) live.value = null;
 			// The bridge reports every abort, including Escape in the terminal: a stopped turn must
-			// not be followed by the next queued task without the user asking for it.
-			if (payload.aborted) queuePaused.value = true;
+			// not be followed by the next queued task without the user asking for it. An empty queue
+			// has nothing to hold, so it stays unpaused and the strip stays away.
+			queuePaused.value = payload.aborted && queue.value.length > 0;
 			clearQueuedErrors();
 			refreshMeta();
 			void drain();
@@ -897,6 +1200,15 @@ function handle(payload) {
 			break;
 		case "subagents":
 			subagents.value = payload.running ?? [];
+			break;
+		case "tunnel":
+			state.value.tunnel = payload.tunnel;
+			if (payload.ports) state.value.ports = payload.ports;
+			break;
+		case "services":
+			state.value.services = payload.services;
+			if (payload.ports) state.value.ports = payload.ports;
+			noteServices(payload.services);
 			break;
 		case "thinking_level_changed":
 			state.value.thinkingLevel = payload.level;
@@ -960,6 +1272,8 @@ async function loadState() {
 	const loaded = await response.json();
 	state.value = loaded;
 	subagents.value = loaded.subagents ?? [];
+	// rows are keyed by message index, so an open row means nothing after a session switch
+	openRows.value = new Set();
 	messages.value = loaded.messages ?? [];
 	triggerRef(messages);
 	loadedFrom.value = loaded.loadedFrom ?? 0;
@@ -1455,6 +1769,7 @@ onMounted(async () => {
 	});
 	window.addEventListener("click", () => {
 		menu.value = null;
+		tunnelMenu.value = false;
 	});
 	window.addEventListener("dragover", onDragOver);
 	window.addEventListener("dragleave", onDragLeave);
@@ -1474,11 +1789,19 @@ onMounted(async () => {
 		if (SCROLL_KEYS.has(event.key)) markGesture();
 		if (event.key !== "Escape") return;
 		menu.value = null;
+		tunnelMenu.value = false;
 		if (narrow.value) sidebarOpen.value = false;
 		// Answer, don't just hide: an unanswered dialog would block the agent on both sides.
 		if (dialog.value) answer(undefined);
 	});
 	await loadState();
+	// the first scan lands after the first state request, so give it a moment before ports count as
+	// "new" - otherwise opening the page would announce the servers that were already there
+	noteServices(state.value.services);
+	setTimeout(() => {
+		servicesReady = true;
+	}, 3000);
+	await finishTunnelDisconnect();
 	await loadSessions();
 	connect();
 	inputEl.value?.focus();
@@ -1505,7 +1828,7 @@ onBeforeUnmount(() => {
 	<div class="app" :class="{ collapsed }">
 		<nav class="sidebar" :class="{ open: sidebarOpen }">
 			<div class="sidebar-head">
-				<span class="brand">nife</span>
+				<span class="brand">Nife</span>
 				<div class="head-actions">
 					<button type="button" class="iconbtn" title="Reload sessions" @click="loadSessions">
 						<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13 8a5 5 0 1 1-1.6-3.7M13 2v3h-3" /></svg>
@@ -1553,7 +1876,92 @@ onBeforeUnmount(() => {
 			</div>
 
 			<div class="sidebar-foot">
-				<span class="muted ellipsis">{{ state.cwd }}</span>
+				<span class="muted ellipsis foot-path">{{ state.cwd }}</span>
+				<!-- No nifetun extension, no tunnel control: the bridge reports whether it is usable -->
+				<button
+					v-if="state.tunnelAvailable"
+					type="button"
+					class="tunnel-chip"
+					:class="{ pending: tunnelPending, open: pageTunnel }"
+					:title="tunnelTitle"
+					@click.stop="tunnelMenu = !tunnelMenu"
+				>
+					<span v-if="tunnelPending" class="tunnel-wait"></span>
+					<svg v-else-if="pageTunnel && !localHost" viewBox="0 0 16 16" aria-hidden="true">
+						<path d="M4 4l8 8M12 4l-8 8" />
+					</svg>
+					<svg v-else viewBox="0 0 16 16" aria-hidden="true">
+						<path d="M6.5 9.5a2.5 2.5 0 0 0 3.6 0l2-2a2.5 2.5 0 0 0-3.5-3.5l-1 1M9.5 6.5a2.5 2.5 0 0 0-3.6 0l-2 2a2.5 2.5 0 0 0 3.5 3.5l1-1" />
+					</svg>
+					tunnel
+				</button>
+
+				<!-- The tunnel menu, the same shape as the model selector: this page first, then the ports
+				     the session serves, then a slot for a port nobody detected. The page's own port is
+				     never listed: it is what this menu belongs to. -->
+				<div v-if="tunnelMenu && state.tunnelAvailable" class="menu tunnel-menu" @click.stop>
+					<button type="button" class="menu-item tunnel-page" :disabled="tunnelPending" @click="toggleTunnel">
+						<svg viewBox="0 0 16 16" aria-hidden="true">
+							<path d="M6.5 9.5a2.5 2.5 0 0 0 3.6 0l2-2a2.5 2.5 0 0 0-3.5-3.5l-1 1M9.5 6.5a2.5 2.5 0 0 0-3.6 0l-2 2a2.5 2.5 0 0 0 3.5 3.5l1-1" />
+						</svg>
+						<span class="ellipsis">Nife Web</span>
+						<span class="tunnel-action" :class="{ waiting: tunnelPending }">{{ pageAction }}</span>
+					</button>
+
+					<div class="menu-label">Server</div>
+					<div class="menu-list">
+						<div v-for="row in serverRows" :key="`server-${row.port}`" class="menu-item tunnel-row">
+							<span class="ellipsis" :title="row.cmd ? `${row.cmd} on 127.0.0.1:${row.port}` : `127.0.0.1:${row.port}`">
+								<span class="muted">{{ row.port }}</span>
+								<template v-if="row.cmd"> · {{ row.cmd }}</template>
+							</span>
+							<template v-if="row.url">
+								<a class="tunnel-row-open" :href="row.url" target="_blank" rel="noreferrer">open</a>
+								<button
+									type="button"
+									class="tunnel-row-x"
+									:title="`Stop publishing ${row.port}`"
+									@click="unpublishService(row)"
+								>
+									×
+								</button>
+							</template>
+							<button
+								v-else
+								type="button"
+								class="tunnel-row-plus"
+								:disabled="Boolean(serviceBusy)"
+								:title="`Publish ${row.port} through nifetun`"
+								@click="publishService(row)"
+							>
+								<span v-if="serviceBusy === row.port" class="tunnel-wait"></span>
+								<template v-else>+</template>
+							</button>
+						</div>
+						<p v-if="!serverRows.length" class="muted pad">Nothing listening</p>
+					</div>
+
+					<div class="menu-footer">
+						<div class="menu-label">Custom Port</div>
+						<div v-for="row in customRows" :key="`custom-${row.port}`" class="menu-item tunnel-row">
+							<span class="ellipsis muted">{{ row.port }}</span>
+							<a class="tunnel-row-open" :href="row.url" target="_blank" rel="noreferrer">open</a>
+							<button type="button" class="tunnel-row-x" :title="`Stop publishing ${row.port}`" @click="unpublishService(row)">
+								×
+							</button>
+						</div>
+						<input
+							v-model="manualValue"
+							class="menu-search tunnel-add"
+							inputmode="numeric"
+							placeholder="port"
+							aria-label="Port to publish"
+							:disabled="manualBusy"
+							@keydown.enter.prevent="publishManual"
+							@keydown.esc.prevent="tunnelMenu = false"
+						/>
+					</div>
+				</div>
 			</div>
 		</nav>
 
@@ -1605,22 +2013,47 @@ onBeforeUnmount(() => {
 						<details
 							v-if="row.kind === 'process'"
 							class="process"
-							:class="{ failed: row.counts.failed }"
+							:class="{ failed: row.counts.failed, working: rowWorking(row) }"
+							:open="openRows.has(rowKey(row))"
 							:data-row="runStart + index"
+							@toggle="setRowOpen(rowKey(row), $event.target.open)"
 						>
 							<summary>
 								<span class="chev"></span>
-								<span class="tool-verb">Worked</span>
-								<span class="tool-arg ellipsis">{{ stepLabel(row.counts) }}</span>
+								<svg
+									v-if="rowWorking(row)"
+									class="think-icon spinning"
+									viewBox="0 0 16 16"
+									aria-hidden="true"
+								>
+									<path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M12.6 3.4l-1.4 1.4M4.8 11.2l-1.4 1.4" />
+								</svg>
+								<span class="tool-verb">{{ rowWorking(row) ? "Working" : "Worked" }}</span>
+								<span class="tool-arg ellipsis">{{
+									rowKey(row) === liveRowKey
+										? stepLabel({ tools: row.counts.tools, thoughts: row.counts.thoughts + 1 })
+										: stepLabel(row.counts)
+								}}</span>
 							</summary>
 							<div class="process-body">
 								<MessageItem v-for="(step, i) in row.steps" :key="i" :item="step" flat />
+								<LiveThinking
+									v-if="rowKey(row) === liveRowKey"
+									:live="live"
+									:open="openRows.has(rowKey(row))"
+								/>
 							</div>
 						</details>
 						<MessageItem v-else :item="row" :data-row="runStart + index" />
 					</template>
 
-					<LiveMessage v-if="live" :live="live" />
+					<!-- Only when there is something to draw: an empty live block still carries its margins,
+					     and mounting it for the tick before the first delta arrives made the page blink. -->
+					<LiveMessage
+						v-if="live && (liveHasText || (!liveHosted && live.thinking))"
+						:live="live"
+						:hosted="liveHosted"
+					/>
 
 					<div v-if="tailPad > 0" class="window-pad" :style="{ height: `${tailPad}px` }" aria-hidden="true"></div>
 				</div>
@@ -1684,7 +2117,8 @@ onBeforeUnmount(() => {
 				<p v-if="notice" class="composer-notice" :style="noticeStyle">{{ notice }}</p>
 
 				<!-- queue strip: narrower than the composer box and flush against its top edge -->
-				<div v-if="queue.length > 0 || queuePaused" class="queue" :class="{ paused: queuePaused }">
+				<!-- no items, no strip: a paused empty queue would be a popup with nothing in it -->
+				<div v-if="queue.length > 0" class="queue" :class="{ paused: queuePaused }">
 					<div class="queue-head">
 						<span class="queue-title">
 							{{ queuePaused ? "Paused" : "Queue" }} · {{ queue.length }}
