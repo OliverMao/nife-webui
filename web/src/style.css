@@ -677,6 +677,33 @@ svg {
 	margin: 0;
 }
 
+/* Waiting for the steps behind an open row: they are fetched, not carried in the first page. */
+.steps-loading {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 4px 0 2px;
+	border: 0;
+	background: none;
+	font: inherit;
+	font-size: 12px;
+	color: var(--muted);
+	text-align: left;
+}
+
+.steps-loading .think-icon {
+	color: var(--muted);
+}
+
+.steps-loading.failed {
+	cursor: pointer;
+	color: var(--warn);
+}
+
+.steps-loading.failed:hover {
+	color: var(--text);
+}
+
 img {
 	max-width: 320px;
 	border-radius: 8px;

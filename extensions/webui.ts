@@ -407,6 +407,49 @@ function messageSize(message: { content?: unknown }): number {
 }
 
 /**
+ * A "Worked" row is closed by default, so its content does not belong in the first page: a thought
+ * stays a marker, a tool call keeps its name and a truncated copy of its arguments (enough for the
+ * label under the row), a tool result keeps only its error flag. Expanding the row asks for the real
+ * messages. On a session full of tool output this is the difference between a page of small markers
+ * and a page of megabytes nobody asked to see yet.
+ */
+const STEP_ARG_MAX = 160;
+const STEP_ARG_DEPTH = 2;
+const STEP_RANGE_MAX = 400;
+
+/** Deep copy of a tool's arguments with every string cut to a label's length. */
+function slimValue(value: unknown, depth: number): unknown {
+	if (typeof value === "string") return value.length > STEP_ARG_MAX ? `${value.slice(0, STEP_ARG_MAX)}…` : value;
+	if (typeof value === "number" || typeof value === "boolean" || value === null) return value;
+	if (depth >= STEP_ARG_DEPTH) return Array.isArray(value) ? value.slice(0, 1) : {};
+	if (Array.isArray(value)) return value.map((entry) => slimValue(entry, depth + 1));
+	if (typeof value !== "object") return undefined;
+	const out: Record<string, unknown> = {};
+	for (const [key, entry] of Object.entries(value as Record<string, unknown>)) out[key] = slimValue(entry, depth + 1);
+	return out;
+}
+
+function slimMessage(message: TranscriptMessage): TranscriptMessage {
+	if (message.role === "toolResult") {
+		const empty = !message.content || (Array.isArray(message.content) && message.content.length === 0);
+		if (empty) return message;
+		return { role: message.role, toolCallId: message.toolCallId, isError: message.isError, trimmed: true };
+	}
+	if (!Array.isArray(message.content)) return message;
+	let changed = false;
+	const content = (message.content as Record<string, unknown>[]).map((block) => {
+		if (block?.type === "thinking") {
+			changed = true;
+			return { type: "thinking" };
+		}
+		if (block?.type !== "toolCall") return block;
+		changed = true;
+		return { type: "toolCall", id: block.id, name: block.name, arguments: slimValue(block.arguments ?? {}, 0) };
+	});
+	return changed ? { ...message, content, trimmed: true } : message;
+}
+
+/**
  * The page that ends at `end`. A page starts on a user message when it can, so a tool call is never
  * separated from the result the transcript pairs it with.
  */
@@ -479,6 +522,10 @@ interface TranscriptMessage {
 	role: string;
 	display?: boolean;
 	content?: unknown;
+	/** set when the payload dropped the reasoning / output the collapsed row keeps hidden */
+	trimmed?: boolean;
+	toolCallId?: string;
+	isError?: boolean;
 	summary?: string;
 	tokensBefore?: number;
 	timestamp?: string;
@@ -571,8 +618,9 @@ function snapshot(b: Bridge, metaOnly = false): unknown {
 		ports: portRows(b),
 		stats,
 		subagents: [...b.children.values()],
-		// the transcript reads `messages` and asks for older pages with `loadedFrom` as the cursor
-		messages: metaOnly ? [] : page.messages,
+		// the transcript reads `messages` and asks for older pages with `loadedFrom` as the cursor;
+		// the reasoning inside a collapsed row arrives when that row is opened
+		messages: metaOnly ? [] : page.messages.map(slimMessage),
 		messageCount: messages.length,
 		loadedFrom: page.from,
 		tasks: taskIndex(messages),
@@ -738,7 +786,27 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		if (!Number.isInteger(before) || before <= 0) return send(res, 400, "before must be a positive index");
 		const messages = contextMessages(b);
 		const page = pageOf(messages, Math.min(before, messages.length));
-		return send(res, 200, JSON.stringify({ messages: page.messages, from: page.from, total: messages.length }), "application/json");
+		return send(
+			res,
+			200,
+			JSON.stringify({ messages: page.messages.map(slimMessage), from: page.from, total: messages.length }),
+			"application/json",
+		);
+	}
+
+	// the real messages behind a collapsed row, from what the model thought to what the tool printed
+	if (req.method === "GET" && path === "/api/steps") {
+		const from = Number(url.searchParams.get("from"));
+		const to = Number(url.searchParams.get("to"));
+		if (!Number.isInteger(from) || from < 0) return send(res, 400, "from must be a message index");
+		const end = Math.min(Number.isInteger(to) ? to : from, from + STEP_RANGE_MAX - 1);
+		const messages = contextMessages(b);
+		const start = Math.min(from, messages.length);
+		let stop = Math.min(Math.max(end + 1, start), messages.length);
+		// a tool result is its own message right after the call that produced it, and the row only
+		// knows the call: keep walking while the results still belong to what was asked for
+		while (stop < messages.length && messages[stop].role === "toolResult") stop += 1;
+		return send(res, 200, JSON.stringify({ messages: messages.slice(start, stop), from: start }), "application/json");
 	}
 
 	if (req.method === "GET" && path === "/api/sessions") {

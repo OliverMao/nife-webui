@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, triggerRef, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, shallowRef, triggerRef, watch } from "vue";
 import EffortSlider from "./EffortSlider.vue";
 import LiveMessage from "./LiveMessage.vue";
 import LiveThinking from "./LiveThinking.vue";
@@ -511,6 +511,72 @@ function setRowOpen(key, open) {
 	if (open) next.add(key);
 	else next.delete(key);
 	openRows.value = next;
+}
+
+/*
+ * The reasoning inside a collapsed row is not in the first page (a session full of tool output would
+ * ship megabytes of text nobody has asked to see). Opening the row fetches just those messages and
+ * merges them back in place: the row keeps its key, its open state and its place in the scroll.
+ */
+const stepsLoaded = reactive(new Set());
+const stepsLoading = reactive(new Set());
+const stepsFailed = reactive(new Set());
+
+/** Has this row's payload been stripped? A committed row from the live stream already has it all. */
+const rowTrimmed = (row) =>
+	row.kind === "process" &&
+	row.steps.some(
+		(step) => step.message?.trimmed || Object.values(step.results ?? {}).some((result) => result?.trimmed),
+	);
+
+async function ensureSteps(row) {
+	const key = rowKey(row);
+	if (!rowTrimmed(row) || stepsLoaded.has(key) || stepsLoading.has(key)) return;
+	stepsLoading.add(key);
+	stepsFailed.delete(key);
+	const first = row.steps[0]?.index ?? 0;
+	const last = row.steps[row.steps.length - 1]?.index ?? first;
+	try {
+		const response = await fetch(api(`steps?from=${first}&to=${last}`));
+		if (!response.ok) throw new Error(`steps ${response.status}`);
+		mergeSteps(await response.json());
+		stepsLoaded.add(key);
+	} catch {
+		stepsFailed.add(key);
+	} finally {
+		stepsLoading.delete(key);
+	}
+}
+
+/** Replace the trimmed messages with the real ones, by absolute index. */
+function mergeSteps(page) {
+	const byIndex = new Map((page.messages ?? []).map((message, offset) => [page.from + offset, message]));
+	let changed = false;
+	for (let position = 0; position < messages.value.length; position += 1) {
+		const full = byIndex.get(loadedFrom.value + position);
+		if (!full) continue;
+		messages.value[position] = full;
+		changed = true;
+	}
+	if (changed) triggerRef(messages);
+}
+
+function onRowToggle(row, event) {
+	const open = Boolean(event.target?.open);
+	setRowOpen(rowKey(row), open);
+	if (open) void ensureSteps(row);
+}
+
+/** `toggle` is not delivered everywhere (headless browsers skip it), so opening is read here too. */
+function onRowClick(row, event) {
+	if (!event.target?.closest?.("summary")) return;
+	// currentTarget is gone by the time the tick runs; the element itself is not
+	const details = event.currentTarget;
+	nextTick(() => {
+		if (!details?.open) return;
+		setRowOpen(rowKey(row), true);
+		void ensureSteps(row);
+	});
 }
 
 /** Carry the live row's expanded state over to the committed row it just became. */
@@ -1272,8 +1338,12 @@ async function loadState() {
 	const loaded = await response.json();
 	state.value = loaded;
 	subagents.value = loaded.subagents ?? [];
-	// rows are keyed by message index, so an open row means nothing after a session switch
+	// rows are keyed by message index, so an open row means nothing after a session switch; the same
+	// goes for "this row already has its steps", which is keyed the same way
 	openRows.value = new Set();
+	stepsLoaded.clear();
+	stepsLoading.clear();
+	stepsFailed.clear();
 	messages.value = loaded.messages ?? [];
 	triggerRef(messages);
 	loadedFrom.value = loaded.loadedFrom ?? 0;
@@ -2016,7 +2086,8 @@ onBeforeUnmount(() => {
 							:class="{ failed: row.counts.failed, working: rowWorking(row) }"
 							:open="openRows.has(rowKey(row))"
 							:data-row="runStart + index"
-							@toggle="setRowOpen(rowKey(row), $event.target.open)"
+							@toggle="onRowToggle(row, $event)"
+							@click="onRowClick(row, $event)"
 						>
 							<summary>
 								<span class="chev"></span>
@@ -2036,12 +2107,32 @@ onBeforeUnmount(() => {
 								}}</span>
 							</summary>
 							<div class="process-body">
-								<MessageItem v-for="(step, i) in row.steps" :key="i" :item="step" flat />
-								<LiveThinking
-									v-if="rowKey(row) === liveRowKey"
-									:live="live"
-									:open="openRows.has(rowKey(row))"
-								/>
+								<!-- The row opened before its content arrived: say so instead of showing the
+								     empty markers the first page carried and letting it look broken. -->
+								<div v-if="stepsLoading.has(rowKey(row))" class="steps-loading">
+									<svg class="think-icon spinning" viewBox="0 0 16 16" aria-hidden="true">
+										<path
+											d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M12.6 3.4l-1.4 1.4M4.8 11.2l-1.4 1.4"
+										/>
+									</svg>
+									<span>loading {{ row.counts.tools + row.counts.thoughts }} steps…</span>
+								</div>
+								<button
+									v-else-if="stepsFailed.has(rowKey(row))"
+									type="button"
+									class="steps-loading failed"
+									@click="ensureSteps(row)"
+								>
+									could not load the steps · retry
+								</button>
+								<template v-else>
+									<MessageItem v-for="(step, i) in row.steps" :key="i" :item="step" flat />
+									<LiveThinking
+										v-if="rowKey(row) === liveRowKey"
+										:live="live"
+										:open="openRows.has(rowKey(row))"
+									/>
+								</template>
 							</div>
 						</details>
 						<MessageItem v-else :item="row" :data-row="runStart + index" />

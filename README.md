@@ -379,6 +379,15 @@ before the page could paint anything; now a page load costs the same whether the
 messages or 3000. `/api/state?meta=1` returns the same header fields with an empty `messages` array,
 which is what the event-driven refresh uses.
 
+A "Worked" row is closed by default, so its contents are not in that page either: a thought arrives
+as a bare marker, a tool call keeps its name and a truncated copy of its arguments (the label under
+the row), a tool result keeps only its error flag, and the message carries `trimmed: true`. Opening
+the row asks `GET /api/steps?from=<index>&to=<index>` for the real messages of that run - extended
+forward while tool results still belong to it - and merges them back by absolute index, so the row
+keeps its key, its open state and its place in the scroll. While that request is in flight the body
+says `loading N steps`; a failure says so and retries on click. On a session with a megabyte of tool
+output this is the difference between a 3 KB first page and an 800 KB one.
+
 The scrollbar is hidden and replaced by a rail on the right with one dot per user prompt, since a
 thumb over thousands of pixels was never precise. The rail is built from `state.tasks` - a message
 index plus a label per prompt, no content - so it lists tasks whose messages are not loaded yet;
