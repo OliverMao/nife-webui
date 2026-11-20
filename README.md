@@ -230,7 +230,8 @@ From the browser:
   it; the dim stats line (`msgs · tools · context x/y (z%) · in/out · cache · cost`) sits inside
   that row right behind the model selector and hides under 900px. Stats come from `/api/state`
   (`usage` from `ctx.getContextUsage()`, totals summed from message usage including `cost.total`)
-  and refresh after each turn without touching scroll
+  and are pushed again as a `stats` event after every `turn_end`, so a long tool loop moves the
+  numbers step by step instead of freezing until the agent settles; neither path touches scroll
 - context usage is the composer outline: a 2px rounded-rect stroke drawn with `pathLength="100"`,
   so `stroke-dasharray="<pct> 100"` fills exactly that share of the perimeter (a conic sweep would
   drift with the box aspect ratio). It starts at the top-left corner and runs clockwise.

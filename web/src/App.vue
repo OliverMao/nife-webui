@@ -1264,6 +1264,11 @@ function handle(payload) {
 		case "state_changed":
 			loadState();
 			break;
+		case "stats":
+			// pushed after every committed step, so a long tool loop keeps the footer honest
+			state.value.stats = payload.stats;
+			state.value.usage = payload.usage ?? null;
+			break;
 		case "subagents":
 			subagents.value = payload.running ?? [];
 			break;

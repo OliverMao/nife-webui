@@ -560,11 +560,8 @@ function contextMessages(b: Bridge): TranscriptMessage[] {
 	return out;
 }
 
-function snapshot(b: Bridge, metaOnly = false): unknown {
-	const ctx = b.ctx;
-	const messages = contextMessages(b);
-	const page = pageOf(messages, messages.length);
-	const model = ctx.model;
+/** The footer numbers: counts and token totals over the whole branch. */
+function statsOf(messages: TranscriptMessage[]) {
 	const stats = {
 		messages: messages.length,
 		toolCalls: 0,
@@ -592,6 +589,27 @@ function snapshot(b: Bridge, metaOnly = false): unknown {
 			stats.cost += usage.cost?.total ?? 0;
 		}
 	}
+	return stats;
+}
+
+/**
+ * Refresh just the footer while a turn runs. A tool loop can take minutes and several steps, and the
+ * whole snapshot is neither needed nor wanted then - but the counts must not freeze until it settles.
+ */
+function broadcastStats(b: Bridge): void {
+	broadcast(b, {
+		type: "stats",
+		stats: statsOf(contextMessages(b)),
+		usage: b.ctx.getContextUsage() ?? null,
+	});
+}
+
+function snapshot(b: Bridge, metaOnly = false): unknown {
+	const ctx = b.ctx;
+	const messages = contextMessages(b);
+	const page = pageOf(messages, messages.length);
+	const model = ctx.model;
+	const stats = statsOf(messages);
 	return {
 		sessionId: ctx.sessionManager.getSessionId(),
 		sessionFile: ctx.sessionManager.getSessionFile(),
@@ -1818,6 +1836,11 @@ export default function webui(api: ExtensionAPI) {
 		// `aborted` matters to the page: an interrupted turn is a deliberate stop, and the UI queue
 		// must hold the next task instead of starting it.
 		forward({ type: "agent_settled", aborted: Boolean(event?.aborted) });
+	});
+	api.on("turn_end", () => {
+		// One step (assistant message + its tool results) is committed: the footer can move now.
+		const b = store.__nifeWebui;
+		if (b) broadcastStats(b);
 	});
 	// Threshold and overflow compaction happen without a click; the page needs to know either way.
 	api.on("session_before_compact", (event) => {
