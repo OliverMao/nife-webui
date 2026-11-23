@@ -75,6 +75,10 @@ const UPLOAD_STALE_MS = 12 * 60 * 60 * 1000;
 
 /** Recents renders a title, not a transcript: a pasted log must not ride along in the payload. */
 const SESSION_TITLE_MAX = 100;
+/** Full-text search: enough context to recognise the hit, bounded so a broad query stays cheap. */
+const SEARCH_QUERY_MAX = 200;
+const SEARCH_RESULT_MAX = 40;
+const SEARCH_MATCH_MAX = 6;
 
 /** Directories to remove on exit, kept module-wide so a reloaded extension still cleans up. */
 const trackedUploadDirs = new Set<string>();
@@ -175,6 +179,11 @@ interface Bridge {
 	autoOpened: boolean;
 	/** Resolver for the session switch currently in flight, settled by the webui-session command. */
 	switchRequest: ((outcome: SwitchOutcome) => void) | undefined;
+	/**
+	 * Session file the page already knows exists. A new conversation gets its file only when the
+	 * first prompt is persisted, so the sidebar needs one `sessions_changed` at that moment.
+	 */
+	persistedFile: string | undefined;
 	/** Uploaded drop target for this bridge; created on first drop, removed when the process exits. */
 	uploadDir: string | undefined;
 	/** no_proxy values saved when the page switched the proxy off, so it can be restored. */
@@ -361,6 +370,7 @@ function announceMessageEntry(b: Bridge, message: unknown): void {
 	const role = (message as { role?: string } | undefined)?.role;
 	// only prompts can be edited, so nothing else is worth an id on the wire
 	if (role !== "user") return;
+	announceSessionFile(b);
 	const attempt = (left: number) => {
 		if (store.__nifeWebui !== b) return;
 		const entryId = entryIdOfMessage(b, message);
@@ -371,6 +381,20 @@ function announceMessageEntry(b: Bridge, message: unknown): void {
 		if (left > 0) setTimeout(() => attempt(left - 1), 60);
 	};
 	setTimeout(() => attempt(4), 0);
+}
+
+/** A new session file is created with its first prompt, a microtask after `message_end`. Tell the
+ * page to reload the sidebar once it is actually on disk; every later prompt reuses the same file. */
+function announceSessionFile(b: Bridge, left = 5): void {
+	if (store.__nifeWebui !== b) return;
+	const file = b.ctx.sessionManager.getSessionFile();
+	if (file && file !== b.persistedFile && existsSync(file)) {
+		b.persistedFile = file;
+		broadcast(b, { type: "sessions_changed" });
+		return;
+	}
+	// Persistence happens after the extension handler returns; retry briefly instead of guessing.
+	if (left > 0) setTimeout(() => announceSessionFile(b, left - 1), 80);
 }
 
 /** System prompts and hidden extension messages are not conversation content. */
@@ -735,6 +759,37 @@ async function listSessions(b: Bridge): Promise<unknown> {
 	};
 }
 
+/** The text a conversation search can match: prose, not thinking blocks, tool arguments or images. */
+function searchableText(message: unknown): string {
+	const content = (message as { content?: unknown } | undefined)?.content;
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	const parts: string[] = [];
+	for (const block of content as Record<string, unknown>[]) {
+		if (block?.type === "text" && typeof block.text === "string") parts.push(block.text);
+	}
+	return parts.join("\n");
+}
+
+/** One snippet per matching message, with a little context around the first hit. */
+function searchMatches(rows: { entryId: string; message: unknown }[], query: string) {
+	const matches: { entryId: string; role: string; text: string }[] = [];
+	for (const row of rows) {
+		const role = (row.message as { role?: string } | undefined)?.role;
+		if (role !== "user" && role !== "assistant") continue;
+		const text = searchableText(row.message);
+		if (!text) continue;
+		const at = text.toLowerCase().indexOf(query);
+		if (at < 0) continue;
+		const start = Math.max(0, at - 60);
+		const end = Math.min(text.length, at + query.length + 120);
+		const snippet = `${start > 0 ? "…" : ""}${text.slice(start, end).replace(/\s+/g, " ").trim()}${end < text.length ? "…" : ""}`;
+		matches.push({ entryId: row.entryId, role, text: snippet });
+		if (matches.length >= SEARCH_MATCH_MAX) break;
+	}
+	return matches;
+}
+
 /**
  * Deleting a session mirrors the TUI selector: prefer the `trash` CLI so the file is recoverable,
  * fall back to unlink. Only paths that SessionManager lists for this cwd are ever passed here.
@@ -908,6 +963,43 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		return send(res, 200, JSON.stringify(await listSessions(b)), "application/json");
 	}
 
+	// Full-text search across this project's conversations. `SessionManager.list` already read every
+	// file for the sidebar, so its allMessagesText filters the cheap way; only sessions that can hit
+	// are opened again for snippets and entry ids.
+	if (req.method === "GET" && path === "/api/search") {
+		const raw = (url.searchParams.get("q") ?? "").trim();
+		if (!raw) return send(res, 200, JSON.stringify({ results: [] }), "application/json");
+		if (raw.length > SEARCH_QUERY_MAX) return send(res, 400, "query too long");
+		const query = raw.toLowerCase();
+		const sessions = await SessionManager.list(b.ctx.cwd);
+		const results: unknown[] = [];
+		for (const session of sessions) {
+			if (!session.allMessagesText.toLowerCase().includes(query)) continue;
+			let manager: SessionManager;
+			try {
+				manager = SessionManager.open(session.path);
+			} catch {
+				continue;
+			}
+			const rows: { entryId: string; message: unknown }[] = [];
+			for (const entry of manager.getBranch()) {
+				for (const message of sessionEntryToContextMessages(entry)) rows.push({ entryId: entry.id, message });
+			}
+			const matches = searchMatches(rows, query);
+			if (matches.length === 0) continue;
+			results.push({
+				path: session.path,
+				id: session.id,
+				name: session.name,
+				modified: session.modified,
+				firstMessage: session.firstMessage.replace(/\s+/g, " ").trim().slice(0, SESSION_TITLE_MAX),
+				matches,
+			});
+			if (results.length >= SEARCH_RESULT_MAX) break;
+		}
+		return send(res, 200, JSON.stringify({ results }), "application/json");
+	}
+
 	if (req.method === "GET" && path === "/api/events") {
 		res.writeHead(200, {
 			"content-type": "text/event-stream",
@@ -1073,16 +1165,56 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 
 	if (req.method === "POST" && path === "/api/delete") {
 		const body = await readJson(req);
+		// One row from the menu posts `path`; multi-select posts the whole `paths` list so the batch
+		// is validated (and the active session is left) before any file is removed.
+		const requested = Array.isArray(body.paths) ? body.paths : [body.path];
+		const targets = [...new Set(requested.filter((entry): entry is string => typeof entry === "string" && entry.length > 0))];
+		if (targets.length === 0) return send(res, 400, "missing path");
+		// Never delete arbitrary paths: every target has to be a session this project lists.
+		const known = new Set((await SessionManager.list(b.ctx.cwd)).map((session) => session.path));
+		if (targets.some((target) => !known.has(target))) return send(res, 404, "unknown session");
+		const active = b.ctx.sessionManager.getSessionFile();
+		if (active && targets.includes(active)) {
+			// The active session can go too, but not while it is being written to. Move the runtime to
+			// a fresh session first, then remove the file the old session pointed at.
+			if (!b.ctx.isIdle()) return send(res, 409, "stop the current turn first");
+			const outcome = await requestSwitch(b, "new");
+			if (!outcome.ok) return send(res, 409, outcome.message ?? "switch failed");
+			broadcast(b, { type: "session_switch" });
+		}
+		const methods: string[] = [];
+		for (const target of targets) {
+			const result = await deleteSessionFile(target);
+			if (!result.ok) {
+				// Earlier targets in a batch are already gone; let every tab refresh instead of
+				// leaving rows that no longer exist on disk.
+				broadcast(b, { type: "sessions_changed" });
+				return send(res, 500, result.error ?? "delete failed");
+			}
+			methods.push(result.method);
+		}
+		broadcast(b, { type: "sessions_changed" });
+		return send(res, 200, JSON.stringify({ methods }));
+	}
+
+	if (req.method === "POST" && path === "/api/rename") {
+		const body = await readJson(req);
 		const target = typeof body.path === "string" ? body.path : "";
+		const name = typeof body.name === "string" ? body.name.replace(/[\r\n]+/g, " ").trim() : "";
 		if (!target) return send(res, 400, "missing path");
-		if (target === b.ctx.sessionManager.getSessionFile()) return send(res, 409, "cannot delete the active session");
-		// Never delete arbitrary paths: the target has to be a session this project lists.
+		if (name.length > 200) return send(res, 400, "name too long");
+		// Same rule as delete: only a session this project lists can be renamed.
 		const known = (await SessionManager.list(b.ctx.cwd)).some((session) => session.path === target);
 		if (!known) return send(res, 404, "unknown session");
-		const result = await deleteSessionFile(target);
-		if (!result.ok) return send(res, 500, result.error ?? "delete failed");
+		if (target === b.ctx.sessionManager.getSessionFile()) {
+			// Goes through the live session so its own event updates every attached page.
+			b.api.setSessionName(name);
+		} else {
+			// Not running: append the same session_info entry the live path writes.
+			SessionManager.open(target).appendSessionInfo(name);
+		}
 		broadcast(b, { type: "sessions_changed" });
-		return send(res, 200, result.method);
+		return send(res, 200, "ok");
 	}
 
 	if (req.method === "POST" && path === "/api/new") {
@@ -1776,6 +1908,7 @@ async function start(api: ExtensionAPI, ctx: ExtensionContext): Promise<Bridge> 
 	await sweepUploads();
 	const token = randomBytes(16).toString("hex");
 	const server = createServer();
+	const sessionFile = ctx.sessionManager.getSessionFile();
 	const b: Bridge = {
 		api,
 		ctx,
@@ -1789,6 +1922,7 @@ async function start(api: ExtensionAPI, ctx: ExtensionContext): Promise<Bridge> 
 		children: new Map(),
 		autoOpened: false,
 		switchRequest: undefined,
+		persistedFile: sessionFile && existsSync(sessionFile) ? sessionFile : undefined,
 		uploadDir: undefined,
 		proxyBypassSaved: undefined,
 		publicUrls: new Map(),
@@ -1943,6 +2077,9 @@ export default function webui(api: ExtensionAPI) {
 		// New session: same bridge, same port and token, rebound to the live context.
 		b.api = api;
 		b.ctx = ctx;
+		// A fresh session has a file path before its first prompt, but no file on disk yet.
+		const file = ctx.sessionManager.getSessionFile();
+		b.persistedFile = file && existsSync(file) ? file : undefined;
 		patchDialogs(ctx, b);
 		// /reload keeps the bridge (globalThis) but not this module's fields, and it drops the timer
 		// that watched the tunnel: fill both back in instead of leaving a dead public URL behind.

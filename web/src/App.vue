@@ -45,6 +45,15 @@ const inputEl = ref(null);
 const composerBox = ref(null);
 const sidebarOpen = ref(false);
 const collapsed = ref(localStorage.getItem("nife-webui.collapsed") === "1");
+// Conversation search: a centred palette over the page, backed by the bridge's full-text scan.
+const searchOpen = ref(false);
+const searchQuery = ref("");
+const searchInput = ref(null);
+const searchResults = ref([]);
+const searchBusy = ref(false);
+const searchError = ref("");
+let searchTimer = 0;
+let searchAbort;
 const narrow = ref(false);
 const sessions = ref([]);
 const currentFile = ref("");
@@ -243,8 +252,20 @@ async function finishTunnelDisconnect() {
 	await postDetailed("tunnel", { action: "down" });
 	await loadState();
 }
-// Session awaiting delete confirmation in the sidebar.
-const pendingDelete = ref("");
+// Session row with its three-dot menu open: { session, top, left }.
+const sessionMenu = ref(null);
+// Sessions waiting for delete confirmation in the centred modal.
+const deleteQueue = ref([]);
+const deleting = ref(false);
+// Inline rename: path of the row being edited, its draft, and the input to focus.
+const renaming = ref("");
+const renameText = ref("");
+const renameEl = ref(null);
+// Pinned sessions live in localStorage, keyed by the project directory.
+const pinnedPaths = ref([]);
+// Multi-select: rows become checkboxes and the sidebar footer turns into its action bar.
+const selecting = ref(false);
+const selectedPaths = ref([]);
 // Manual context compaction in flight (the bridge also reports automatic ones).
 const compacting = ref(false);
 // UI task queue: sent one at a time, only after the previous turn settled. Paused on session
@@ -921,6 +942,8 @@ const isCurrentModel = (model) =>
 
 const sessionTitle = (session) => {
 	if (!session) return "";
+	const name = (session.name ?? "").trim();
+	if (name) return name;
 	const first = (session.firstMessage ?? "").trim().replace(/\s+/g, " ");
 	return first.length > 60 ? `${first.slice(0, 60)}…` : first || session.id.slice(0, 8);
 };
@@ -1446,24 +1469,209 @@ async function loadSessions() {
 	const data = await response.json();
 	sessions.value = data.sessions ?? [];
 	currentFile.value = data.current ?? "";
-	pendingDelete.value = "";
+	sessionMenu.value = null;
+	// Drop selection/pin entries whose file is gone, so the bar and sort never count ghosts.
+	const paths = new Set(sessions.value.map((session) => session.path));
+	if (selectedPaths.value.some((path) => !paths.has(path))) {
+		selectedPaths.value = selectedPaths.value.filter((path) => paths.has(path));
+	}
+	const pins = pinnedPaths.value.filter((path) => paths.has(path));
+	if (pins.length !== pinnedPaths.value.length) {
+		pinnedPaths.value = pins;
+		savePinned();
+	}
+	if (renaming.value && !paths.has(renaming.value)) cancelRename();
 }
 
-/** Two-step delete: the row turns into a confirm pair, the file never leaves without a second click. */
-async function deleteSession(session) {
-	pendingDelete.value = "";
-	const response = await fetch(api("delete"), {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify({ path: session.path }),
-	});
-	if (!response.ok) {
-		showNotice((await response.text()).slice(0, 200) || "could not delete the session");
+/** Pinned rows first; the backend order is kept inside each group. */
+const orderedSessions = computed(() => {
+	const pinned = new Set(pinnedPaths.value);
+	if (pinned.size === 0) return sessions.value;
+	const first = [];
+	const rest = [];
+	for (const session of sessions.value) (pinned.has(session.path) ? first : rest).push(session);
+	return [...first, ...rest];
+});
+
+const selectedSessions = computed(() =>
+	orderedSessions.value.filter((session) => selectedPaths.value.includes(session.path)),
+);
+const selectedCount = computed(() => selectedPaths.value.length);
+const allSelectedPinned = computed(
+	() => selectedSessions.value.length > 0 && selectedSessions.value.every((session) => isPinned(session.path)),
+);
+
+const pinKey = () => `nife-webui.pinned:${state.value.cwd || ""}`;
+
+function loadPinned() {
+	try {
+		const parsed = JSON.parse(localStorage.getItem(pinKey()) ?? "[]");
+		pinnedPaths.value = Array.isArray(parsed) ? parsed.filter((path) => typeof path === "string") : [];
+	} catch {
+		pinnedPaths.value = [];
+	}
+}
+
+function savePinned() {
+	try {
+		localStorage.setItem(pinKey(), JSON.stringify(pinnedPaths.value));
+	} catch {
+		// storage can be disabled; pinning simply does not survive a reload then
+	}
+}
+
+watch(() => state.value.cwd, loadPinned, { immediate: true });
+
+const isPinned = (path) => pinnedPaths.value.includes(path);
+
+function setPinned(list, pinned) {
+	const next = new Set(pinnedPaths.value);
+	for (const session of list) {
+		if (pinned) next.add(session.path);
+		else next.delete(session.path);
+	}
+	pinnedPaths.value = [...next];
+	savePinned();
+}
+
+/** Place the row menu next to its button, right-aligned enough to stay on screen. */
+function toggleSessionMenu(event, session) {
+	if (sessionMenu.value?.session.path === session.path) {
+		sessionMenu.value = null;
 		return;
 	}
-	const method = (await response.text()).trim();
-	sessions.value = sessions.value.filter((entry) => entry.path !== session.path);
-	showNotice(method === "trash" ? "session moved to trash" : "session deleted");
+	const rect = event.currentTarget.getBoundingClientRect();
+	const width = 176;
+	sessionMenu.value = {
+		session,
+		top: Math.max(8, Math.min(rect.bottom + 4, window.innerHeight - 186)),
+		left: Math.max(8, Math.min(rect.left - 4, window.innerWidth - width - 8)),
+	};
+}
+
+function togglePin(session) {
+	sessionMenu.value = null;
+	const next = !isPinned(session.path);
+	setPinned([session], next);
+	showNotice(next ? "session pinned" : "session unpinned");
+}
+
+function pinSelected() {
+	const targets = selectedSessions.value;
+	if (!targets.length) return;
+	const next = !allSelectedPinned.value;
+	setPinned(targets, next);
+	showNotice(next ? `${targets.length} sessions pinned` : `${targets.length} sessions unpinned`);
+	exitSelect();
+}
+
+function enterSelect(session) {
+	sessionMenu.value = null;
+	tunnelMenu.value = false;
+	closeSearch();
+	selecting.value = true;
+	if (session && !selectedPaths.value.includes(session.path)) {
+		selectedPaths.value = [...selectedPaths.value, session.path];
+	}
+}
+
+function toggleSelected(session) {
+	selectedPaths.value = selectedPaths.value.includes(session.path)
+		? selectedPaths.value.filter((path) => path !== session.path)
+		: [...selectedPaths.value, session.path];
+}
+
+function exitSelect() {
+	selecting.value = false;
+	selectedPaths.value = [];
+}
+
+/** Rename in place, like the sidebar editor: Enter commits, Escape or a click elsewhere abandons. */
+async function startRename(session) {
+	sessionMenu.value = null;
+	renaming.value = session.path;
+	renameText.value = sessionTitle(session);
+	await nextTick();
+	const input = Array.isArray(renameEl.value) ? renameEl.value[0] : renameEl.value;
+	input?.focus();
+	input?.select();
+}
+
+function cancelRename() {
+	renaming.value = "";
+	renameText.value = "";
+}
+
+async function commitRename(session) {
+	if (renaming.value !== session.path) return;
+	const name = renameText.value.trim();
+	const current = (session.name ?? "").trim();
+	renaming.value = "";
+	if (name === current) return;
+	const result = await postDetailed("rename", { path: session.path, name });
+	if (!result.ok) {
+		showNotice(result.message || "could not rename the session");
+		return;
+	}
+	await loadSessions();
+	if (session.path === currentFile.value) await refreshMeta();
+}
+
+/** The menu only asks; the modal is where the file actually goes. */
+function askDeleteSession(session) {
+	sessionMenu.value = null;
+	deleteQueue.value = [session];
+}
+
+function askDeleteSelected() {
+	if (!selectedSessions.value.length) return;
+	deleteQueue.value = [...selectedSessions.value];
+}
+
+function cancelDelete() {
+	if (deleting.value) return;
+	deleteQueue.value = [];
+}
+
+/**
+ * Delete one session or a selection. The bridge moves the runtime to a fresh session first when the
+ * active one is included, so the page just reloads and lands on the New chat screen.
+ */
+async function confirmDeleteSessions() {
+	const targets = deleteQueue.value;
+	if (!targets.length || deleting.value) return;
+	const wasCurrent = targets.some((session) => session.path === currentFile.value);
+	deleting.value = true;
+	try {
+		const response = await fetch(api("delete"), {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ paths: targets.map((session) => session.path) }),
+		});
+		if (!response.ok) {
+			showNotice((await response.text()).slice(0, 200) || "could not delete the session");
+			return;
+		}
+		const payload = await response.json().catch(() => ({}));
+		const methods = Array.isArray(payload.methods) ? payload.methods : [];
+		const gone = new Set(targets.map((session) => session.path));
+		sessions.value = sessions.value.filter((entry) => !gone.has(entry.path));
+		if (wasCurrent) await loadState();
+		await loadSessions();
+		exitSelect();
+		showNotice(
+			targets.length > 1
+				? `${targets.length} sessions deleted`
+				: methods[0] === "trash"
+					? "session moved to trash"
+					: "session deleted",
+		);
+	} catch {
+		showNotice("could not delete the session");
+	} finally {
+		deleting.value = false;
+		deleteQueue.value = [];
+	}
 }
 
 async function postDetailed(path, body) {
@@ -1968,6 +2176,126 @@ function toggleSidebar() {
 	}
 	collapsed.value = !collapsed.value;
 	localStorage.setItem("nife-webui.collapsed", collapsed.value ? "1" : "0");
+	if (collapsed.value) {
+		closeSearch();
+		exitSelect();
+	}
+}
+
+/** Search is an overlay: it works from the expanded header and the compact pill alike. */
+async function openSearch() {
+	if (selecting.value) exitSelect();
+	searchOpen.value = true;
+	searchQuery.value = "";
+	searchResults.value = [];
+	searchError.value = "";
+	await nextTick();
+	searchInput.value?.focus();
+}
+
+function closeSearch() {
+	// Keep the query and results while the fade-out runs; the next open resets them.
+	searchOpen.value = false;
+	searchBusy.value = false;
+	clearTimeout(searchTimer);
+	searchAbort?.abort();
+	searchAbort = undefined;
+}
+
+function toggleSearch() {
+	if (searchOpen.value) closeSearch();
+	else void openSearch();
+}
+
+/** Wait out the keystroke, then ask the bridge; stale responses are aborted, not rendered. */
+function scheduleSearch() {
+	clearTimeout(searchTimer);
+	searchAbort?.abort();
+	searchAbort = undefined;
+	searchError.value = "";
+	const query = searchQuery.value.trim();
+	if (!query) {
+		searchResults.value = [];
+		searchBusy.value = false;
+		return;
+	}
+	searchBusy.value = true;
+	searchTimer = setTimeout(() => void runSearch(query), 180);
+}
+
+watch(searchQuery, scheduleSearch);
+
+async function runSearch(query) {
+	const controller = new AbortController();
+	searchAbort = controller;
+	try {
+		const response = await fetch(api(`search?q=${encodeURIComponent(query)}`), { signal: controller.signal });
+		if (!response.ok) throw new Error((await response.text()).slice(0, 200) || `search ${response.status}`);
+		const payload = await response.json();
+		if (searchQuery.value.trim() !== query) return;
+		searchResults.value = payload.results ?? [];
+	} catch (error) {
+		if (error?.name === "AbortError") return;
+		searchError.value = error instanceof Error ? error.message : "search failed";
+	} finally {
+		if (searchAbort === controller) {
+			searchBusy.value = false;
+			searchAbort = undefined;
+		}
+	}
+}
+
+/** Split a snippet into plain/highlighted runs without v-html. */
+function highlightParts(text) {
+	const query = searchQuery.value.trim();
+	if (!query) return [{ text, hit: false }];
+	const parts = [];
+	const lower = text.toLowerCase();
+	const needle = query.toLowerCase();
+	let from = 0;
+	for (;;) {
+		const at = lower.indexOf(needle, from);
+		if (at < 0) break;
+		if (at > from) parts.push({ text: text.slice(from, at), hit: false });
+		parts.push({ text: text.slice(at, at + needle.length), hit: true });
+		from = at + needle.length;
+	}
+	if (from < text.length) parts.push({ text: text.slice(from), hit: false });
+	return parts;
+}
+
+/** Open the session behind a hit and park the transcript on the matching message. */
+async function openSearchResult(group, match) {
+	const entryId = match?.entryId ?? group.matches?.[0]?.entryId ?? "";
+	const path = group.path;
+	closeSearch();
+	if (path !== currentFile.value) {
+		const result = await postDetailed("resume", { path });
+		if (!result.ok) {
+			showNotice(result.message || "could not switch session");
+			return;
+		}
+		await loadState();
+		await loadSessions();
+	}
+	if (entryId) await revealEntry(entryId);
+}
+
+async function revealEntry(entryId) {
+	const find = () => messages.value.findIndex((message) => message.entryId === entryId);
+	let index = find();
+	for (let guard = 0; index < 0 && loadedFrom.value > 0 && guard < 40; guard += 1) {
+		if ((await loadOlder()) === 0) break;
+		index = find();
+	}
+	if (index < 0) return;
+	const row = rowByMessage.value.get(loadedFrom.value + index);
+	if (row !== undefined) await jumpToRow(row);
+}
+
+function openFirstSearchResult() {
+	const group = searchResults.value[0];
+	if (group) void openSearchResult(group, group.matches?.[0]);
 }
 
 function toggleMenu(name) {
@@ -2006,6 +2334,7 @@ async function toggleProxy() {
 
 async function switchTo(path) {
 	sidebarOpen.value = false;
+	sessionMenu.value = null;
 	const result = await postDetailed("resume", { path });
 	if (!result.ok) {
 		showNotice(result.message || "could not switch session");
@@ -2017,6 +2346,9 @@ async function switchTo(path) {
 
 async function newSession() {
 	sidebarOpen.value = false;
+	sessionMenu.value = null;
+	closeSearch();
+	exitSelect();
 	const result = await postDetailed("new");
 	if (!result.ok) {
 		showNotice(result.message || "could not start a new session");
@@ -2076,6 +2408,7 @@ onMounted(async () => {
 	window.addEventListener("click", () => {
 		menu.value = null;
 		tunnelMenu.value = false;
+		sessionMenu.value = null;
 	});
 	window.addEventListener("dragover", onDragOver);
 	window.addEventListener("dragleave", onDragLeave);
@@ -2096,6 +2429,23 @@ onMounted(async () => {
 		if (event.key !== "Escape") return;
 		menu.value = null;
 		tunnelMenu.value = false;
+		sessionMenu.value = null;
+		if (deleteQueue.value.length) {
+			cancelDelete();
+			return;
+		}
+		if (renaming.value) {
+			cancelRename();
+			return;
+		}
+		if (selecting.value) {
+			exitSelect();
+			return;
+		}
+		if (searchOpen.value) {
+			closeSearch();
+			return;
+		}
 		cancelEdit();
 		if (narrow.value) sidebarOpen.value = false;
 		// Answer, don't just hide: an unanswered dialog would block the agent on both sides.
@@ -2134,55 +2484,119 @@ onBeforeUnmount(() => {
 <template>
 	<div class="app" :class="{ collapsed }">
 		<nav class="sidebar" :class="{ open: sidebarOpen }">
-			<div class="sidebar-head">
+			<div v-if="selecting" class="sidebar-head select-head">
+				<span class="select-title">已选择 {{ selectedCount }} 个对话</span>
+				<button type="button" class="iconbtn" title="退出多选" @click="exitSelect">
+					<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" /></svg>
+				</button>
+			</div>
+			<div v-else class="sidebar-head">
 				<span class="brand">Nife</span>
 				<div class="head-actions">
-					<button type="button" class="iconbtn" title="Reload sessions" @click="loadSessions">
-						<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13 8a5 5 0 1 1-1.6-3.7M13 2v3h-3" /></svg>
-					</button>
-					<button type="button" class="iconbtn" title="New session" @click="newSession">
-						<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
-					</button>
-				</div>
-			</div>
-
-			<button type="button" class="new-chat" @click="newSession">
-				<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
-				New chat
-			</button>
-
-			<div class="section-label">Recents</div>
-			<div class="session-list">
-				<p v-if="sessions.length === 0" class="muted pad">No sessions in this directory.</p>
-				<div
-					v-for="session in sessions"
-					:key="session.path"
-					:class="['session', session.path === currentFile ? 'current' : '']"
-				>
-					<button type="button" class="session-main" @click="switchTo(session.path)">
-						<span class="session-name">{{ sessionTitle(session) }}</span>
-						<span class="session-when">{{ when(session.modified) }}</span>
-					</button>
-					<template v-if="pendingDelete === session.path">
-						<button type="button" class="session-confirm" @click="deleteSession(session)">Delete</button>
-						<button type="button" class="session-cancel" @click="pendingDelete = ''">Cancel</button>
-					</template>
 					<button
-						v-else
 						type="button"
-						class="session-delete"
-						:disabled="session.path === currentFile"
-						:title="session.path === currentFile ? 'Cannot delete the session you are in' : 'Delete session'"
-						@click.stop="pendingDelete = session.path"
+						class="iconbtn"
+						:class="{ active: searchOpen }"
+						:title="searchOpen ? 'Close search' : 'Search conversations'"
+						@click.stop="toggleSearch"
 					>
 						<svg viewBox="0 0 16 16" aria-hidden="true">
-							<path d="M3 4.5h10M6.5 4.5V2.5h3v2M4.8 4.5l.6 9h5.2l.6-9" />
+							<circle cx="7" cy="7" r="4.2" />
+							<path d="M10.2 10.2L14 14" />
+						</svg>
+					</button>
+					<button type="button" class="iconbtn" title="Collapse sidebar" @click.stop="toggleSidebar">
+						<svg viewBox="0 0 16 16" aria-hidden="true">
+							<rect x="2.5" y="3" width="11" height="10" rx="2" />
+							<path d="M6.5 3.5v9" />
 						</svg>
 					</button>
 				</div>
 			</div>
 
-			<div class="sidebar-foot">
+			<button v-if="!selecting" type="button" class="new-chat" @click="newSession">
+				<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
+				New chat
+			</button>
+
+			<div v-if="!selecting" class="section-label">Recents</div>
+			<div class="session-list" :class="{ picking: selecting }">
+				<p v-if="sessions.length === 0" class="muted pad">No sessions in this directory.</p>
+				<div
+					v-for="session in orderedSessions"
+					:key="session.path"
+					:class="[
+						'session',
+						session.path === currentFile ? 'current' : '',
+						selectedPaths.includes(session.path) ? 'selected' : '',
+					]"
+				>
+					<button v-if="selecting" type="button" class="session-pick" @click="toggleSelected(session)">
+						<span class="pick-box" :class="{ checked: selectedPaths.includes(session.path) }">
+							<svg v-if="selectedPaths.includes(session.path)" viewBox="0 0 16 16" aria-hidden="true">
+								<path d="M3.5 8.5l3 3 6-7" />
+							</svg>
+						</span>
+						<span class="session-name">{{ sessionTitle(session) }}</span>
+					</button>
+					<input
+						v-else-if="renaming === session.path"
+						ref="renameEl"
+						v-model="renameText"
+						class="session-rename"
+						aria-label="Session name"
+						@click.stop
+						@keydown.enter.prevent="commitRename(session)"
+						@keydown.esc.prevent="cancelRename"
+						@blur="commitRename(session)"
+					/>
+					<template v-else>
+						<button type="button" class="session-main" @click="switchTo(session.path)">
+							<span class="session-name">{{ sessionTitle(session) }}</span>
+							<span v-if="isPinned(session.path)" class="session-pin" title="Pinned">
+								<svg viewBox="0 0 16 16" aria-hidden="true">
+									<path d="M9.6 2.4l4 4-1.7.5-2.3 2.3.5 2.2-1 1L4.4 7.7l1-1 2.2.5L9.9 4.9z" />
+									<path d="M6.3 9.7L3 13" />
+								</svg>
+							</span>
+							<span class="session-when">{{ when(session.modified) }}</span>
+						</button>
+						<button
+							type="button"
+							class="session-more"
+							:class="{ open: sessionMenu?.session.path === session.path }"
+							title="Session actions"
+							aria-label="Session actions"
+							@click.stop="toggleSessionMenu($event, session)"
+						>
+							<svg viewBox="0 0 16 16" aria-hidden="true">
+								<circle cx="3.5" cy="8" r="1.2" />
+								<circle cx="8" cy="8" r="1.2" />
+								<circle cx="12.5" cy="8" r="1.2" />
+							</svg>
+						</button>
+					</template>
+				</div>
+			</div>
+
+			<div v-if="selecting" class="select-bar">
+				<button type="button" class="select-action" :disabled="!selectedCount" @click="pinSelected">
+					<svg viewBox="0 0 16 16" aria-hidden="true">
+						<path d="M9.6 2.4l4 4-1.7.5-2.3 2.3.5 2.2-1 1L4.4 7.7l1-1 2.2.5L9.9 4.9z" />
+						<path d="M6.3 9.7L3 13" />
+					</svg>
+					<span>{{ allSelectedPinned ? "取消置顶" : "置顶" }}</span>
+				</button>
+				<span class="select-sep"></span>
+				<button type="button" class="select-action danger" :disabled="!selectedCount" @click="askDeleteSelected">
+					<svg viewBox="0 0 16 16" aria-hidden="true">
+						<path d="M3 4.5h10M6.5 4.5V2.5h3v2M4.8 4.5l.6 9h5.2l.6-9" />
+					</svg>
+					<span>删除</span>
+				</button>
+			</div>
+
+			<div v-else class="sidebar-foot">
 				<span class="muted ellipsis foot-path">{{ state.cwd }}</span>
 				<!-- No nifetun extension, no tunnel control: the bridge reports whether it is usable -->
 				<button
@@ -2272,14 +2686,127 @@ onBeforeUnmount(() => {
 			</div>
 		</nav>
 
+		<!-- Session actions: fixed, so the list's scroll box cannot clip the menu. -->
+		<Teleport to="body">
+			<div
+				v-if="sessionMenu"
+				class="session-menu"
+				:style="{ top: `${sessionMenu.top}px`, left: `${sessionMenu.left}px` }"
+				@click.stop
+			>
+				<button type="button" class="session-menu-item" @click="startRename(sessionMenu.session)">
+					<svg viewBox="0 0 16 16" aria-hidden="true">
+						<path d="M3 13l.6-3L11 2.6a1.5 1.5 0 0 1 2.1 0l.3.3a1.5 1.5 0 0 1 0 2.1L6 12.4 3 13zM9.8 4.2l2 2" />
+					</svg>
+					<span>重命名</span>
+				</button>
+				<button type="button" class="session-menu-item" @click="togglePin(sessionMenu.session)">
+					<svg viewBox="0 0 16 16" aria-hidden="true">
+						<path d="M9.6 2.4l4 4-1.7.5-2.3 2.3.5 2.2-1 1L4.4 7.7l1-1 2.2.5L9.9 4.9z" />
+						<path d="M6.3 9.7L3 13" />
+					</svg>
+					<span>{{ isPinned(sessionMenu.session.path) ? "取消置顶" : "置顶" }}</span>
+				</button>
+				<button type="button" class="session-menu-item" @click="enterSelect(sessionMenu.session)">
+					<svg viewBox="0 0 16 16" aria-hidden="true">
+						<path d="M6 4h7M6 8h7M6 12h7" />
+						<rect x="2.5" y="3" width="2" height="2" rx="0.6" />
+						<rect x="2.5" y="7" width="2" height="2" rx="0.6" />
+						<rect x="2.5" y="11" width="2" height="2" rx="0.6" />
+					</svg>
+					<span>多选</span>
+				</button>
+				<div class="session-menu-sep"></div>
+				<button type="button" class="session-menu-item danger" @click="askDeleteSession(sessionMenu.session)">
+					<svg viewBox="0 0 16 16" aria-hidden="true">
+						<path d="M3 4.5h10M6.5 4.5V2.5h3v2M4.8 4.5l.6 9h5.2l.6-9" />
+					</svg>
+					<span>删除</span>
+				</button>
+			</div>
+		</Teleport>
+
+		<!-- Full-text search: centred palette, animated in and out. -->
+		<Teleport to="body">
+			<Transition name="search-pop">
+				<div v-if="searchOpen" class="search-modal" @click.self="closeSearch">
+					<div class="search-panel" role="dialog" aria-modal="true" aria-label="搜索全部对话内容">
+						<div class="search-input-row">
+							<svg viewBox="0 0 16 16" aria-hidden="true">
+								<circle cx="7" cy="7" r="4.2" />
+								<path d="M10.2 10.2L14 14" />
+							</svg>
+							<input
+								ref="searchInput"
+								v-model="searchQuery"
+								type="text"
+								placeholder="搜索全部对话内容"
+								aria-label="搜索全部对话内容"
+								@keydown.esc.prevent.stop="closeSearch"
+								@keydown.enter.prevent="openFirstSearchResult"
+							/>
+							<button type="button" class="search-close" title="Close search" @click="closeSearch">
+								<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" /></svg>
+							</button>
+						</div>
+
+						<div class="search-body">
+							<p v-if="!searchQuery.trim()" class="search-hint">搜索所有对话的标题和消息内容</p>
+							<p v-else-if="searchBusy && searchResults.length === 0" class="search-hint">正在搜索…</p>
+							<p v-else-if="searchError" class="search-hint error">{{ searchError }}</p>
+							<p v-else-if="searchResults.length === 0" class="search-hint">没有找到匹配的内容</p>
+							<template v-else>
+								<div v-for="group in searchResults" :key="group.path" class="search-group">
+									<button type="button" class="search-session" @click="openSearchResult(group, group.matches[0])">
+										<span class="search-session-title">{{ sessionTitle(group) }}</span>
+										<span class="search-session-date">{{ when(group.modified) }}</span>
+									</button>
+									<button
+										v-for="match in group.matches"
+										:key="`${group.path}:${match.entryId}`"
+										type="button"
+										class="search-match"
+										@click="openSearchResult(group, match)"
+									>
+										<span
+											v-for="(part, index) in highlightParts(match.text)"
+											:key="index"
+											:class="{ hit: part.hit }"
+										>{{ part.text }}</span>
+									</button>
+								</div>
+							</template>
+						</div>
+					</div>
+				</div>
+			</Transition>
+		</Teleport>
+
 		<!-- Narrow screens: the sidebar is an overlay, so tapping anywhere else closes it. -->
 		<div v-if="narrow && sidebarOpen" class="sidebar-backdrop" @click="sidebarOpen = false"></div>
 
 		<section class="main">
 			<header class="topbar">
-				<button type="button" class="iconbtn panel-toggle" @click.stop="toggleSidebar">
-					<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 3.5h12M2 8h12M2 12.5h8" /></svg>
-				</button>
+				<div v-if="narrow || collapsed" class="top-actions-pill">
+					<button type="button" class="iconbtn" title="Open sidebar" @click.stop="toggleSidebar">
+						<svg viewBox="0 0 16 16" aria-hidden="true">
+							<rect x="2.5" y="3" width="11" height="10" rx="2" />
+							<path d="M6.5 3.5v9" />
+						</svg>
+					</button>
+					<button type="button" class="iconbtn" title="Search conversations" @click.stop="openSearch">
+						<svg viewBox="0 0 16 16" aria-hidden="true">
+							<circle cx="7" cy="7" r="4.2" />
+							<path d="M10.2 10.2L14 14" />
+						</svg>
+					</button>
+					<button type="button" class="iconbtn" title="New session" @click.stop="newSession">
+						<svg viewBox="0 0 16 16" aria-hidden="true">
+							<path d="M13.2 7.8a5.2 5.2 0 0 1-7.6 4.5L3 13l.7-2.6A5.2 5.2 0 1 1 13.2 7.8z" />
+							<path d="M8 5.8v4M6 7.8h4" />
+						</svg>
+					</button>
+				</div>
 				<div class="titles">
 					<strong class="ellipsis">{{ title }}</strong>
 				</div>
@@ -2693,6 +3220,21 @@ onBeforeUnmount(() => {
 				</div>
 			</form>
 		</section>
+
+		<div v-if="deleteQueue.length" class="modal" @click.self="cancelDelete">
+			<div class="modal-card delete-card" role="alertdialog" aria-modal="true">
+				<h2 v-if="deleteQueue.length === 1">删除后，该对话将不可恢复</h2>
+				<h2 v-else>删除后，这 {{ deleteQueue.length }} 个对话将不可恢复</h2>
+				<p v-if="deleteQueue.length === 1">该对话的聊天记录将被永久删除。</p>
+				<p v-else>这些对话的聊天记录将被永久删除。</p>
+				<div class="modal-actions">
+					<button type="button" class="ghost" :disabled="deleting" @click="cancelDelete">取消</button>
+					<button type="button" class="danger" :disabled="deleting" @click="confirmDeleteSessions">
+						{{ deleting ? "删除中…" : deleteQueue.length === 1 ? "删除该对话" : "删除这些对话" }}
+					</button>
+				</div>
+			</div>
+		</div>
 
 		<div v-if="dialog" class="modal">
 			<div class="modal-card">

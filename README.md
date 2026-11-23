@@ -152,10 +152,21 @@ so 700ms later) and the page ignores ports that were already there for the first
 From the browser:
 
 - left sidebar lists sessions for the current working directory, click to switch (`/resume`)
-- hovering a session reveals a delete button: one click asks for confirmation in place
-  (`Delete` / `Cancel`), then the row is removed and every open tab refreshes via the
-  `sessions_changed` event. The bridge deletes with the `trash` CLI when it is installed and falls
-  back to `unlink`, mirroring the TUI selector, and refuses the session that is currently running
+- hovering a session reveals a `⋯` menu with `重命名`, `置顶`, `多选` and `删除`. Rename edits the
+  row in place (Enter commits, Escape cancels) and prefers the stored `session_info` name over the
+  first prompt. Pinned rows sort above the rest and keep a pin mark; the pin list is stored in
+  `localStorage` per project directory, because it is a browser preference, not session content
+- the sidebar header keeps the existing `Nife` wordmark, with search and panel buttons on the
+  right. Search opens an animated centred palette and scans the user/assistant text of every
+  conversation in this project: results group matching snippets under their session title and
+  highlight the query. Clicking a snippet switches to that session and jumps to the matching
+  message. Escape or the X closes the palette; the compact pill opens the same one
+- entering `多选` from a row's `⋯` menu turns rows into circular
+  checkboxes, the header counts the selection, and the footer offers `置顶` plus `删除`. Bulk pin
+  toggles all checked rows; bulk delete asks once in the same centred modal. The active session can
+  be deleted too: the bridge first switches to a fresh session, so the page lands on the New chat
+  screen. Deletion uses the `trash` CLI when it is installed and falls back to `unlink`, mirroring
+  the TUI selector, and every open tab refreshes via the `sessions_changed` event
 - sending while a turn is running **queues** the task instead of interrupting it: a strip 20px
   narrower than the composer sits flush on its top edge, listing FIFO items with a text preview, a
   `2 images · 1 file` counter, click-to-edit back into the composer and `×` to drop. Limits are 20
@@ -168,7 +179,9 @@ From the browser:
   session is idle and the queue is paused runs that message immediately and resumes the queue, so
   the parked items follow that turn. `Resume` continues without a new message, `Clear` drops them; failures stay at the head with a
   `Retry` action instead of silently disappearing
-- `+` starts a fresh session (`/new`)
+- `+` starts a fresh session (`/new`). A new conversation gets its file only when the first prompt is
+  persisted; the bridge watches for that file and broadcasts `sessions_changed`, so the row appears
+  in Recents immediately instead of after a manual refresh
 - hovering a user prompt reveals two icons in the row's own bottom margin - copy, and edit (the
   DeepSeek row). Edit happens **in place**: the bubble is replaced by an editor card at the same
   spot (`web/src/MessageEdit.vue`) holding its attachments, its text and its own `Cancel` / `Send`,
@@ -215,9 +228,12 @@ From the browser:
   exact spot the run's summary will occupy (same margin, padding, type and spinner, with a spacer
   where the chevron goes), and it disappears the moment the answer text, its reasoning or the
   trailing run's `Working` label takes over
-- panel button collapses the sidebar (remembered in `localStorage`); it becomes an overlay under
-  820px, where a dimmed backdrop covers the page: tapping it, switching sessions, or Escape closes
-  the overlay, and resizing back to a wide window clears the open state
+- the panel button collapses the sidebar (remembered in `localStorage`). When collapsed, the
+  panel/search/new-chat tools move into a rounded pill at the left of the topbar; the brand area is
+  unchanged. Under 820px the sidebar becomes an overlay, where a dimmed backdrop covers the page:
+  tapping it, switching sessions, or Escape closes the overlay, and resizing back to a wide window
+  clears the open state. Search from the compact pill expands the sidebar first, so the same filter
+  input is used in both states
 - model chip in the composer lists available/scoped models with a filter, `setModel` runs in the CLI
   session so the terminal switches too; models without credentials are reported, not switched
 - `Compact context` sits in its own divided `Tools` section at the bottom of the model menu (below
@@ -393,8 +409,16 @@ No build step for the extension itself: plain `node:http` + SSE, no runtime depe
   request's file name is reduced to a label (directory parts dropped, `<>:"|?*` and control
   characters replaced, 80 chars max) and only a `[a-z0-9]` extension is carried over, so a header
   cannot choose a directory, overwrite another drop, or smuggle a name into a shell command.
-- `POST /api/delete` only accepts paths that `SessionManager.list(cwd)` returns for this project and
-  never the active session, so the endpoint cannot be pointed at an arbitrary file.
+- `POST /api/delete` accepts `path` or a `paths` array; every target must be a path that
+  `SessionManager.list(cwd)` returns for this project, so the endpoint cannot be pointed at an
+  arbitrary file. The active session is allowed while idle: the runtime moves to a fresh session
+  before any file is removed, and a batch is validated before the first unlink.
+- `POST /api/rename` takes `path` and `name`; the active session goes through
+  `api.setSessionName`, an inactive one through `SessionManager.open(path).appendSessionInfo(name)`,
+  so the name the list shows is the same `session_info` entry the terminal writes.
+- `GET /api/search?q=` scans the `allMessagesText` of every session listed for this cwd, opens only
+  the sessions that can hit, and returns up to 40 groups with up to 6 snippets each. A snippet
+  carries its `entryId`, so the page can reveal that message after switching sessions.
 - There is no login: the URL carries the token, so treat a published URL as a credential. The port
   itself still binds `127.0.0.1`; the only public path is the nifetun tunnel (`/tunnel down` closes
   it). For anything else use an SSH tunnel or Tailscale rather than a reverse proxy.
