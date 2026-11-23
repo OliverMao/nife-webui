@@ -376,6 +376,8 @@ svg {
 	text-align: left;
 }
 
+/* The project's trash affordance is a hover action: the row reads as a name until you aim at it.
+   It keeps its width while hidden, so revealing it never shifts the count or the chevron. */
 .session-group-delete {
 	display: grid;
 	flex: 0 0 auto;
@@ -385,13 +387,28 @@ svg {
 	margin-right: 2px;
 	border-radius: 5px;
 	color: var(--dim);
-	opacity: 0.45;
+	opacity: 0;
+	pointer-events: none;
+	transition: opacity 120ms ease;
+}
+
+.session-group-head:hover .session-group-delete,
+.session-group-head:focus-within .session-group-delete {
+	opacity: 1;
+	pointer-events: auto;
 }
 
 .session-group-delete:hover {
 	background: rgb(240 104 104 / 12%);
 	color: var(--error);
-	opacity: 1;
+}
+
+/* No pointer to hover with: keep the button reachable on touch screens. */
+@media (hover: none) {
+	.session-group-delete {
+		opacity: 1;
+		pointer-events: auto;
+	}
 }
 
 .session-group-delete svg {
@@ -572,6 +589,39 @@ svg {
 	line-height: 1.45;
 	outline: none;
 	box-shadow: 0 0 0 1px rgb(59 130 246 / 25%);
+}
+
+/* Live run state of a row: blue ring while the turn runs, green dot when it finished unattended. */
+.session-state {
+	flex: 0 0 auto;
+	width: 10px;
+	height: 10px;
+	border-radius: 50%;
+}
+
+.session-state.running {
+	border: 1.5px solid rgb(96 165 250 / 28%);
+	border-top-color: #60a5fa;
+	animation: session-spin 0.75s linear infinite;
+}
+
+.session-state.done {
+	background: #34d399;
+	box-shadow: 0 0 0 3px rgb(52 211 153 / 14%);
+}
+
+@keyframes session-spin {
+	to {
+		transform: rotate(360deg);
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.session-state.running {
+		animation: none;
+		border-top-color: rgb(96 165 250 / 28%);
+		background: #60a5fa;
+	}
 }
 
 .session-pin {

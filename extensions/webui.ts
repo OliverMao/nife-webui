@@ -20,7 +20,16 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getAgentDir, SessionManager, sessionEntryToContextMessages, type SessionInfo } from "nife-coding-agent";
-import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "nife-coding-agent";
+import {
+	createAgentSession,
+	DefaultResourceLoader,
+	ModelRuntime,
+	SettingsManager,
+	type AgentSession,
+	type ExtensionAPI,
+	type ExtensionContext,
+	type ExtensionUIContext,
+} from "nife-coding-agent";
 
 /** Whatever ctx.model is; the package does not export the model type itself. */
 type AnyModel = NonNullable<ExtensionContext["model"]>;
@@ -283,6 +292,23 @@ interface Bridge {
 	handle: (req: IncomingMessage, res: ServerResponse) => Promise<void>;
 	/** Waiting for the approval mail, so a tunnel that comes up later still gets announced. */
 	tunnelTimer: ReturnType<typeof setTimeout> | undefined;
+	/**
+	 * Background runtimes, one per session the page opened that is not the terminal's session. Each is
+	 * an in-process AgentSession with its own loop, so switching the page to another conversation no
+	 * longer stops the turn that was running. Keyed by sid; `workersByPath` keeps "one runtime per
+	 * session file".
+	 */
+	workers: Map<string, Worker>;
+	workersByPath: Map<string, string>;
+	/** Session the page is looking at: "host" (the terminal's) or a worker sid. */
+	viewSid: string;
+	/** Partial assistant text of the host session, so re-attaching mid-turn renders what is streaming. */
+	hostLive: { text: string; thinking: string } | null;
+	/** The terminal session's run state, so its sidebar row shows the same dot as a background one. */
+	hostRunning?: boolean;
+	hostDone?: boolean;
+	/** Shared auth/model catalogue for workers; created on the first background run. */
+	modelRuntime?: Promise<ModelRuntime>;
 }
 
 interface SwitchOutcome {
@@ -384,24 +410,6 @@ async function workspaceSessionPath(b: Bridge, workspace: Workspace, cwd: string
 	return recent?.path ?? createSessionFile(workspaceDir(b, workspace), cwd);
 }
 
-/** Move the runtime to the other workspace's session, keeping the current project directory. */
-async function switchWorkspace(b: Bridge, target: Workspace): Promise<SwitchOutcome> {
-	if (target === currentWorkspace(b)) return { ok: true };
-	if (!b.ctx.isIdle()) return { ok: false, message: "stop the current turn first" };
-	const file = b.ctx.sessionManager.getSessionFile();
-	// `--no-session` has no directory to switch between; do not quietly create files on disk.
-	if (!file) return { ok: false, message: "workspaces need a saved session" };
-	const cwd = b.ctx.cwd;
-	rememberCurrent(b);
-	const path = await workspaceSessionPath(b, target, cwd);
-	const outcome = await requestSwitch(b, `resume ${path}`);
-	if (outcome.ok) {
-		b.workspaceFiles[workspaceKey(target, cwd)] = path;
-		broadcast(b, { type: "session_switch" });
-	}
-	return outcome;
-}
-
 /** Create a header for a project and move the runtime there. */
 async function createAndSwitch(
 	b: Bridge,
@@ -421,9 +429,11 @@ async function createAndSwitch(
 	return { ...outcome, path };
 }
 
+/** Host-session events carry their sid, so a page reading a background session ignores them. */
 function forward(payload: Record<string, unknown>): void {
 	const b = store.__nifeWebui;
-	if (b) broadcast(b, payload);
+	if (!b) return;
+	broadcast(b, { sid: "host", path: b.ctx.sessionManager.getSessionFile() ?? undefined, ...payload });
 }
 
 /** Ask the browser. Returns "tui" when no browser is attached so the caller falls back. */
@@ -570,7 +580,7 @@ function announceMessageEntry(b: Bridge, message: unknown): void {
 		if (store.__nifeWebui !== b) return;
 		const entryId = entryIdOfMessage(b, message);
 		if (entryId) {
-			broadcast(b, { type: "entry_id", entryId });
+			broadcast(b, { type: "entry_id", entryId, sid: "host", path: b.ctx.sessionManager.getSessionFile() ?? undefined });
 			return;
 		}
 		if (left > 0) setTimeout(() => attempt(left - 1), 60);
@@ -603,26 +613,13 @@ function cleanTitle(value: string): string {
 	return title.slice(0, 60).trim();
 }
 
-/**
- * Name a conversation with the model once, after its first turn settles. The session file's
- * `session_info` entry is the same one a manual rename writes, so the sidebar, search and terminal
- * all see the title. A failed call leaves the first-prompt fallback in place.
- */
-async function autoTitle(b: Bridge): Promise<void> {
-	if (!b.ctx.isIdle()) return;
-	const manager = b.ctx.sessionManager;
-	const id = manager.getSessionId();
-	if (b.titleTried.has(id) || manager.getSessionName()) return;
-	const model = b.ctx.model;
-	if (!model) return;
-	const messages = contextMessages(b);
+async function suggestTitle(b: Bridge, model: AnyModel, messages: TranscriptMessage[]): Promise<string> {
 	const user = messages.find((message) => message.role === "user");
-	if (!user) return;
+	if (!user) return "";
 	const reply = messages.find((message) => message.role === "assistant" && searchableText(message).trim());
 	const prompt = searchableText(user).replace(/\s+/g, " ").trim().slice(0, 2000);
-	if (!prompt) return;
+	if (!prompt) return "";
 	const answer = reply ? searchableText(reply).replace(/\s+/g, " ").trim().slice(0, 2000) : "";
-	b.titleTried.add(id);
 	const source = [`用户: ${prompt}`, answer ? `助手: ${answer}` : ""].filter(Boolean).join("\n\n");
 	try {
 		const result = await b.ctx.modelRegistry
@@ -643,16 +640,48 @@ async function autoTitle(b: Bridge): Promise<void> {
 				{ maxTokens: 128, temperature: 0.2, cacheRetention: "none", timeoutMs: 20_000 },
 			)
 			.result();
-		// The live context may have moved on while the title request ran: never name a different session.
-		if (b.ctx.sessionManager.getSessionId() !== id || b.ctx.sessionManager.getSessionName()) return;
-		const title = cleanTitle(searchableText(result));
-		if (!title) return;
-		b.api.setSessionName(title);
-		invalidateSessions(b);
-		broadcast(b, { type: "sessions_changed" });
+		return cleanTitle(searchableText(result));
 	} catch {
 		// Cosmetic: the first-message fallback is still a usable name.
+		return "";
 	}
+}
+
+/**
+ * Name a conversation with the model once, after its first turn settles. The session file's
+ * `session_info` entry is the same one a manual rename writes, so the sidebar, search and terminal
+ * all see the title. A failed call leaves the first-prompt fallback in place.
+ */
+async function autoTitle(b: Bridge): Promise<void> {
+	if (!b.ctx.isIdle()) return;
+	const manager = b.ctx.sessionManager;
+	const id = manager.getSessionId();
+	if (b.titleTried.has(id) || manager.getSessionName()) return;
+	const model = b.ctx.model;
+	if (!model) return;
+	b.titleTried.add(id);
+	const title = await suggestTitle(b, model, contextMessages(manager));
+	// The live context may have moved on while the title request ran: never name a different session.
+	if (!title || manager.getSessionId() !== id || manager.getSessionName()) return;
+	b.api.setSessionName(title);
+	invalidateSessions(b);
+	broadcast(b, { type: "sessions_changed" });
+}
+
+/** Same naming rule for a background session, written through the worker's own manager. */
+async function autoTitleWorker(b: Bridge, worker: Worker): Promise<void> {
+	if (worker.running || worker.titleTried) return;
+	const id = worker.manager.getSessionId();
+	if (worker.manager.getSessionName()) return;
+	const model = worker.session?.model;
+	if (!model) return;
+	worker.titleTried = true;
+	const title = await suggestTitle(b, model, contextMessages(worker.manager));
+	if (!title || worker.manager.getSessionId() !== id || worker.manager.getSessionName()) return;
+	worker.manager.appendSessionInfo(title);
+	invalidateSessions(b);
+	broadcast(b, { type: "sessions_changed" });
+	broadcastStatus(b, worker);
 }
 
 /** System prompts and hidden extension messages are not conversation content. */
@@ -880,9 +909,9 @@ interface TranscriptMessage {
 	};
 }
 
-function contextMessages(b: Bridge): TranscriptMessage[] {
+function contextMessages(manager: TargetManager): TranscriptMessage[] {
 	const out: TranscriptMessage[] = [];
-	for (const entry of b.ctx.sessionManager.getBranch()) {
+	for (const entry of manager.getBranch()) {
 		if (entry.type === "compaction") {
 			// A row where the context was rewritten, so the missing messages are explained in place.
 			out.push({
@@ -935,39 +964,532 @@ function statsOf(messages: TranscriptMessage[]) {
 }
 
 /**
- * Refresh just the footer while a turn runs. A tool loop can take minutes and several steps, and the
- * whole snapshot is neither needed nor wanted then - but the counts must not freeze until it settles.
+ * Background runtimes. The host session is the terminal's; every other conversation the page opens
+ * gets its own in-process AgentSession, so switching the page to another session no longer stops the
+ * turn that was running. No child processes and no tmux: the pool lives in this Node process and
+ * dies with it, exactly like a terminal session would.
  */
-function broadcastStats(b: Bridge): void {
+const MAX_WORKERS = 3;
+/** An idle background runtime keeps its tools and model warm; after this it is disposed and rebuilt
+ * on the next visit (the session file is the source of truth). */
+const WORKER_IDLE_MS = 30 * 60 * 1000;
+/** This extension must not be loaded a second time inside a worker: one page, one server. */
+const WEBUI_MODULE = fileURLToPath(import.meta.url);
+
+interface Worker {
+	sid: string;
+	cwd: string;
+	workspace: Workspace;
+	manager: SessionManager;
+	/** Session file. A worker is always created from a real file (a new one gets its header first). */
+	path: string;
+	session?: AgentSession;
+	opening?: Promise<{ ok: true; session: AgentSession } | { ok: false; message: string }>;
+	unsub?: () => void;
+	running: boolean;
+	/** The turn finished while the page was looking at another session: the sidebar shows a dot. */
+	done: boolean;
+	/** Partial assistant text, so switching back mid-turn renders what is streaming. */
+	live: { text: string; thinking: string } | null;
+	lastUsed: number;
+	titleTried: boolean;
+}
+
+/** A request is about the terminal's session or about one background runtime. */
+type Target = { kind: "host"; sid: "host" } | { kind: "worker"; sid: string; worker: Worker };
+
+type TargetManager = Pick<SessionManager, "getBranch" | "getSessionFile" | "getSessionId" | "getSessionName" | "getCwd">;
+
+function hostFile(b: Bridge): string | undefined {
+	return b.ctx.sessionManager.getSessionFile() ?? undefined;
+}
+
+function workerName(w: Worker): string {
+	return w.manager.getSessionName() || basename(w.cwd) || w.cwd;
+}
+
+function targetOf(b: Bridge, raw: unknown): Target | undefined {
+	const sid = typeof raw === "string" && raw ? raw : "host";
+	if (sid === "host") return { kind: "host", sid: "host" };
+	const worker = b.workers.get(sid);
+	if (!worker) return undefined;
+	worker.lastUsed = Date.now();
+	return { kind: "worker", sid, worker };
+}
+
+const targetManager = (b: Bridge, t: Target): TargetManager =>
+	t.kind === "host" ? b.ctx.sessionManager : t.worker.manager;
+const targetCwd = (b: Bridge, t: Target): string => (t.kind === "host" ? b.ctx.cwd : t.worker.cwd);
+const targetRunning = (b: Bridge, t: Target): boolean =>
+	t.kind === "host" ? !b.ctx.isIdle() : t.worker.running;
+const targetWorkspace = (b: Bridge, t: Target): Workspace =>
+	t.kind === "host" ? currentWorkspace(b) : t.worker.workspace;
+const targetModel = (b: Bridge, t: Target): AnyModel | undefined =>
+	t.kind === "host" ? b.ctx.model : t.worker.session?.model ?? entryModel(b, t.worker.manager);
+const targetThinking = (b: Bridge, t: Target): string =>
+	t.kind === "host"
+		? String(b.ctx.thinkingLevel ?? "off")
+		: String(t.worker.session?.thinkingLevel ?? entryThinking(t.worker.manager) ?? "off");
+const targetUsage = (b: Bridge, t: Target) => (t.kind === "host" ? b.ctx.getContextUsage() ?? null : null);
+
+/** The model a session was last switched to, for a worker whose runtime is not built yet. */
+function entryModel(b: Bridge, manager: TargetManager): AnyModel | undefined {
+	const branch = manager.getBranch();
+	for (let index = branch.length - 1; index >= 0; index -= 1) {
+		const entry = branch[index] as { type?: string; provider?: string; modelId?: string };
+		if (entry?.type !== "model_change" || !entry.provider || !entry.modelId) continue;
+		return b.ctx.modelRegistry.find(entry.provider, entry.modelId) as AnyModel | undefined;
+	}
+	return undefined;
+}
+
+function entryThinking(manager: TargetManager): string | undefined {
+	const branch = manager.getBranch();
+	for (let index = branch.length - 1; index >= 0; index -= 1) {
+		const entry = branch[index] as { type?: string; thinkingLevel?: string };
+		if (entry?.type === "thinking_level_change" && entry.thinkingLevel) return entry.thinkingLevel;
+	}
+	return undefined;
+}
+
+/** The session the page is looking at: what the sidebar marks as current and what a new turn joins. */
+function viewedTarget(b: Bridge): Target {
+	return targetOf(b, b.viewSid) ?? { kind: "host", sid: "host" };
+}
+
+function broadcastStatus(b: Bridge, worker: Worker): void {
 	broadcast(b, {
-		type: "stats",
-		stats: statsOf(contextMessages(b)),
-		usage: b.ctx.getContextUsage() ?? null,
+		type: "session_status",
+		sid: worker.sid,
+		path: worker.path,
+		cwd: worker.cwd,
+		name: workerName(worker),
+		running: worker.running,
+		done: worker.done,
 	});
 }
 
-function snapshot(b: Bridge, metaOnly = false): unknown {
-	const ctx = b.ctx;
-	const messages = contextMessages(b);
+function hostStatus(b: Bridge): void {
+	const path = hostFile(b);
+	if (!path) return;
+	broadcast(b, {
+		type: "session_status",
+		sid: "host",
+		path,
+		cwd: b.ctx.cwd,
+		name: b.api.getSessionName(),
+		running: b.hostRunning ?? !b.ctx.isIdle(),
+		done: b.hostDone === true,
+	});
+}
+
+function focusSession(b: Bridge, sid: string): void {
+	b.viewSid = sid;
+	const worker = b.workers.get(sid);
+	if (worker) {
+		worker.done = false;
+		broadcastStatus(b, worker);
+		return;
+	}
+	b.hostDone = false;
+	if (sid === "host") hostStatus(b);
+}
+
+function disposeWorker(b: Bridge, worker: Worker): void {
+	b.workers.delete(worker.sid);
+	if (b.workersByPath.get(pathKey(worker.path)) === worker.sid) b.workersByPath.delete(pathKey(worker.path));
+	try {
+		worker.unsub?.();
+	} catch {
+		// the session is going away; a failing unsubscribe must not keep it alive
+	}
+	try {
+		worker.session?.dispose();
+	} catch {
+		// same: dispose is best effort
+	}
+	if (b.viewSid === worker.sid) focusSession(b, "host");
+}
+
+/** Oldest idle worker, or undefined when every slot is busy (or the page is looking at it). */
+function evictable(b: Bridge): Worker | undefined {
+	const idle = [...b.workers.values()].filter(
+		(worker) => !worker.running && !worker.opening && worker.sid !== b.viewSid,
+	);
+	return idle.sort((left, right) => left.lastUsed - right.lastUsed)[0];
+}
+
+/** Drop runtimes nobody is using: their session files are the history, the memory is not. */
+function sweepWorkers(b: Bridge): void {
+	const now = Date.now();
+	for (const worker of [...b.workers.values()]) {
+		if (worker.running || worker.opening || worker.sid === b.viewSid) continue;
+		if (now - worker.lastUsed < WORKER_IDLE_MS) continue;
+		disposeWorker(b, worker);
+	}
+}
+
+type AttachOutcome = { ok: true; sid: string } | { ok: false; message: string };
+
+/** Point the page at a session, creating a background runtime when it is not the terminal's. */
+function attachSession(b: Bridge, rawPath: string): AttachOutcome {
+	if (!rawPath) return { ok: false, message: "missing path" };
+	const path = resolve(rawPath);
+	const host = hostFile(b);
+	if (host && samePath(host, path)) {
+		focusSession(b, "host");
+		return { ok: true, sid: "host" };
+	}
+	const known = b.workersByPath.get(pathKey(path));
+	if (known && b.workers.has(known)) {
+		focusSession(b, known);
+		return { ok: true, sid: known };
+	}
+	if (!existsSync(path)) return { ok: false, message: "session file not found" };
+	if (b.workers.size >= MAX_WORKERS) {
+		const victim = evictable(b);
+		if (!victim) return { ok: false, message: `${MAX_WORKERS} 个会话已经在后台运行，先等一个结束再打开别的` };
+		disposeWorker(b, victim);
+	}
+	let manager: SessionManager;
+	try {
+		manager = SessionManager.open(path);
+	} catch (error) {
+		return { ok: false, message: error instanceof Error ? error.message : "could not open session" };
+	}
+	const worker: Worker = {
+		sid: randomUUID(),
+		cwd: manager.getCwd(),
+		workspace: workspaceOfFile(path),
+		manager,
+		path,
+		running: false,
+		done: false,
+		live: null,
+		lastUsed: Date.now(),
+		titleTried: false,
+	};
+	b.workers.set(worker.sid, worker);
+	b.workersByPath.set(pathKey(path), worker.sid);
+	focusSession(b, worker.sid);
+	return { ok: true, sid: worker.sid };
+}
+
+/** Work or Chat, read from where the session file lives (the layout the sidebar already uses). */
+function workspaceOfFile(path: string): Workspace {
+	const clean = resolve(path);
+	const chat = resolve(CHAT_SESSION_DIR);
+	if (clean === chat || clean.startsWith(chat + sep)) return "chat";
+	return basename(dirname(clean)).toLowerCase() === LEGACY_CHAT_DIR ? "chat" : "work";
+}
+
+/** Create a header for a new conversation and attach it as a background runtime. */
+async function createAttachedSession(
+	b: Bridge,
+	workspace: Workspace,
+	cwd: string,
+): Promise<AttachOutcome & { path?: string; cwd?: string; workspace?: Workspace }> {
+	const path = await createSessionFile(workspaceDir(b, workspace), cwd);
+	const outcome = attachSession(b, path);
+	if (!outcome.ok) return outcome;
+	b.workspaceFiles[workspaceKey(workspace, cwd)] = path;
+	return { ...outcome, path, cwd, workspace };
+}
+
+function workerModelRuntime(b: Bridge): Promise<ModelRuntime> {
+	b.modelRuntime ??= ModelRuntime.create();
+	return b.modelRuntime;
+}
+
+/**
+ * The UI a background extension talks to. Dialogs go to the browser with the session attached, so a
+ * confirmation raised by a background run names the conversation it belongs to; the terminal-only
+ * surfaces are no-ops because nobody is watching that runtime.
+ */
+function workerUI(b: Bridge, worker: Worker): ExtensionUIContext {
+	const tag = () => ({ sid: worker.sid, path: worker.path, workerName: workerName(worker) });
+	const base: Record<string, unknown> = {
+		confirm: async (title: string, message: string) => {
+			const answer = await ask<boolean>(b, "confirm", { title, message, ...tag() });
+			return answer === true;
+		},
+		select: async (title: string, options: string[]) => {
+			const answer = await ask<string>(b, "select", { title, options, ...tag() });
+			return answer === "tui" ? undefined : answer;
+		},
+		input: async (title: string, placeholder?: string) => {
+			const answer = await ask<string>(b, "input", { title, placeholder, ...tag() });
+			return answer === "tui" ? undefined : answer;
+		},
+		editor: async (title: string, prefill?: string) => {
+			const answer = await ask<string>(b, "editor", { title, prefill, ...tag() });
+			return answer === "tui" ? undefined : answer;
+		},
+		notify: (message: string, level?: string) => {
+			broadcast(b, { type: "notice", text: message, level: level ?? "info", ...tag() });
+		},
+		onTerminalInput: () => () => {},
+		getEditorText: () => "",
+		getEditorComponent: () => undefined,
+		getToolsExpanded: () => false,
+		getAllThemes: () => [],
+		getTheme: () => undefined,
+		setTheme: () => ({ success: false, error: "background sessions have no terminal theme" }),
+		custom: async () => undefined,
+	};
+	return new Proxy(base, {
+		get(target, property) {
+			if (property in target) return target[property as string];
+			return () => {};
+		},
+	}) as unknown as ExtensionUIContext;
+}
+
+/** Chat sessions never declare tools and use nife's chat prompt, same rule as the host session. */
+const CHAT_EXTENSION = {
+	name: "webui-chat",
+	factory: (api: ExtensionAPI) => {
+		api.on("before_agent_start", () => ({ systemPrompt: CHAT_SYSTEM_PROMPT }));
+	},
+};
+
+/** Build the runtime for a worker: settings, extensions, tools and model, all from its own project. */
+function openWorkerSession(
+	b: Bridge,
+	worker: Worker,
+): Promise<{ ok: true; session: AgentSession } | { ok: false; message: string }> {
+	worker.opening ??= (async () => {
+		try {
+			const agentDir = getAgentDir();
+			const settingsManager = SettingsManager.create(worker.cwd, agentDir);
+			const loader = new DefaultResourceLoader({
+				cwd: worker.cwd,
+				agentDir,
+				settingsManager,
+				// one webui server per process: the copy inside a worker would race for the port
+				extensionsOverride: (base) => ({
+					...base,
+					extensions: base.extensions.filter((extension) => resolve(extension.resolvedPath) !== WEBUI_MODULE),
+				}),
+				extensionFactories: worker.workspace === "chat" ? [CHAT_EXTENSION] : undefined,
+			});
+			await loader.reload();
+			const modelRuntime = await workerModelRuntime(b);
+			const { session } = await createAgentSession({
+				cwd: worker.cwd,
+				agentDir,
+				settingsManager,
+				modelRuntime,
+				sessionManager: worker.manager,
+				resourceLoader: loader,
+				noTools: worker.workspace === "chat" ? "all" : undefined,
+			});
+			await session.bindExtensions({
+				uiContext: workerUI(b, worker),
+				mode: "rpc",
+				abortHandler: () => void session.abort(),
+			});
+			worker.session = session;
+			worker.unsub = session.subscribe((event) => workerEvent(b, worker, event));
+			return { ok: true as const, session };
+		} catch (error) {
+			return { ok: false as const, message: error instanceof Error ? error.message : "could not start the session" };
+		}
+	})().finally(() => {
+		worker.opening = undefined;
+	});
+	return worker.opening;
+}
+
+async function ensureWorkerSession(
+	b: Bridge,
+	worker: Worker,
+): Promise<{ ok: true; session: AgentSession } | { ok: false; message: string }> {
+	if (worker.session) return { ok: true, session: worker.session };
+	return await openWorkerSession(b, worker);
+}
+
+/** Forward a background runtime's events to the page, tagged with the session they belong to. */
+function workerEvent(b: Bridge, worker: Worker, event: { type: string } & Record<string, unknown>): void {
+	const base = { sid: worker.sid, path: worker.path };
+	const push = (payload: Record<string, unknown>) => broadcast(b, { ...base, ...payload });
+	switch (event.type) {
+		case "message_start": {
+			const message = event.message as { role?: string; display?: boolean } | undefined;
+			if (!message || isHiddenMessage(message as never)) return;
+			if (message.role === "assistant") worker.live = { text: "", thinking: "" };
+			push({ type: "message_start", message });
+			break;
+		}
+		case "message_update": {
+			const delta = event.assistantMessageEvent as Record<string, unknown> | undefined;
+			if (worker.live && delta) {
+				if (delta.type === "text_delta") worker.live.text += String(delta.delta ?? "");
+				else if (delta.type === "thinking_delta") worker.live.thinking += String(delta.delta ?? "");
+				else if (delta.type === "error") {
+					const error = delta.error as { errorMessage?: string } | undefined;
+					worker.live.text += `\n${error?.errorMessage ?? "request failed"}`;
+				}
+			}
+			push({ type: "message_update", delta });
+			break;
+		}
+		case "message_end": {
+			const message = event.message as { role?: string; display?: boolean } | undefined;
+			if (!message) return;
+			if (!isHiddenMessage(message as never)) push({ type: "message_end", message });
+			break;
+		}
+		case "entry_appended": {
+			const entry = event.entry as { id?: string; type?: string; message?: { role?: string } } | undefined;
+			if (entry?.type === "message" && entry.message?.role === "user" && entry.id) {
+				push({ type: "entry_id", entryId: entry.id });
+			}
+			break;
+		}
+		case "agent_start":
+			worker.running = true;
+			worker.done = false;
+			push({ type: "agent_start" });
+			broadcastStatus(b, worker);
+			break;
+		case "agent_settled":
+			worker.running = false;
+			worker.live = null;
+			worker.lastUsed = Date.now();
+			worker.done = b.viewSid !== worker.sid;
+			push({ type: "agent_settled", aborted: Boolean(event.aborted) });
+			invalidateSessions(b);
+			broadcastStatus(b, worker);
+			void autoTitleWorker(b, worker);
+			break;
+		case "turn_end":
+			broadcastStats(b, { kind: "worker", sid: worker.sid, worker });
+			break;
+		case "session_before_compact":
+			push({ type: "compaction_start", reason: event.reason });
+			break;
+		case "session_compact":
+			push({ type: "compaction_end", ok: true, reason: event.reason });
+			break;
+		case "session_compact_failed":
+			push({ type: "compaction_end", ok: false, reason: event.reason, message: event.errorMessage });
+			break;
+		case "session_info_changed":
+			push({ type: "session_info_changed", name: event.name });
+			broadcastStatus(b, worker);
+			break;
+		case "thinking_level_changed":
+			push({ type: "thinking_level_changed", level: event.level });
+			break;
+		case "tool_execution_start":
+			push({
+				type: "tool_execution_start",
+				toolCallId: event.toolCallId,
+				toolName: event.toolName,
+				args: event.args,
+			});
+			break;
+		case "tool_execution_end":
+			push({
+				type: "tool_execution_end",
+				toolCallId: event.toolCallId,
+				toolName: event.toolName,
+				isError: event.isError,
+			});
+			break;
+		default:
+			break;
+	}
+}
+
+/** Send one prompt into a background runtime; the page queues its own sends while `running`. */
+async function promptWorker(
+	b: Bridge,
+	worker: Worker,
+	text: string,
+	images: ImageBlock[],
+): Promise<{ ok: true } | { ok: false; message: string }> {
+	if (worker.running) return { ok: false, message: "busy" };
+	// The model check needs the runtime, and a worker is built on its first prompt anyway.
+	const opened = await ensureWorkerSession(b, worker);
+	if (!opened.ok) return { ok: false, message: opened.message };
+	const model = opened.session.model;
+	if (images.length > 0 && !model?.input?.includes("image")) {
+		return { ok: false, message: `${model?.id ?? "this model"} does not accept images` };
+	}
+	worker.running = true;
+	worker.done = false;
+	broadcastStatus(b, worker);
+	try {
+		// Not awaited: the response returns as soon as the prompt is accepted, and the events stream.
+		void opened.session
+			.prompt(text, images.length > 0 ? { images: images as never } : undefined)
+			.catch((error: unknown) => {
+				worker.running = false;
+				worker.live = null;
+				broadcast(b, {
+					type: "agent_settled",
+					sid: worker.sid,
+					path: worker.path,
+					aborted: false,
+				});
+				broadcast(b, {
+					type: "notice",
+					text: error instanceof Error ? error.message : "prompt failed",
+					level: "error",
+					sid: worker.sid,
+					path: worker.path,
+				});
+				broadcastStatus(b, worker);
+			});
+	} catch (error) {
+		worker.running = false;
+		broadcastStatus(b, worker);
+		return { ok: false, message: error instanceof Error ? error.message : "send failed" };
+	}
+	return { ok: true };
+}
+
+/**
+ * Refresh just the footer while a turn runs. A tool loop can take minutes and several steps, and the
+ * whole snapshot is neither needed nor wanted then - but the counts must not freeze until it settles.
+ */
+function broadcastStats(b: Bridge, target: Target): void {
+	broadcast(b, {
+		type: "stats",
+		sid: target.sid,
+		stats: statsOf(contextMessages(targetManager(b, target))),
+		usage: targetUsage(b, target),
+	});
+}
+
+function snapshot(b: Bridge, target: Target, metaOnly = false): unknown {
+	const manager = targetManager(b, target);
+	const messages = contextMessages(manager);
 	const page = pageOf(messages, messages.length);
-	const model = ctx.model;
+	const model = targetModel(b, target);
 	const stats = statsOf(messages);
 	return {
-		sessionId: ctx.sessionManager.getSessionId(),
-		sessionFile: ctx.sessionManager.getSessionFile(),
-		name: b.api.getSessionName(),
-		cwd: ctx.cwd,
+		sid: target.sid,
+		kind: target.kind,
+		sessionId: manager.getSessionId(),
+		sessionFile: manager.getSessionFile(),
+		name: target.kind === "host" ? b.api.getSessionName() : workerName(target.worker),
+		cwd: targetCwd(b, target),
 		model: model ? { id: model.id, name: model.name, provider: model.provider } : null,
-		thinkingLevel: ctx.thinkingLevel,
-		thinkingLevels: supportedLevels(ctx.model),
-		mode: currentWorkspace(b),
-		models: availableModels(ctx).map((model) => ({
+		thinkingLevel: targetThinking(b, target),
+		thinkingLevels: supportedLevels(model),
+		mode: targetWorkspace(b, target),
+		models: (target.kind === "host" ? availableModels(b.ctx) : b.ctx.modelRegistry.getAvailable()).map((model) => ({
 			provider: model.provider,
 			id: model.id,
 			name: model.name,
 		})),
-		streaming: !ctx.isIdle(),
-		usage: ctx.getContextUsage() ?? null,
+		streaming: targetRunning(b, target),
+		// what the assistant has streamed so far, so switching back mid-turn is not a blank bubble
+		live: target.kind === "host" ? b.hostLive : target.worker.live,
+		usage: targetUsage(b, target),
 		proxy: proxyState(b),
 		// the footer button only exists when a tunnel can actually be made
 		tunnelAvailable: hasTunnel(b.api),
@@ -1095,7 +1617,7 @@ async function workspaceRefs(b: Bridge, workspace: Workspace): Promise<SessionRe
 	if (workspace === "work") {
 		add(WORK_SESSION_DIR);
 		if (b.legacyWorkDir) add(b.legacyWorkDir);
-		if (currentWorkspace(b) === "work" && currentDir) add(currentDir);
+		if (targetWorkspace(b, viewedTarget(b)) === "work" && currentDir) add(currentDir);
 		for (const dir of await nifeSessionDirs()) add(dir);
 	} else {
 		add(CHAT_SESSION_DIR);
@@ -1107,8 +1629,11 @@ async function workspaceRefs(b: Bridge, workspace: Workspace): Promise<SessionRe
 		for (const dir of await nifeSessionDirs()) add(join(dir, LEGACY_CHAT_DIR));
 	}
 	const groups = await mapLimit([...dirs], 8, sessionRefsIn);
-	const live = b.ctx.sessionManager.getSessionFile();
-	const livePath = live ? resolve(live) : "";
+	// Files a running runtime is writing to: temp cleanup must never pull one of those out from under it.
+	const live = new Set<string>();
+	const hostSession = b.ctx.sessionManager.getSessionFile();
+	if (hostSession) live.add(resolve(hostSession));
+	for (const worker of b.workers.values()) live.add(resolve(worker.path));
 	const byPath = new Map<string, SessionRef>();
 	let dropped = false;
 	for (const ref of groups.flat()) {
@@ -1116,7 +1641,7 @@ async function workspaceRefs(b: Bridge, workspace: Workspace): Promise<SessionRe
 		// and delete the file, so neither this scan nor the next one has to look at it again. The
 		// session this process is running is never deleted, even when it happens to live there.
 		if (isTempPath(ref.cwd) || isTempPath(ref.path)) {
-			if (resolve(ref.path) !== livePath) {
+			if (!live.has(resolve(ref.path))) {
 				await rm(ref.path, { force: true }).catch(() => {});
 				dropped = true;
 			}
@@ -1151,7 +1676,7 @@ function isTempPath(value: string): boolean {
 	return probe.split(/[\\/]+/).some((segment) => TEMP_SEGMENTS.has(segment));
 }
 
-function projectGroups(b: Bridge, refs: SessionRef[]): ProjectGroupInfo[] {
+function projectGroups(b: Bridge, refs: SessionRef[], currentCwd = b.ctx.cwd): ProjectGroupInfo[] {
 	const groups = new Map<string, ProjectGroupInfo>();
 	for (const ref of refs) {
 		if (!ref.hasMessage) continue;
@@ -1160,7 +1685,7 @@ function projectGroups(b: Bridge, refs: SessionRef[]): ProjectGroupInfo[] {
 		const key = ref.cwd ? pathKey(ref.cwd) : "";
 		let group = groups.get(key);
 		if (!group) {
-			group = { cwd: ref.cwd || "", name: ref.cwd ? basename(ref.cwd) || ref.cwd : "Unknown project", count: 0, modified: ref.modified, current: Boolean(ref.cwd) && samePath(ref.cwd, b.ctx.cwd) };
+			group = { cwd: ref.cwd || "", name: ref.cwd ? basename(ref.cwd) || ref.cwd : "Unknown project", count: 0, modified: ref.modified, current: Boolean(ref.cwd) && samePath(ref.cwd, currentCwd) };
 			groups.set(key, group);
 		}
 		group.count += 1;
@@ -1278,38 +1803,67 @@ async function listProjects(b: Bridge) {
 
 /** Sidebar metadata: every project, but no transcript bodies. */
 async function listGroups(b: Bridge): Promise<unknown> {
-	const refs = await workspaceRefs(b, currentWorkspace(b));
-	const groups = projectGroups(b, refs);
+	const viewed = viewedTarget(b);
+	const refs = await workspaceRefs(b, targetWorkspace(b, viewed));
+	const groups = projectGroups(b, refs, targetCwd(b, viewed));
 	// Only projects with a saved conversation are listed. The current project is not injected as an
 	// empty group: a New Work / New Chat still has no row, and deleting a workspace has to remove it
 	// from the sidebar right away instead of leaving its name behind with "No sessions". The group
 	// comes back with the first message, because that message is what puts a row in it.
 	return {
-		current: b.ctx.cwd,
-		currentFile: b.ctx.sessionManager.getSessionFile(),
-		mode: currentWorkspace(b),
+		current: targetCwd(b, viewed),
+		currentFile: targetManager(b, viewed).getSessionFile(),
+		mode: targetWorkspace(b, viewed),
 		groups,
 	};
 }
 
 async function listSessions(b: Bridge, cwd: string): Promise<unknown> {
+	const viewed = viewedTarget(b);
 	// Header-only sessions are the empty target of a workspace switch; they join Recents with their
 	// first message, not before.
-	const sessions = await projectSessionsForCwd(b, currentWorkspace(b), cwd);
+	const sessions = await projectSessionsForCwd(b, targetWorkspace(b, viewed), cwd);
 	return {
-		current: b.ctx.sessionManager.getSessionFile(),
+		current: targetManager(b, viewed).getSessionFile(),
 		cwd,
-		sessions: sessions.map((session) => ({
-			path: session.path,
-			id: session.id,
-			name: session.name,
-			cwd: session.cwd,
-			modified: session.modified,
-			messageCount: session.messageCount,
-			// Whitespace collapsed here, not in the page: a title is one line, whatever was pasted.
-			firstMessage: session.firstMessage.replace(/\s+/g, " ").trim().slice(0, SESSION_TITLE_MAX),
-		})),
+		sessions: sessions.map((session) => {
+			const workerSid = b.workersByPath.get(pathKey(session.path));
+			const worker = workerSid ? b.workers.get(workerSid) : undefined;
+			const host = hostFile(b);
+			const isHost = Boolean(host && samePath(host, session.path));
+			return {
+				path: session.path,
+				id: session.id,
+				name: session.name,
+				cwd: session.cwd,
+				modified: session.modified,
+				messageCount: session.messageCount,
+				// The sidebar shows a blue spinner while a turn runs and a green dot when it finished
+				// in the background, so a reader in another conversation still sees what is happening.
+				running: worker ? worker.running : isHost ? !b.ctx.isIdle() : false,
+				done: worker ? worker.done : isHost ? b.hostDone === true : false,
+				// Whitespace collapsed here, not in the page: a title is one line, whatever was pasted.
+				firstMessage: session.firstMessage.replace(/\s+/g, " ").trim().slice(0, SESSION_TITLE_MAX),
+			};
+		}),
 	};
+}
+
+/** The recorded prompt of a user message, for retrying it in a background runtime. */
+function messageText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return (content as Record<string, unknown>[])
+		.filter((block) => block?.type === "text" && typeof block.text === "string")
+		.map((block) => String(block.text))
+		.join("\n");
+}
+
+function messageImages(content: unknown): ImageBlock[] {
+	if (!Array.isArray(content)) return [];
+	return (content as Record<string, unknown>[])
+		.filter((block) => block?.type === "image" && typeof block.data === "string")
+		.map((block) => ({ type: "image" as const, mimeType: String(block.mimeType ?? ""), data: String(block.data) }));
 }
 
 /** The text a conversation search can match: prose, not thinking blocks, tool arguments or images. */
@@ -1388,6 +1942,19 @@ function requestTree(b: Bridge, entryId: string): Promise<SwitchOutcome> {
 	return requestSwitch(b, ["tree", entryId].join(" "));
 }
 
+/** Same leaf move for a background runtime, which navigates its own session. */
+async function navigateTarget(b: Bridge, target: Target, entryId: string): Promise<SwitchOutcome> {
+	if (target.kind === "host") return await requestTree(b, entryId);
+	const opened = await ensureWorkerSession(b, target.worker);
+	if (!opened.ok) return { ok: false, message: opened.message };
+	try {
+		const result = await opened.session.navigateTree(entryId);
+		return result.cancelled ? { ok: false, message: "navigation cancelled" } : { ok: true };
+	} catch (error) {
+		return { ok: false, message: error instanceof Error ? error.message : "navigation failed" };
+	}
+}
+
 /** Wait until the session grew a leaf past `before`: the just-sent prompt is persisted by then. */
 async function waitForLeafChange(b: Bridge, before: string | null, timeoutMs: number): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
@@ -1420,6 +1987,11 @@ function routePath(req: IncomingMessage, pathname: string): { path: string; moun
 	return { path: path.startsWith("/") ? path : `/${path}`, mount };
 }
 
+/** The session a request is about. Unknown sids are a stale tab, not the host session. */
+function requestTarget(b: Bridge, sid: unknown): Target | null {
+	return targetOf(b, sid) ?? null;
+}
+
 async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Promise<void> {
 	// `new URL("//x/y")` parses as a scheme-relative host, so the leading slash is collapsed first:
 	// a doubled slash must stay a path, not become a hostname.
@@ -1447,8 +2019,10 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 	if (url.searchParams.get("t") !== b.token) return send(res, 401, "bad token");
 
 	if (req.method === "GET" && path === "/api/state") {
+		const target = requestTarget(b, url.searchParams.get("sid"));
+		if (!target) return send(res, 404, "unknown session");
 		// the header refresh runs on every event and only reads counts: no reason to ship the page
-		return send(res, 200, JSON.stringify(snapshot(b, url.searchParams.get("meta") === "1")), "application/json");
+		return send(res, 200, JSON.stringify(snapshot(b, target, url.searchParams.get("meta") === "1")), "application/json");
 	}
 
 	// one page of older messages, ending right before `before`
@@ -1487,7 +2061,9 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 	if (req.method === "GET" && path === "/api/messages") {
 		const before = Number(url.searchParams.get("before"));
 		if (!Number.isInteger(before) || before <= 0) return send(res, 400, "before must be a positive index");
-		const messages = contextMessages(b);
+		const target = requestTarget(b, url.searchParams.get("sid"));
+		if (!target) return send(res, 404, "unknown session");
+		const messages = contextMessages(targetManager(b, target));
 		const page = pageOf(messages, Math.min(before, messages.length));
 		return send(
 			res,
@@ -1503,7 +2079,9 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		const to = Number(url.searchParams.get("to"));
 		if (!Number.isInteger(from) || from < 0) return send(res, 400, "from must be a message index");
 		const end = Math.min(Number.isInteger(to) ? to : from, from + STEP_RANGE_MAX - 1);
-		const messages = contextMessages(b);
+		const target = requestTarget(b, url.searchParams.get("sid"));
+		if (!target) return send(res, 404, "unknown session");
+		const messages = contextMessages(targetManager(b, target));
 		const start = Math.min(from, messages.length);
 		let stop = Math.min(Math.max(end + 1, start), messages.length);
 		// a tool result is its own message right after the call that produced it, and the row only
@@ -1559,7 +2137,7 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 
 	if (req.method === "GET" && path === "/api/sessions") {
 		const cwd = url.searchParams.get("cwd");
-		return send(res, 200, JSON.stringify(await listSessions(b, cwd ?? b.ctx.cwd)), "application/json");
+		return send(res, 200, JSON.stringify(await listSessions(b, cwd ?? targetCwd(b, viewedTarget(b)))), "application/json");
 	}
 
 	// Full-text search across this project's conversations. `SessionManager.list` already read every
@@ -1570,7 +2148,7 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		if (!raw) return send(res, 200, JSON.stringify({ results: [] }), "application/json");
 		if (raw.length > SEARCH_QUERY_MAX) return send(res, 400, "query too long");
 		const query = raw.toLowerCase();
-		const refs = await workspaceRefs(b, currentWorkspace(b));
+		const refs = await workspaceRefs(b, targetWorkspace(b, viewedTarget(b)));
 		const results: unknown[] = [];
 		for (const ref of refs) {
 			if (!ref.hasMessage) continue;
@@ -1628,6 +2206,14 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		const images = parseImages(body.images);
 		if (typeof images === "string") return send(res, 400, images);
 		if (!text && images.length === 0) return send(res, 400, "empty prompt");
+		const target = requestTarget(b, body.sid ?? url.searchParams.get("sid"));
+		if (!target) return send(res, 404, "unknown session");
+		// A background session runs its own loop: the page's queue is per session, so "busy" here only
+		// concerns the conversation the reader is looking at.
+		if (target.kind === "worker") {
+			const outcome = await promptWorker(b, target.worker, text, images);
+			return send(res, outcome.ok ? 200 : outcome.message === "busy" ? 409 : 409, outcome.ok ? "ok" : outcome.message);
+		}
 		if (images.length > 0 && !b.ctx.model?.input?.includes("image")) {
 			return send(res, 409, `${b.ctx.model?.id ?? "this model"} does not accept images`);
 		}
@@ -1684,6 +2270,18 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 			body = {};
 		}
 		const instructions = typeof body.instructions === "string" ? body.instructions.trim() : "";
+		const target = requestTarget(b, body.sid ?? url.searchParams.get("sid"));
+		if (!target) return send(res, 404, "unknown session");
+		if (target.kind === "worker") {
+			const opened = await ensureWorkerSession(b, target.worker);
+			if (!opened.ok) return send(res, 409, opened.message);
+			try {
+				await opened.session.compact(instructions || undefined);
+			} catch (error) {
+				return send(res, 409, error instanceof Error ? error.message : "compaction failed");
+			}
+			return send(res, 200, "ok");
+		}
 		// compact() is fire-and-forget by design, so wrap its callbacks in a promise the page can wait on.
 		const outcome = await new Promise<{ ok: boolean; message: string }>((done) => {
 			const timer = setTimeout(() => done({ ok: false, message: "compaction timed out" }), 300_000);
@@ -1720,7 +2318,10 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 	}
 
 	if (req.method === "POST" && path === "/api/abort") {
-		b.ctx.abort();
+		const target = requestTarget(b, url.searchParams.get("sid"));
+		if (!target) return send(res, 404, "unknown session");
+		if (target.kind === "host") b.ctx.abort();
+		else void target.worker.session?.abort();
 		return send(res, 200, "ok");
 	}
 
@@ -1738,11 +2339,19 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		const body = await readJson(req);
 		const provider = typeof body.provider === "string" ? body.provider : "";
 		const id = typeof body.id === "string" ? body.id : "";
+		const target = requestTarget(b, body.sid ?? url.searchParams.get("sid"));
+		if (!target) return send(res, 404, "unknown session");
 		const model = b.ctx.modelRegistry.find(provider, id);
 		if (!model) return send(res, 404, "unknown model");
-		const ok = await b.api.setModel(model as never);
-		if (!ok) return send(res, 409, `no credentials for ${provider}/${id}`);
-		broadcast(b, { type: "state_changed" });
+		if (target.kind === "host") {
+			const ok = await b.api.setModel(model as never);
+			if (!ok) return send(res, 409, `no credentials for ${provider}/${id}`);
+		} else {
+			const opened = await ensureWorkerSession(b, target.worker);
+			if (!opened.ok) return send(res, 409, opened.message);
+			await opened.session.setModel(model as never);
+		}
+		broadcast(b, { type: "state_changed", sid: target.sid });
 		return send(res, 200, "ok");
 	}
 
@@ -1750,28 +2359,57 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		const body = await readJson(req);
 		const level = typeof body.level === "string" ? body.level : "";
 		if (!ALL_LEVELS.includes(level)) return send(res, 400, "unknown level");
-		b.api.setThinkingLevel(level as never);
-		broadcast(b, { type: "state_changed" });
+		const target = requestTarget(b, body.sid ?? url.searchParams.get("sid"));
+		if (!target) return send(res, 404, "unknown session");
+		if (target.kind === "host") {
+			b.api.setThinkingLevel(level as never);
+		} else {
+			const opened = await ensureWorkerSession(b, target.worker);
+			if (!opened.ok) return send(res, 409, opened.message);
+			opened.session.setThinkingLevel(level as never);
+		}
+		broadcast(b, { type: "state_changed", sid: target.sid });
 		return send(res, 200, "ok");
 	}
 
 	if (req.method === "POST" && path === "/api/mode") {
 		const body = await readJson(req, 1024);
 		if (body.mode !== "work" && body.mode !== "chat") return send(res, 400, "mode must be work or chat");
-		const outcome = await switchWorkspace(b, body.mode);
-		if (!outcome.ok) return send(res, 409, outcome.message ?? "switch failed");
-		return send(res, 200, JSON.stringify({ mode: currentWorkspace(b) }), "application/json");
+		// The workspace belongs to the conversation, not to the process: open the other workspace's
+		// session for this project instead of switching the terminal's runtime.
+		const viewed = viewedTarget(b);
+		const cwd = targetCwd(b, viewed);
+		const sessionPath = await workspaceSessionPath(b, body.mode, cwd);
+		const outcome = attachSession(b, sessionPath);
+		if (!outcome.ok) return send(res, 409, outcome.message);
+		b.workspaceFiles[workspaceKey(body.mode, cwd)] = sessionPath;
+		broadcast(b, { type: "session_switch", sid: outcome.sid });
+		return send(res, 200, JSON.stringify({ mode: body.mode, sid: outcome.sid, path: sessionPath }), "application/json");
 	}
 
-	if (req.method === "POST" && path === "/api/resume") {
-		const body = await readJson(req);
+	/**
+	 * Open a conversation in the page. The terminal's own session is opened in place; every other one
+	 * gets its own background runtime, so this never stops a turn and never moves the terminal.
+	 */
+	if (req.method === "POST" && (path === "/api/attach" || path === "/api/resume")) {
+		let body: Record<string, unknown>;
+		try {
+			body = await readJson(req);
+		} catch {
+			body = {};
+		}
 		const sessionPath = typeof body.path === "string" ? body.path : "";
 		if (!sessionPath) return send(res, 400, "missing path");
-		rememberCurrent(b);
-		const outcome = await requestSwitch(b, `resume ${sessionPath}`);
-		if (!outcome.ok) return send(res, 409, outcome.message ?? "switch failed");
-		broadcast(b, { type: "session_switch" });
-		return send(res, 200, "ok");
+		const outcome = attachSession(b, sessionPath);
+		if (!outcome.ok) return send(res, 409, outcome.message);
+		const target = targetOf(b, outcome.sid);
+		broadcast(b, { type: "session_switch", sid: outcome.sid });
+		return send(
+			res,
+			200,
+			JSON.stringify({ sid: outcome.sid, path: sessionPath, mode: target ? targetWorkspace(b, target) : "work" }),
+			"application/json",
+		);
 	}
 
 	if (req.method === "POST" && path === "/api/delete") {
@@ -1784,6 +2422,20 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		// Never delete arbitrary paths: every target has to be a session either workspace lists.
 		const known = await allSessionPaths(b);
 		if (targets.some((target) => !known.has(target))) return send(res, 404, "unknown session");
+		// A background runtime holds the file it writes to: stop it before the file goes away.
+		for (const target of targets) {
+			const sid = b.workersByPath.get(pathKey(target));
+			const worker = sid ? b.workers.get(sid) : undefined;
+			if (!worker) continue;
+			if (worker.running) {
+				try {
+					await worker.session?.abort();
+				} catch {
+					// the delete below reports whatever is left
+				}
+			}
+			disposeWorker(b, worker);
+		}
 		const active = b.ctx.sessionManager.getSessionFile();
 		if (active && targets.includes(active)) {
 			// The active session can go too, but not while it is being written to. Move the runtime to
@@ -1825,8 +2477,15 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 			// Goes through the live session so its own event updates every attached page.
 			b.api.setSessionName(name);
 		} else {
-			// Not running: append the same session_info entry the live path writes.
-			SessionManager.open(target).appendSessionInfo(name);
+			// A background runtime writes through its own manager; anything else is read from disk.
+			const sid = b.workersByPath.get(pathKey(target));
+			const worker = sid ? b.workers.get(sid) : undefined;
+			if (worker) {
+				worker.manager.appendSessionInfo(name);
+				broadcastStatus(b, worker);
+			} else {
+				SessionManager.open(target).appendSessionInfo(name);
+			}
 		}
 		invalidateSessions(b);
 		broadcast(b, { type: "sessions_changed" });
@@ -1835,8 +2494,8 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 
 	if (req.method === "POST" && path === "/api/new") {
 		const body = await readJson(req, 16 * 1024);
-		if (!b.ctx.isIdle()) return send(res, 409, "stop the current turn first");
-		const mode: Workspace = body.mode === "chat" ? "chat" : body.mode === "work" ? "work" : currentWorkspace(b);
+		const viewed = viewedTarget(b);
+		const mode: Workspace = body.mode === "chat" ? "chat" : body.mode === "work" ? "work" : targetWorkspace(b, viewed);
 		const cwd = projectPath(b, typeof body.cwd === "string" ? body.cwd : "");
 		try {
 			await mkdir(cwd, { recursive: true });
@@ -1844,9 +2503,15 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		} catch (error) {
 			return send(res, 400, `could not use ${cwd}: ${error instanceof Error ? error.message : "not a directory"}`);
 		}
-		const outcome = await createAndSwitch(b, mode, cwd);
-		if (!outcome.ok) return send(res, 409, outcome.message ?? "switch failed");
-		return send(res, 200, JSON.stringify({ path: outcome.path, cwd, mode }), "application/json");
+		// A new conversation runs in the page as its own runtime: the terminal keeps whatever it has.
+		const outcome = await createAttachedSession(b, mode, cwd);
+		if (!outcome.ok) return send(res, 409, outcome.message);
+		return send(
+			res,
+			200,
+			JSON.stringify({ path: outcome.path, cwd, mode, sid: outcome.sid }),
+			"application/json",
+		);
 	}
 
 	/**
@@ -1858,15 +2523,17 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		const body = await readJson(req);
 		const entryId = typeof body.entryId === "string" ? body.entryId : "";
 		if (!entryId) return send(res, 400, "missing entryId");
+		const target = requestTarget(b, body.sid ?? url.searchParams.get("sid"));
+		if (!target) return send(res, 404, "unknown session");
 		// Only a prompt the transcript shows can be rerun: the entry has to be a user message on the
 		// current branch, which is exactly what the page offers the button for.
-		const target = contextMessages(b).find((message) => message.entryId === entryId);
-		if (!target) return send(res, 404, "unknown entry");
-		if (target.role !== "user") return send(res, 400, "only a prompt can be rerun");
-		const outcome = await requestTree(b, entryId);
+		const found = contextMessages(targetManager(b, target)).find((message) => message.entryId === entryId);
+		if (!found) return send(res, 404, "unknown entry");
+		if (found.role !== "user") return send(res, 400, "only a prompt can be rerun");
+		const outcome = await navigateTarget(b, target, entryId);
 		if (!outcome.ok) return send(res, 409, outcome.message ?? "navigation failed");
 		// every open tab is now reading a different branch
-		broadcast(b, { type: "session_tree" });
+		broadcast(b, { type: "session_tree", sid: target.sid });
 		return send(res, 200, "ok");
 	}
 
@@ -1879,24 +2546,37 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		const body = await readJson(req);
 		const entryId = typeof body.entryId === "string" ? body.entryId : "";
 		if (!entryId) return send(res, 400, "missing entryId");
-		if (!b.ctx.isIdle()) return send(res, 409, "stop the current turn first");
-		const target = contextMessages(b).find((message) => message.entryId === entryId);
-		if (!target) return send(res, 404, "unknown entry");
-		if (target.role !== "user") return send(res, 400, "only a prompt can be retried");
-		const outcome = await requestTree(b, entryId);
+		const request = requestTarget(b, body.sid ?? url.searchParams.get("sid"));
+		if (!request) return send(res, 404, "unknown session");
+		if (targetRunning(b, request)) return send(res, 409, "stop the current turn first");
+		const found = contextMessages(targetManager(b, request)).find((message) => message.entryId === entryId);
+		if (!found) return send(res, 404, "unknown entry");
+		if (found.role !== "user") return send(res, 400, "only a prompt can be retried");
+		const outcome = await navigateTarget(b, request, entryId);
 		if (!outcome.ok) return send(res, 409, outcome.message ?? "navigation failed");
+		if (request.kind === "worker") {
+			const opened = await ensureWorkerSession(b, request.worker);
+			if (!opened.ok) return send(res, 409, opened.message);
+			const content = found.content;
+			const text = typeof content === "string" ? content : messageText(content);
+			const images = typeof content === "string" ? [] : messageImages(content);
+			const sent = await promptWorker(b, request.worker, text, images);
+			if (!sent.ok) return send(res, 409, sent.message);
+			broadcast(b, { type: "session_tree", sid: request.sid });
+			return send(res, 200, "ok");
+		}
 		// Broadcast only once the prompt is in the session: a page that reloads the truncated branch
 		// must find it there, or a tab that already received the `message_end` would either lose the
 		// row or show it twice depending on which response landed first.
 		const parent = b.ctx.sessionManager.getLeafId();
 		try {
 			// the recorded content, not a rebuilt string: images ride along untouched
-			b.api.sendUserMessage(target.content as string | (TextBlock | ImageBlock)[]);
+			b.api.sendUserMessage(found.content as string | (TextBlock | ImageBlock)[]);
 			await waitForLeafChange(b, parent, 2_000);
 		} catch (error) {
 			return send(res, 409, error instanceof Error ? error.message : "send failed");
 		}
-		broadcast(b, { type: "session_tree" });
+		broadcast(b, { type: "session_tree", sid: request.sid });
 		return send(res, 200, "ok");
 	}
 
@@ -2560,9 +3240,19 @@ async function start(api: ExtensionAPI, ctx: ExtensionContext): Promise<Bridge> 
 		tunnelRevives: 0,
 		tunnelBusy: false,
 		tunnelTimer: undefined,
+		workers: new Map(),
+		workersByPath: new Map(),
+		viewSid: "host",
+		hostLive: null,
+		hostRunning: false,
+		hostDone: false,
+		modelRuntime: undefined,
 		// `b` is only read when a request arrives, after the literal is assigned
 		handle: (req, res) => handle(b, req, res),
 	};
+
+	const sweep = setInterval(() => sweepWorkers(b), 5 * 60 * 1000);
+	sweep.unref?.();
 
 	server.on("request", (req, res) => {
 		// Read through the bridge: a reloaded module replaces `handle`, so routing fixes apply without
@@ -2605,7 +3295,10 @@ export default function webui(api: ExtensionAPI) {
 		process.on("exit", killServices);
 	}
 	api.on("session_shutdown", (event) => {
-		if (event.reason === "quit") killServices();
+		if (event.reason !== "quit") return;
+		killServices();
+		const b = store.__nifeWebui;
+		if (b) for (const worker of [...b.workers.values()]) disposeWorker(b, worker);
 	});
 
 	api.registerCommand("webui", {
@@ -2715,6 +3408,13 @@ export default function webui(api: ExtensionAPI) {
 		// A fresh session has a file path before its first prompt, but no file on disk yet. An empty
 		// header-only session also waits for its first message before it belongs in Recents.
 		const file = ctx.sessionManager.getSessionFile();
+		// The terminal just moved onto a file a background runtime already writes: one runtime per
+		// session file, so the terminal wins and the worker goes away instead of appending twice.
+		if (file) {
+			const sid = b.workersByPath.get(pathKey(file));
+			const worker = sid ? b.workers.get(sid) : undefined;
+			if (worker) disposeWorker(b, worker);
+		}
 		b.persistedFile = file && existsSync(file) && hasMessages(ctx) ? file : undefined;
 		patchDialogs(ctx, b);
 		// /reload keeps the bridge (globalThis) but not this module's fields, and it drops the timer
@@ -2728,6 +3428,12 @@ export default function webui(api: ExtensionAPI) {
 		b.workspaceFiles ??= {};
 		b.sessionIndexCache ??= {};
 		b.projectSessionCache ??= {};
+		b.workers ??= new Map();
+		b.workersByPath ??= new Map();
+		b.viewSid ??= "host";
+		b.hostLive ??= null;
+		b.hostRunning ??= false;
+		b.hostDone ??= false;
 		invalidateSessions(b);
 		b.legacyWorkDir ??= legacyWorkDirOf(ctx.sessionManager.getSessionDir());
 		if (b.publicUrls.size) scheduleTunnel(b, TUNNEL_HEARTBEAT_MS);
@@ -2736,8 +3442,8 @@ export default function webui(api: ExtensionAPI) {
 		// Chat workspace sessions never declare tools. Work sessions get nife's defaults from the
 		// fresh runtime created by switchSession/newSession.
 		if (workspace === "chat") b.api.setActiveTools([]);
-		broadcast(b, { type: "session_start", reason: event.reason });
-		broadcast(b, { type: "mode_changed", mode: workspace });
+		broadcast(b, { type: "session_start", reason: event.reason, sid: "host", path: file ?? undefined });
+		broadcast(b, { type: "mode_changed", mode: workspace, sid: "host" });
 	});
 
 	api.on("before_agent_start", () => {
@@ -2754,18 +3460,34 @@ export default function webui(api: ExtensionAPI) {
 		// conversation content: a snapshot drops them, so the live stream must not deliver them either
 		// (a forwarded system message used to show up as a stray "Note (system)" row until a reload).
 		if (isHiddenMessage(event.message)) return;
+		const b = store.__nifeWebui;
+		if (b && event.message.role === "assistant") b.hostLive = { text: "", thinking: "" };
 		forward({ type: "message_start", message: event.message });
 	});
 	api.on("message_update", (event) => {
 		// Send only the delta: event.message is cumulative and would grow O(n^2) on the wire.
-		forward({ type: "message_update", delta: event.assistantMessageEvent });
+		const b = store.__nifeWebui;
+		const delta = event.assistantMessageEvent;
+		if (b?.hostLive) {
+			if (delta.type === "text_delta") b.hostLive.text += delta.delta;
+			else if (delta.type === "thinking_delta") b.hostLive.thinking += delta.delta;
+			else if (delta.type === "error") b.hostLive.text += `\n${delta.error?.errorMessage ?? "request failed"}`;
+		}
+		forward({ type: "message_update", delta });
 	});
 	api.on("message_end", (event) => {
 		const b = store.__nifeWebui;
+		if (b) b.hostLive = null;
 		if (!isHiddenMessage(event.message)) forward({ type: "message_end", message: event.message });
 		if (b) announceMessageEntry(b, event.message);
 	});
 	api.on("agent_start", () => {
+		const b = store.__nifeWebui;
+		if (b) {
+			b.hostRunning = true;
+			b.hostDone = false;
+			hostStatus(b);
+		}
 		forward({ type: "agent_start" });
 	});
 	api.on("agent_settled", (event) => {
@@ -2775,12 +3497,18 @@ export default function webui(api: ExtensionAPI) {
 		// Name the conversation once, after the first completed turn. It is a separate model call,
 		// never part of the session transcript.
 		const b = store.__nifeWebui;
-		if (b) void autoTitle(b);
+		if (b) {
+			b.hostRunning = false;
+			b.hostLive = null;
+			b.hostDone = b.viewSid !== "host";
+			hostStatus(b);
+			void autoTitle(b);
+		}
 	});
 	api.on("turn_end", () => {
 		// One step (assistant message + its tool results) is committed: the footer can move now.
 		const b = store.__nifeWebui;
-		if (b) broadcastStats(b);
+		if (b) broadcastStats(b, { kind: "host", sid: "host" });
 	});
 	// Threshold and overflow compaction happen without a click; the page needs to know either way.
 	api.on("session_before_compact", (event) => {

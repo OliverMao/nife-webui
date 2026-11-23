@@ -174,21 +174,33 @@ From the browser:
   level of subdirectories without leaving the server. Picking another directory moves the
   still-empty session there, the last choice is remembered in `localStorage`, and once the first
   message is sent the chip disappears: nife fixes a session's `cwd` at that point
-- left sidebar lists sessions for the current workspace across **all projects**, click to switch
-  (`/resume`). Rows are grouped under foldable project headers; the active/most recent project is
-  expanded and marked with a dot, other groups follow by latest activity and are collapsed. The
-  first group's rows load immediately; expanding any other group fetches just that project's
-  sessions, so a large old session tree does not delay the first paint. A trash button on each
+- left sidebar lists sessions for the current workspace across **all projects**, click to switch.
+  Rows are grouped under foldable project headers; the active/most recent project is expanded and
+  marked with a dot, other groups follow by latest activity and are collapsed. The first group's
+  rows load immediately; expanding any other group fetches just that project's sessions, so a large
+  old session tree does not delay the first paint.
+- **background sessions**: opening a conversation attaches it, it does not replace the terminal's
+  runtime. The terminal's own session runs in place; every other conversation the page opens gets
+  its own in-process `AgentSession` (`POST /api/attach`), so switching the page away from a running
+  turn keeps it running instead of answering `stop the current turn first`. Up to 3 background
+  runtimes live at once (the oldest idle one is recycled, never the one on screen); a run that
+  started there keeps going while the page reads something else, and every per-session endpoint
+  takes a `sid` so a turn is never confused with the conversation next to it. Rows show a blue
+  spinner while a turn runs and a green dot when it finished unattended, with a toast naming the
+  conversation; opening the row clears the dot. A running conversation can still be aborted, or
+  deleted (which stops it first). Idle runtimes are rebuilt from the session file on the next visit,
+  and the page remembers which conversation it was on across reloads A trash button on each
   project header deletes that workspace's conversations after one confirmation; the project
   directory and its files are left untouched, and the header disappears with its last conversation
   instead of lingering as an empty group. A project only appears once it has a saved conversation:
   an empty New Work / New Chat is not a row, so there is no group to leave behind either. The
   footer always shows the active project. Search scans every conversation in the current workspace,
   again across projects, and its results carry a project label
-- the mode selector switches workspace but keeps the current project directory: it resumes that
-  project's last session in the target workspace, or opens an empty New Work / New Chat for it.
-  Switching pauses the page queue because the active session changed. Each workspace has its own
-  Recents, pins and search
+- the mode selector switches workspace but keeps the current project directory: it opens that
+  project's last session in the target workspace, or an empty New Work / New Chat for it. Each
+  workspace has its own Recents, pins and search; the page queue belongs to the conversation, so it
+  is parked (not delivered into the other session) when the view moves. The terminal is never moved
+  by the page: it keeps whatever session it had
 - Chat workspace sessions always declare no tools and use nife's chat system prompt. The workspace
   is derived from the session file location, so `/new`, `/resume` and `/fork` stay inside it.
   Dropped images attach as image content for vision models; text, code, CSV, Markdown, JSON and

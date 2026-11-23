@@ -5,7 +5,7 @@ import LiveMessage from "./LiveMessage.vue";
 import LiveThinking from "./LiveThinking.vue";
 import MessageEdit from "./MessageEdit.vue";
 import MessageItem from "./MessageItem.vue";
-import { api, uploadFile } from "./bridge.js";
+import { api, sessionFile, sessionSid, setSessionSid, uploadFile } from "./bridge.js";
 import { previewImage } from "./images.js";
 import FileIcon from "./FileIcon.vue";
 import { formatBytes } from "./files.js";
@@ -1334,7 +1334,45 @@ function stampEntryId(entryId) {
 	orphanEntryIds.push(entryId);
 }
 
+/** Sidebar rows of every project that is loaded, so a status event can patch them in place. */
+function patchSessionRow(path, patch) {
+	if (!path) return;
+	const found = sessions.value.find((session) => session.path === path);
+	if (found) Object.assign(found, patch);
+	for (const rows of Object.values(sessionsByProject.value)) {
+		for (const session of rows) if (session.path === path) Object.assign(session, patch);
+	}
+}
+
+/** A background turn finished while the reader was elsewhere: dot on the row, toast on the page. */
+function sessionFinished(payload) {
+	const known = sessions.value.find((session) => session.path === payload.path);
+	const label = known ? sessionTitle(known) : payload.name || projectName(payload.cwd) || "会话";
+	showNotice(`「${label}」已完成`);
+	// the row's time and title changed with the turn; the list is cheap enough to re-read
+	void loadGroups({ refresh: true });
+}
+
+/** Events from another conversation still update its row, but never this transcript. */
+function fromOtherSession(payload) {
+	if (!payload.sid || payload.sid === sessionSid()) return false;
+	// A confirmation raised by a background run still needs an answer, whoever it belongs to.
+	if (payload.type === "dialog") return false;
+	if (payload.type === "session_status") {
+		patchSessionRow(payload.path, { running: Boolean(payload.running), done: Boolean(payload.done) });
+		if (!payload.running && payload.done) sessionFinished(payload);
+		return true;
+	}
+	if (payload.type === "sessions_changed" || payload.type === "notice") {
+		if (payload.type === "notice" && payload.text) showNotice(payload.text);
+		if (payload.type === "sessions_changed") void loadGroups({ refresh: true });
+		return true;
+	}
+	return true;
+}
+
 function handle(payload) {
+	if (fromOtherSession(payload)) return;
 	switch (payload.type) {
 		case "message_start":
 			if (payload.message?.role === "assistant") {
@@ -1375,6 +1413,10 @@ function handle(payload) {
 			clearQueuedErrors();
 			refreshMeta();
 			void drain();
+			break;
+		case "session_status":
+			// the viewed conversation: the local flags already track it, but the row must too
+			patchSessionRow(payload.path, { running: Boolean(payload.running), done: Boolean(payload.done) });
 			break;
 		case "session_info_changed":
 			state.value.name = payload.name;
@@ -1478,9 +1520,23 @@ function connect() {
 }
 
 async function loadState() {
-	const response = await fetch(api("state"));
+	let response = await fetch(api("state"));
+	if (response.status === 404) {
+		// The background runtime behind this sid was evicted, the file was deleted, or the bridge
+		// restarted. Try the same conversation again; with no file left, fall back to the terminal's.
+		const path = state.value.sessionFile || sessionFile();
+		setSessionSid("host");
+		if (path) {
+			const reattach = await postDetailed("attach", { path });
+			if (reattach.ok) setSessionSid(reattach.data?.sid, path);
+		}
+		response = await fetch(api("state"));
+	}
 	if (!response.ok) throw new Error(`state ${response.status}`);
 	const loaded = await response.json();
+	// The tab remembers where it was: a reload keeps the conversation, and the sid survives only
+	// while this nife process does (a stale one falls back to the re-attach above).
+	setSessionSid(loaded.sid, loaded.sessionFile);
 	state.value = loaded;
 	mode.value = loaded.mode === "chat" ? "chat" : "work";
 	subagents.value = loaded.subagents ?? [];
@@ -1496,6 +1552,11 @@ async function loadState() {
 	orphanEntryIds.length = 0;
 	loadedFrom.value = loaded.loadedFrom ?? 0;
 	streaming.value = Boolean(loaded.streaming);
+	// A turn that is still running when the reader comes back: show what it has streamed so far.
+	live.value = loaded.live ? { text: loaded.live.text ?? "", thinking: loaded.live.thinking ?? "" } : null;
+	pendingText = "";
+	pendingThinking = "";
+	if (loaded.sessionFile) currentFile.value = loaded.sessionFile;
 	turnPending = false;
 	openWindow();
 	scrollToBottom();
@@ -1977,7 +2038,21 @@ async function confirmDeleteSessions() {
 		selectedPaths.value = selectedPaths.value.filter((path) => !gone.has(path));
 		pinnedPaths.value = pinnedPaths.value.filter((path) => !gone.has(path));
 		savePinned();
-		if (wasCurrent) await loadState();
+		if (wasCurrent) {
+			// The conversation that was open is gone: start a fresh one in the same project, the way the
+			// bridge used to move the runtime to an empty session.
+			const removed = targets.find((session) => session.path === currentFile.value);
+			const cwd = removed?.cwd || state.value.cwd;
+			setSessionSid("host");
+			carryQueue(null);
+			queue.value = [];
+			const opened = await postDetailed("new", { cwd, mode: mode.value });
+			if (opened.ok) {
+				setSessionSid(opened.data?.sid, opened.data?.path);
+				freshSession.value = true;
+			}
+			await loadState();
+		}
 		await loadGroups({ refresh: true });
 		exitSelect();
 		if (workspace && localStorage.getItem("nife-webui.new-cwd") === workspace.cwd) {
@@ -2020,6 +2095,38 @@ async function postDetailed(path, body) {
 
 async function post(path, body) {
 	return (await postDetailed(path, body)).ok;
+}
+
+/**
+ * Queued sends belong to one conversation: park the current list when the view moves, so a task
+ * typed for A is not delivered into B after a switch.
+ */
+const queues = new Map();
+function carryQueue(nextPath) {
+	const from = currentFile.value;
+	if (from === nextPath) return;
+	if (from) queues.set(from, queue.value.slice());
+	queue.value = nextPath ? [...(queues.get(nextPath) ?? [])] : [];
+	queuePaused.value = false;
+}
+
+/** Open a conversation in the page, then read its state. Switching never stops a running turn. */
+async function attachSession(path) {
+	carryQueue(path);
+	const result = await postDetailed("attach", { path });
+	if (!result.ok) {
+		showNotice(result.message || "could not open the session");
+		return false;
+	}
+	setSessionSid(result.data?.sid, path);
+	if (selecting.value) exitSelect();
+	sidebarOpen.value = false;
+	sessionMenu.value = null;
+	workspaceMenu.value = false;
+	freshSession.value = false;
+	await loadState();
+	await loadGroups({ reveal: true });
+	return true;
 }
 
 let pasteSeq = 0;
@@ -2170,7 +2277,19 @@ async function drain() {
 	}
 	const head = queue.value[0];
 	if (!head) return;
+	const sid = sessionSid();
+	const path = currentFile.value;
 	const result = await dispatch(head);
+	if (sessionSid() !== sid) {
+		// The reader switched conversations while this send was in flight. It was accepted by the old
+		// session or refused by it, but it never belongs in the new session's queue: park the failure
+		// with the conversation it was typed for and leave the view alone.
+		if (!result.ok && path) {
+			const parked = queues.get(path) ?? [];
+			queues.set(path, [{ ...head, error: result.message === "busy" ? "" : result.message || "could not send" }, ...parked]);
+		}
+		return;
+	}
 	if (!result.ok) {
 		// a busy bridge is transient: the item stays at the head with no error and the next settle
 		// sends it (this is the only case where the page and nife briefly disagree about being idle)
@@ -2659,13 +2778,7 @@ async function openSearchResult(group, match) {
 	closeSearch();
 	if (group.cwd) await revealProject(group.cwd);
 	if (path !== currentFile.value) {
-		const result = await postDetailed("resume", { path });
-		if (!result.ok) {
-			showNotice(result.message || "could not switch session");
-			return;
-		}
-		await loadState();
-		await loadGroups({ reveal: true });
+		if (!(await attachSession(path))) return;
 	}
 	if (entryId) await revealEntry(entryId);
 }
@@ -2705,6 +2818,9 @@ async function pickMode(next) {
 	sidebarOpen.value = false;
 	freshSession.value = false;
 	workspaceMenu.value = false;
+	carryQueue(null);
+	queue.value = [];
+	if (result.data?.sid) setSessionSid(result.data.sid);
 	await loadState();
 	loadPinned();
 	await loadGroups({ reveal: true });
@@ -2740,17 +2856,7 @@ async function toggleProxy() {
 }
 
 async function switchTo(path) {
-	sidebarOpen.value = false;
-	sessionMenu.value = null;
-	freshSession.value = false;
-	workspaceMenu.value = false;
-	const result = await postDetailed("resume", { path });
-	if (!result.ok) {
-		showNotice(result.message || "could not switch session");
-		return;
-	}
-	await loadState();
-	await loadGroups({ reveal: true });
+	await attachSession(path);
 }
 
 /**
@@ -2782,6 +2888,7 @@ async function startNewSession(path, { inline = false } = {}) {
 	}
 	newBusy.value = true;
 	newError.value = "";
+	carryQueue(null);
 	const result = await postDetailed("new", { cwd, mode: mode.value });
 	newBusy.value = false;
 	if (!result.ok) {
@@ -2793,6 +2900,8 @@ async function startNewSession(path, { inline = false } = {}) {
 		}
 		return;
 	}
+	setSessionSid(result.data?.sid);
+	queue.value = [];
 	const resolved = typeof result.data?.cwd === "string" ? result.data.cwd : cwd;
 	localStorage.setItem("nife-webui.new-cwd", resolved);
 	newCwd.value = resolved;
@@ -3133,7 +3242,19 @@ onBeforeUnmount(() => {
 							<span class="session-copy">
 								<span class="session-name">{{ sessionTitle(session) }}</span>
 							</span>
-							<span v-if="isPinned(session.path)" class="session-pin" title="Pinned">
+							<span
+							v-if="session.running"
+							class="session-state running"
+							title="正在后台运行"
+							aria-label="running"
+						></span>
+						<span
+							v-else-if="session.done"
+							class="session-state done"
+							title="已完成，点开查看"
+							aria-label="finished"
+						></span>
+						<span v-if="isPinned(session.path)" class="session-pin" title="Pinned">
 								<svg viewBox="0 0 16 16" aria-hidden="true">
 									<path d="M9.6 2.4l4 4-1.7.5-2.3 2.3.5 2.2-1 1L4.4 7.7l1-1 2.2.5L9.9 4.9z" />
 									<path d="M6.3 9.7L3 13" />
