@@ -209,7 +209,12 @@ From the browser:
   end of its body (`web/src/LiveMessage.vue`, `web/src/LiveThinking.vue`), with the answer below the
   fold, so committing the turn only swaps the live body for its block and does not move the page.
   Inside the row, tool steps stay flat one-liners (`Ran npm test`), expand for arguments and output,
-  failed rows are marked in amber
+  failed rows are marked in amber. Before any of that arrives there is a gap - the prompt is
+  uploaded, the agent starts, the model prefills (vLLM pads, a provider queues the request) - which
+  used to look like the page had ignored the send: `waitingForModel` holds a `Working` line in the
+  exact spot the run's summary will occupy (same margin, padding, type and spinner, with a spacer
+  where the chevron goes), and it disappears the moment the answer text, its reasoning or the
+  trailing run's `Working` label takes over
 - panel button collapses the sidebar (remembered in `localStorage`); it becomes an overlay under
   820px, where a dimmed backdrop covers the page: tapping it, switching sessions, or Escape closes
   the overlay, and resizing back to a wide window clears the open state

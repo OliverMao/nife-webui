@@ -464,6 +464,32 @@ svg {
 	left: 0;
 }
 
+/*
+ * The placeholder that holds the run's line while the agent starts or the model prefills: same
+ * metrics and wording as the collapsed run's summary, so the real "Working" row replaces it in
+ * place instead of popping into existence.
+ */
+.msg.waiting {
+	flex-direction: row;
+	align-items: center;
+	gap: 6px;
+	/* the summary it turns into: `.process` margin, `summary` padding and type */
+	margin: 6px auto;
+	padding: 2px 0;
+	color: var(--muted);
+	font-size: 12.5px;
+}
+
+.msg.waiting .waiting-spacer {
+	width: 8px;
+	flex: 0 0 auto;
+}
+
+.msg.waiting .think-icon {
+	width: 14px;
+	height: 14px;
+}
+
 .msg:hover .msg-actions,
 .msg:focus-within .msg-actions {
 	opacity: 1;

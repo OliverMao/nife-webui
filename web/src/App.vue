@@ -523,6 +523,21 @@ const liveHosted = computed(() => liveRowKey.value !== "");
 // condition that only needs "has the answer started" is a computed that turns into a boolean
 const liveHasText = computed(() => Boolean(live.value?.text));
 
+/**
+ * A turn is in flight and nothing has arrived yet - the prompt is uploaded, the agent is starting,
+ * or the model is prefilling/padding before its first token. That gap can be seconds long and used
+ * to look like the page had ignored the send: show the same "Working" line the run will occupy, so
+ * it turns into the real row instead of appearing from nowhere.
+ */
+const waitingForModel = computed(() => {
+	if (!streaming.value && !turnPending) return false;
+	// anything the run itself is already showing takes over: the answer, its reasoning, or a
+	// trailing run whose label is already "Working"
+	if (liveHasText.value || Boolean(live.value?.thinking)) return false;
+	if (workingRowKey.value || liveRowKey.value) return false;
+	return true;
+});
+
 // Which committed rows the reader has open. Bound back onto <details> so a row that the live turn
 // was expanded into can be handed over still open: a body that collapses in the same frame the
 // message lands makes the page jump by its whole height.
@@ -1729,6 +1744,8 @@ async function retryAnswer(item) {
 		}
 		// the branch was truncated under our feet: reload before the new turn streams in
 		await loadState();
+		// loadState clears it, but this turn is ours: keep the "Working" placeholder until it settles
+		turnPending = true;
 	} finally {
 		movingBranch.value = false;
 	}
@@ -2383,6 +2400,18 @@ onBeforeUnmount(() => {
 						:live="live"
 						:hosted="liveHosted"
 					/>
+
+					<!-- The send landed but the run has nothing to show yet: hold the "Working" line for it. -->
+					<div v-if="waitingForModel" class="msg waiting" aria-live="polite">
+						<!-- the width of the real row's chevron: the line must not jump when it replaces this -->
+						<span class="waiting-spacer" aria-hidden="true"></span>
+						<svg class="think-icon spinning" viewBox="0 0 16 16" aria-hidden="true">
+							<path
+								d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M12.6 3.4l-1.4 1.4M4.8 11.2l-1.4 1.4"
+							/>
+						</svg>
+						<span class="tool-verb">Working</span>
+					</div>
 
 					<div v-if="tailPad > 0" class="window-pad" :style="{ height: `${tailPad}px` }" aria-hidden="true"></div>
 				</div>
