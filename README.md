@@ -156,6 +156,10 @@ From the browser:
   row in place (Enter commits, Escape cancels) and prefers the stored `session_info` name over the
   first prompt. Pinned rows sort above the rest and keep a pin mark; the pin list is stored in
   `localStorage` per project directory, because it is a browser preference, not session content
+- after a new conversation's first turn settles, the bridge asks the current model for a short
+  title (a separate request, never part of the transcript) and writes the same `session_info` entry
+  a manual rename writes. The sidebar updates through `sessions_changed`. A manual name always
+  wins; if the title request fails, the first-prompt fallback stays in place
 - the sidebar header keeps the existing `Nife` wordmark, with search and panel buttons on the
   right. Search opens an animated centred palette and scans the user/assistant text of every
   conversation in this project: results group matching snippets under their session title and

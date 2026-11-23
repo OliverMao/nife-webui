@@ -184,6 +184,8 @@ interface Bridge {
 	 * first prompt is persisted, so the sidebar needs one `sessions_changed` at that moment.
 	 */
 	persistedFile: string | undefined;
+	/** Session ids whose automatic title was attempted, so a failure does not retry every turn. */
+	titleTried: Set<string>;
 	/** Uploaded drop target for this bridge; created on first drop, removed when the process exits. */
 	uploadDir: string | undefined;
 	/** no_proxy values saved when the page switched the proxy off, so it can be restored. */
@@ -395,6 +397,67 @@ function announceSessionFile(b: Bridge, left = 5): void {
 	}
 	// Persistence happens after the extension handler returns; retry briefly instead of guessing.
 	if (left > 0) setTimeout(() => announceSessionFile(b, left - 1), 80);
+}
+
+/** Keep a model-written title on one line and strip the wrappers models like to add. */
+function cleanTitle(value: string): string {
+	const first = value.split(/\r?\n/).map((line) => line.trim()).find(Boolean) ?? "";
+	let title = first.replace(/\s+/g, " ").trim();
+	title = title.replace(/^(?:title|session title|标题|会话标题)\s*[:：]\s*/i, "");
+	title = title.replace(/^["'“”‘’`#*\s-]+|["'“”‘’`#*\s]+$/g, "");
+	title = title.replace(/[。.!！?？,，;；:：]+$/g, "");
+	return title.slice(0, 60).trim();
+}
+
+/**
+ * Name a conversation with the model once, after its first turn settles. The session file's
+ * `session_info` entry is the same one a manual rename writes, so the sidebar, search and terminal
+ * all see the title. A failed call leaves the first-prompt fallback in place.
+ */
+async function autoTitle(b: Bridge): Promise<void> {
+	if (!b.ctx.isIdle()) return;
+	const manager = b.ctx.sessionManager;
+	const id = manager.getSessionId();
+	if (b.titleTried.has(id) || manager.getSessionName()) return;
+	const model = b.ctx.model;
+	if (!model) return;
+	const messages = contextMessages(b);
+	const user = messages.find((message) => message.role === "user");
+	if (!user) return;
+	const reply = messages.find((message) => message.role === "assistant" && searchableText(message).trim());
+	const prompt = searchableText(user).replace(/\s+/g, " ").trim().slice(0, 2000);
+	if (!prompt) return;
+	const answer = reply ? searchableText(reply).replace(/\s+/g, " ").trim().slice(0, 2000) : "";
+	b.titleTried.add(id);
+	const source = [`用户: ${prompt}`, answer ? `助手: ${answer}` : ""].filter(Boolean).join("\n\n");
+	try {
+		const result = await b.ctx.modelRegistry
+			.streamSimple(
+				model,
+				{
+					systemPrompt:
+						"You name chat conversations. Reply with a short title only, in the same language as the conversation, " +
+						"at most 8 words or 20 Chinese characters. No quotes, no trailing punctuation, no explanation.",
+					messages: [
+						{
+							role: "user",
+							content: [{ type: "text", text: `Summarize this conversation as a title:\n\n${source}` }],
+							timestamp: Date.now(),
+						},
+					],
+				},
+				{ maxTokens: 128, temperature: 0.2, cacheRetention: "none", timeoutMs: 20_000 },
+			)
+			.result();
+		// The live context may have moved on while the title request ran: never name a different session.
+		if (b.ctx.sessionManager.getSessionId() !== id || b.ctx.sessionManager.getSessionName()) return;
+		const title = cleanTitle(searchableText(result));
+		if (!title) return;
+		b.api.setSessionName(title);
+		broadcast(b, { type: "sessions_changed" });
+	} catch {
+		// Cosmetic: the first-message fallback is still a usable name.
+	}
 }
 
 /** System prompts and hidden extension messages are not conversation content. */
@@ -1923,6 +1986,7 @@ async function start(api: ExtensionAPI, ctx: ExtensionContext): Promise<Bridge> 
 		autoOpened: false,
 		switchRequest: undefined,
 		persistedFile: sessionFile && existsSync(sessionFile) ? sessionFile : undefined,
+		titleTried: new Set(),
 		uploadDir: undefined,
 		proxyBypassSaved: undefined,
 		publicUrls: new Map(),
@@ -2088,6 +2152,7 @@ export default function webui(api: ExtensionAPI) {
 		b.tunnelPending ??= false;
 		b.tunnelRevives ??= 0;
 		b.tunnelBusy ??= false;
+		b.titleTried ??= new Set();
 		if (b.publicUrls.size) scheduleTunnel(b, TUNNEL_HEARTBEAT_MS);
 		broadcast(b, { type: "session_start", reason: event.reason });
 	});
@@ -2116,6 +2181,10 @@ export default function webui(api: ExtensionAPI) {
 		// `aborted` matters to the page: an interrupted turn is a deliberate stop, and the UI queue
 		// must hold the next task instead of starting it.
 		forward({ type: "agent_settled", aborted: Boolean(event?.aborted) });
+		// Name the conversation once, after the first completed turn. It is a separate model call,
+		// never part of the session transcript.
+		const b = store.__nifeWebui;
+		if (b) void autoTitle(b);
 	});
 	api.on("turn_end", () => {
 		// One step (assistant message + its tool results) is committed: the footer can move now.
