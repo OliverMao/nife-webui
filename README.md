@@ -1,8 +1,10 @@
 # nife-webui
 
-Attaches a browser UI to a **running** nife CLI session. The web page is another screen on the
-same `AgentSession` — same messages, same streaming tokens, same approval dialogs. It does not
-start a second agent and does not read the session file.
+Attaches a browser UI to a **running** nife CLI session. The terminal's conversation is the same
+one the page shows — same messages, same streaming tokens, same approval dialogs — and every other
+conversation the page opens runs as its own background session inside the same process, so moving
+between them never stops a turn. Session files are read for the sidebar, search and the transcripts
+the page is not attached to; a live conversation is fed by events, not by tailing its file.
 
 ## Build (maintainer only)
 
