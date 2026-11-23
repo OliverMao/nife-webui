@@ -436,6 +436,56 @@ svg {
 
 .msg.user {
 	align-items: flex-end;
+	/* the row's two icons hang in its bottom margin instead of taking a row of their own */
+	position: relative;
+}
+
+/* Hover-only, and inside the 26px gap below the bubble: a prompt that is done with does not need
+   permanent buttons, and nothing moves when the pointer arrives. Touch devices get them dimmed. */
+.user-actions {
+	position: absolute;
+	right: 0;
+	bottom: -26px;
+	display: flex;
+	align-items: center;
+	gap: 2px;
+	opacity: 0;
+	transition: opacity 120ms ease-out;
+}
+
+.msg.user:hover .user-actions,
+.msg.user:focus-within .user-actions {
+	opacity: 1;
+}
+
+@media (hover: none) {
+	.user-actions {
+		opacity: 0.6;
+	}
+}
+
+.user-action {
+	width: 24px;
+	height: 22px;
+	display: grid;
+	place-items: center;
+	border-radius: 6px;
+	color: var(--muted);
+}
+
+.user-action:hover {
+	background: var(--hover);
+	color: var(--text);
+}
+
+.user-action svg {
+	width: 15px;
+	height: 15px;
+	fill: none;
+	stroke: currentColor;
+	stroke-width: 1.3;
+	stroke-linecap: round;
+	stroke-linejoin: round;
 }
 
 .bubble {
@@ -506,6 +556,92 @@ svg {
 	display: flex;
 	flex-wrap: wrap;
 	gap: 6px;
+}
+
+/*
+ * The prompt, editable in place. DeepSeek's card: the bubble is replaced by a bordered box holding
+ * the attachments, the text and its own Cancel / Send, and the composer is not involved.
+ */
+.edit-card {
+	width: 100%;
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	padding: 10px 12px;
+	border: 1px solid var(--accent);
+	border-radius: 14px;
+	background: #232324;
+}
+
+.edit-card.dragging {
+	background: #26262b;
+	box-shadow: 0 0 0 1px var(--accent);
+}
+
+.edit-card textarea {
+	display: block;
+	width: 100%;
+	min-height: 46px;
+	max-height: 220px;
+	resize: none;
+	border: 0;
+	background: transparent;
+	color: var(--text);
+	font: inherit;
+	line-height: 1.6;
+	overflow-y: auto;
+	outline: none;
+	padding: 0;
+}
+
+.edit-card textarea::placeholder {
+	color: var(--dim);
+}
+
+.edit-foot {
+	display: flex;
+	align-items: center;
+	justify-content: flex-end;
+	gap: 8px;
+}
+
+.edit-cancel,
+.edit-send {
+	height: 30px;
+	padding: 0 14px;
+	border-radius: 15px;
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	font-size: 13px;
+}
+
+.edit-cancel {
+	color: var(--muted);
+	border: 1px solid var(--line);
+}
+
+.edit-cancel:hover:not(:disabled) {
+	background: var(--hover);
+	color: var(--text);
+}
+
+.edit-send {
+	background: var(--accent);
+	color: #0d1220;
+	font-weight: 600;
+}
+
+.edit-send:disabled,
+.edit-cancel:disabled {
+	opacity: 0.5;
+	cursor: not-allowed;
+}
+
+.edit-send svg {
+	width: 14px;
+	height: 14px;
+	stroke-width: 1.8;
 }
 
 .bubble-file {
@@ -1182,6 +1318,11 @@ img {
 	border-radius: 8px;
 }
 
+/* an upload in flight: the chip is there from the first byte, pulsing while the bytes move */
+.file-chip:has(.file-progress) {
+	border-color: rgb(255 255 255 / 16%);
+}
+
 .file-icon {
 	width: 14px;
 	height: 14px;
@@ -1273,6 +1414,35 @@ img {
 	object-fit: cover;
 	border: 1px solid var(--line);
 	border-radius: 8px;
+}
+
+/*
+ * A picture that is still being decoded and re-encoded: the blob URL already shows it, dimmed, with
+ * a spinner on top. Without this the chip only appeared once the work was done, which on a big
+ * photo meant seconds of nothing after a drop.
+ */
+.attachment.loading img {
+	opacity: 0.45;
+}
+
+.attachment.loading::after {
+	content: "";
+	position: absolute;
+	top: 50%;
+	left: 50%;
+	width: 16px;
+	height: 16px;
+	margin: -8px 0 0 -8px;
+	border-radius: 50%;
+	border: 2px solid rgb(255 255 255 / 25%);
+	border-top-color: #fff;
+	animation: attachment-spin 700ms linear infinite;
+}
+
+@keyframes attachment-spin {
+	to {
+		transform: rotate(360deg);
+	}
 }
 
 .attachment-remove {

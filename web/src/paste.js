@@ -76,3 +76,57 @@ export function imageProblem(images) {
 	}
 	return null;
 }
+
+/**
+ * The image type of a file the browser could not describe: a drag can hand over a File with no
+ * `type` and a name without an extension (a screenshot tool, an app's own temp file), and that used
+ * to fall through to the generic uploader - no preview, and the model got a path instead of a
+ * picture. Twelve bytes of header are enough to tell the four formats providers accept.
+ */
+export async function sniffImageType(file) {
+	const head = new Uint8Array(await file.slice(0, 12).arrayBuffer());
+	const starts = (bytes, offset = 0) => bytes.every((byte, index) => head[offset + index] === byte);
+	if (starts([0x89, 0x50, 0x4e, 0x47])) return "image/png";
+	if (starts([0xff, 0xd8, 0xff])) return "image/jpeg";
+	if (starts([0x47, 0x49, 0x46, 0x38])) return "image/gif";
+	if (starts([0x52, 0x49, 0x46, 0x46]) && starts([0x57, 0x45, 0x42, 0x50], 8)) return "image/webp";
+	if (starts([0x42, 0x4d])) return "image/bmp";
+	return null;
+}
+
+/** The file as an image, with its type filled in from the header when the browser gave none. */
+export async function asImageFile(file) {
+	if (imageMimeType(file)) return file;
+	// the copy costs memory, so a file that could never be sent is not worth sniffing
+	if (file.size > IMAGE_MAX_BYTES) return null;
+	const sniffed = await sniffImageType(file);
+	if (!sniffed) return null;
+	const extension = sniffed.split("/")[1];
+	return new File([file], file.name || `image.${extension}`, { type: sniffed });
+}
+
+/**
+ * A drag that carries a link instead of bytes. Pictures on this page are `data:` URLs and pictures
+ * added here are `blob:` URLs, so dragging one of them back into the composer can be turned into a
+ * file again without a round trip - which is what a reader does when reusing an image they already
+ * pasted. Anything else (`http(s)`, a file promise) is not ours to read: the caller tells the
+ * reader to paste it instead.
+ */
+export function imageLinkOf(link) {
+	const url = (link || "").trim().split(/\r?\n/)[0];
+	return /^(data:image\/|blob:)/i.test(url) ? url : null;
+}
+
+/** The picture behind a `data:`/`blob:` drag link, as a File the attachment pipeline understands. */
+export async function imageFromLink(url) {
+	try {
+		const response = await fetch(url);
+		if (!response.ok) return null;
+		const blob = await response.blob();
+		if (!blob.type.startsWith("image/")) return null;
+		if (blob.size > IMAGE_MAX_BYTES) return null;
+		return new File([blob], `dragged.${blob.type.split("/")[1] || "png"}`, { type: blob.type });
+	} catch {
+		return null;
+	}
+}

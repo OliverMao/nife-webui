@@ -27,6 +27,7 @@ WEBUI_TARGET=http://127.0.0.1:PORT npm run dev
 extensions/webui.ts   server: HTTP + SSE, ctx.ui interception, event forwarding
 web/src/App.vue       transcript, composer, dialog modal
 web/src/MessageItem.vue  one transcript row; BlockItem.vue one content block
+web/src/MessageEdit.vue  a prompt's bubble, replaced by its inline editor
 web/src/LiveMessage.vue  the streaming turn: `Working` row (LiveThinking.vue) + answer
 web/src/transcript.js  collapses thinking/tool runs into one row
 web/src/images.js     pasted image -> canvas resize -> base64 ImageContent
@@ -168,6 +169,27 @@ From the browser:
   the parked items follow that turn. `Resume` continues without a new message, `Clear` drops them; failures stay at the head with a
   `Retry` action instead of silently disappearing
 - `+` starts a fresh session (`/new`)
+- hovering a user prompt reveals two icons in the row's own bottom margin - copy, and edit (the
+  DeepSeek row). Edit happens **in place**: the bubble is replaced by an editor card at the same
+  spot (`web/src/MessageEdit.vue`) holding its attachments, its text and its own `Cancel` / `Send`,
+  so the composer is never touched and nothing is destroyed. The card takes images and files the
+  same way the composer does, and shows them with the composer's own `.attachments` row: 56px
+  thumbnails with the corner remove badge, `file-chip`s with name and size, a progress bar while an
+  upload runs. Paste goes through `prepareImage` (a clipboard item's type is trusted, and a File that
+  arrives with an empty type is re-typed before it - a screenshot otherwise looked like a plain
+  file, with no preview and no image block for the model), drop uploads non-images to the bridge's
+  temp dir first, and `Send` waits while an upload is still running. `Cancel` (or Escape) puts the bubble
+  back. `Send` first posts the prompt's session entry id to `POST /api/tree` - which runs
+  `ctx.navigateTree` for that prompt, no branch summary, exactly like `/tree` - reloads the
+  truncated branch, and only then posts the edited prompt, so it lands on the branch it edits and
+  becomes a new branch of the same session file. The TUI editor is filled with the same prompt, so
+  both screens agree. The composer refuses to send while a prompt is being edited (`send or cancel
+  the prompt you are editing first`), and a prompt in a session that is still running is refused
+  with `stop the current turn first`. Under the hood the transcript rows carry `entryId`/`parentId`,
+  and - because nife persists a prompt *after* emitting `message_end` - the bridge announces the id
+  in a follow-up `entry_id` event that the page stamps on the prompt it just received; without that,
+  the newest prompt only became editable after a reload. Only a user message on the current branch
+  can be edited.
 - the answer text is the only thing shown outside a collapsed run: thinking and tool calls always
   sit inside a closed `Worked · 3 tools · 1 thought` row, whether they arrived as separate
   process-only messages (`isProcessItem` in `web/src/transcript.js`) or as adjacent blocks inside a
@@ -243,15 +265,35 @@ From the browser:
   Anything over 2000px or 4.5MB of base64 is redrawn on a canvas first, which is nife's own
   clipboard-image cap (below the providers' 5MB per-image limit); animated GIFs are passed through
   unresized and rejected when too big. Images are refused with a notice when the current model's
-  `input` does not include `image`
+  `input` does not include `image`. A picture that already fits (a clipboard screenshot) is passed
+  through untouched - only a size probe plus a `FileReader` - while a full-resolution file dragged
+  from disk has to be decoded, downscaled and re-encoded; that second pass now aims at the byte
+  budget in one shot (the overshoot says how much smaller it has to be) instead of shrinking 25% per
+  attempt and encoding up to six times. The thumbnail is a **placeholder that exists before the work**:
+  `previewImage()` hands back a blob URL straight away (no decode, the chip is on screen at once),
+  the picture is dimmed with a spinner while `prepareImage` runs, and the data URL replaces the blob
+  when it is done (`?debug=1` on the page logs the milliseconds each attachment spent decoding and
+  re-encoding, which is how to tell that time apart from the browser's own drag handover) - resizing a 2000px PNG used to mean seconds of nothing after a drop. The encode
+  itself goes through `canvas.toBlob` instead of `toDataURL` so the resize does not block the main
+  thread and the spinner keeps turning. Until the swap happens the send button is disabled
+  (`Preparing the attachments…`), and `Cancel`/`×` drops the placeholder too
 - files can be dropped anywhere on the page: the composer outline turns into the drop target, and
   dropped images land in the same thumbnail row as pasted ones. Any other file is uploaded to
   `$TMPDIR/nife-webui/<pid>-<token>/` (`POST /api/upload`, 25MB cap) under a **generated** name,
   `<16 hex><sanitized extension>`; the uploaded name is only a label and never picks a path, a
   length or a collision. The endpoint returns `{ path, name }`, and the chip shows the name with a
   type icon (`web/src/files.js`: pdf, image, doc, sheet, slides, archive, code, text, audio,
-  video, generic, each with its own accent colour). While the upload runs the chip shows a
-  percentage and a progress bar, because the drop is sent with `XMLHttpRequest` rather than `fetch`.
+  video, generic, each with its own accent colour). A drag can also carry *no bytes* at all - a
+  picture dragged out of the transcript, or a link dragged from another page. Our own pictures are
+  `data:`/`blob:` URLs, so that case is fetched back into a File and attached like any other image
+  (`attachLink`), and a remote link is refused with `that drag carried a link, not a file — paste
+  the image instead` instead of silently doing nothing (left alone, the browser would navigate to
+  it). A dragged file the browser could not type - no `type`, no telling extension - is recognised
+  by its header (`sniffImageType`) so it can never fall through to the generic uploader.
+  The chip appears from the first byte; while the
+  upload runs it shows `Uploading…` and then a percentage plus a progress bar (`XMLHttpRequest`
+  rather than `fetch`, because only XHR reports upload progress), and the send button stays disabled
+  until the path is back.
   The textarea is untouched: on send the files are appended to the prompt as one
   `[attached] {"name":"<label>","path":"<file>"}` line each, which is what a terminal drop means
   for nife: the agent reads `path` with its own tools. Both the composer chips and the transcript

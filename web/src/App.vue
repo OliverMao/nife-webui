@@ -3,20 +3,27 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, shallowR
 import EffortSlider from "./EffortSlider.vue";
 import LiveMessage from "./LiveMessage.vue";
 import LiveThinking from "./LiveThinking.vue";
+import MessageEdit from "./MessageEdit.vue";
 import MessageItem from "./MessageItem.vue";
-import { prepareImage } from "./images.js";
+import { api, uploadFile } from "./bridge.js";
+import { previewImage } from "./images.js";
 import FileIcon from "./FileIcon.vue";
 import { formatBytes } from "./files.js";
 import { blocksOf } from "./message-utils.js";
-import { IMAGE_MAX_COUNT, expandPastes, imageFiles, imageMimeType, imageProblem, pasteMarker, readClipboard } from "./paste.js";
+import {
+	IMAGE_MAX_COUNT,
+	asImageFile,
+	expandPastes,
+	imageFiles,
+	imageFromLink,
+	imageLinkOf,
+	imageProblem,
+	pasteMarker,
+	readClipboard,
+} from "./paste.js";
 import { metaOf, previewOf, promptTextOf, queueProblem } from "./queue.js";
 import { groupItems, isProcessBlock, stepLabel } from "./transcript.js";
 
-const token = new URLSearchParams(location.search).get("t") ?? "";
-// The page is served from the domain root, or under a tunnel prefix (nifetun publishes it at
-// /t/<id>/): every request stays relative to the page, never to the origin.
-const base = location.pathname.replace(/\/(?:index\.html)?$/, "");
-const api = (path) => `${base}/api/${path}${path.includes("?") ? "&" : "?"}t=${encodeURIComponent(token)}`;
 
 // Committed messages live in a shallowRef: objects are plain (not deep-proxied) and the list is
 // only invalidated on message boundaries, never per streaming token.
@@ -1212,8 +1219,33 @@ function applyDelta(delta) {
 }
 
 function push(message) {
-	messages.value.push(message);
+	// a prompt can arrive before the bridge knows which entry it was written to (see entry_id)
+	const stamped =
+		message?.role === "user" && !message.entryId && orphanEntryIds.length > 0
+			? { ...message, entryId: orphanEntryIds.shift() }
+			: message;
+	messages.value.push(stamped);
 	triggerRef(messages);
+}
+
+/**
+ * Which session entry a prompt landed in, announced by the bridge right after nife persists it. The
+ * two can arrive in either order (the message, then its id; the id, then the message), so whichever
+ * is late fills the gap: the id is stamped on the newest prompt that still has none.
+ */
+const orphanEntryIds = [];
+
+function stampEntryId(entryId) {
+	if (typeof entryId !== "string" || !entryId) return;
+	for (let index = messages.value.length - 1; index >= 0; index -= 1) {
+		const message = messages.value[index];
+		if (message.role !== "user" || message.entryId) continue;
+		messages.value = messages.value.map((entry, position) =>
+			position === index ? { ...entry, entryId } : entry,
+		);
+		return;
+	}
+	orphanEntryIds.push(entryId);
 }
 
 function handle(payload) {
@@ -1292,11 +1324,21 @@ function handle(payload) {
 				queuePaused.value = true;
 				showNotice("queue paused after the session changed");
 			}
+			// the prompt being edited belongs to the session that just went away
+			cancelEdit();
 			loadState();
 			loadSessions();
 			break;
 		case "sessions_changed":
 			loadSessions();
+			break;
+		case "entry_id":
+			stampEntryId(payload.entryId);
+			break;
+		case "session_tree":
+			// the leaf moved. The tab that moved it reloads on its own, in order with the prompt it is
+			// about to post; the others have to catch up here.
+			if (!movingBranch.value) loadState().catch(() => {});
 			break;
 		case "compaction_start":
 			compacting.value = true;
@@ -1351,6 +1393,8 @@ async function loadState() {
 	stepsFailed.clear();
 	messages.value = loaded.messages ?? [];
 	triggerRef(messages);
+	// the snapshot carries every id itself: ids announced for messages that are no longer here are stale
+	orphanEntryIds.length = 0;
 	loadedFrom.value = loaded.loadedFrom ?? 0;
 	streaming.value = Boolean(loaded.streaming);
 	turnPending = false;
@@ -1452,29 +1496,54 @@ function scheduleDrain() {
 	}, 800);
 }
 
-async function send() {
-	if (compacting.value) return;
+/** Attachments still being prepared (image resize) or uploaded: nothing can be sent yet. */
+const preparing = computed(
+	() => attachments.value.some((image) => image.loading) || files.value.some((file) => !file.path),
+);
+
+/** The composer as one queue item, or null when it is not sendable yet (the notice says why). */
+function composedItem() {
 	const value = expandPastes(text.value, pastes).trim();
 	const images = attachments.value.map(({ name, mimeType, data }) => ({ name, mimeType, data }));
 	const queuedFiles = files.value.map(({ name, path, size }) => ({ name, path, size }));
 	if (files.value.some((file) => !file.path)) {
 		showNotice("still uploading, try again in a moment");
-		return;
+		return null;
 	}
-	if (!value && images.length === 0 && queuedFiles.length === 0) return;
+	if (!value && images.length === 0 && queuedFiles.length === 0) return null;
 	const problem = imageProblem(images);
 	if (problem) {
 		showNotice(problem);
-		return;
+		return null;
 	}
 	queueSeq += 1;
-	const item = { id: queueSeq, text: value, images, files: queuedFiles, error: "" };
+	return { id: queueSeq, text: value, images, files: queuedFiles, error: "" };
+}
+
+async function send() {
+	if (compacting.value || movingBranch.value) return;
+	// The inline editor owns the send while it is open: its own button (or Cancel) settles it.
+	if (editing.value) {
+		showNotice("send or cancel the prompt you are editing first");
+		return;
+	}
+	if (preparing.value) {
+		showNotice("still preparing the attachments, try again in a moment");
+		return;
+	}
+	const item = composedItem();
+	if (!item) return;
 	const blocked = queueProblem(queue.value, item);
 	if (blocked) {
 		showNotice(blocked);
 		return;
 	}
 	clearComposer();
+	await deliver(item);
+}
+
+/** Send one composed item now, or park it in the queue when the session is not ready for it. */
+async function deliver(item) {
 	// Paused means "do not continue the queued tasks", not "swallow what I type next": an explicit
 	// send while the session is idle starts now and resumes the queue, so the parked items follow
 	// this turn instead of waiting for a Resume click.
@@ -1583,26 +1652,97 @@ function editQueued(index) {
 	});
 }
 
+/**
+ * Editing an earlier prompt where it stands. The bubble itself turns into an editor (MessageEdit):
+ * nothing is copied into the composer, nothing is destroyed, and the branch only moves when the
+ * edited prompt is sent - cancelling just puts the bubble back.
+ */
+const editing = ref(null); // { entryId, busy }
+// A send that has to move the branch first: the post follows, and a second click must not race it.
+const movingBranch = ref(false);
+
+function openEdit(item) {
+	const message = item.message;
+	if (!message?.entryId) return;
+	if (streaming.value || compacting.value || draining.value || movingBranch.value) {
+		showNotice("stop the current turn first");
+		return;
+	}
+	menu.value = null;
+	// one editor at a time: reopening elsewhere drops the previous one, which was never submitted
+	editing.value = { entryId: message.entryId, busy: false, draft: null };
+}
+
+/** The card's state, kept here so scrolling it out of the rendered window does not undo the edit. */
+function keepDraft(draft) {
+	if (editing.value) editing.value.draft = draft;
+}
+
+function cancelEdit() {
+	editing.value = null;
+}
+
+/** The prompt as one queue item, from what the inline editor still holds. */
+function editedItem(draft) {
+	queueSeq += 1;
+	return { id: queueSeq, text: draft.text, images: draft.images, files: draft.files, error: "" };
+}
+
+/**
+ * Send the edited prompt: move the branch back to its prompt first (that is what /tree does), then
+ * deliver it like any other message, so it becomes a new branch of the same session file.
+ */
+async function submitEdit(draft) {
+	const target = editing.value;
+	if (!target || target.busy || movingBranch.value) return;
+	const item = editedItem(draft);
+	const blocked = queueProblem(queue.value, item);
+	if (blocked) {
+		showNotice(blocked);
+		return;
+	}
+	target.busy = true;
+	movingBranch.value = true;
+	try {
+		const moved = await postDetailed("tree", { entryId: target.entryId });
+		if (!moved.ok) {
+			showNotice(moved.message || "could not move back to that prompt");
+			return;
+		}
+		editing.value = null;
+		// Reload the truncated branch before the prompt is posted: the message that follows must be the
+		// only thing appended after it, and the branch the queue lands on has to be the new one.
+		await loadState();
+		await deliver(item);
+	} finally {
+		movingBranch.value = false;
+		target.busy = false;
+	}
+}
+
+
 async function attachFiles(incoming) {
 	for (const file of incoming) {
 		if (attachments.value.length >= IMAGE_MAX_COUNT) {
 			showNotice(`at most ${IMAGE_MAX_COUNT} images per message`);
 			return;
 		}
+		imageSeq += 1;
+		const id = imageSeq;
+		// The chip and its picture appear before the resize starts; `loading` is what the spinner and
+		// the send guard read until the resized data replaces the blob URL.
+		const preview = previewImage(file);
+		attachments.value = [
+			...attachments.value,
+			{ id, name: file.name || `pasted image ${id}`, loading: true, url: preview.url },
+		];
+		const patch = (next) => {
+			attachments.value = attachments.value.map((image) => (image.id === id ? { ...image, ...next } : image));
+		};
 		try {
-			const { mimeType, data } = await prepareImage(file);
-			imageSeq += 1;
-			attachments.value = [
-				...attachments.value,
-				{
-					id: imageSeq,
-					name: file.name || `pasted image ${imageSeq}`,
-					mimeType,
-					data,
-					url: `data:${mimeType};base64,${data}`,
-				},
-			];
+			patch({ ...(await preview.ready()), loading: false });
 		} catch (error) {
+			attachments.value = attachments.value.filter((image) => image.id !== id);
 			showNotice(error instanceof Error ? error.message : "could not read the pasted image");
 		}
 	}
@@ -1610,31 +1750,6 @@ async function attachFiles(incoming) {
 
 function removeImage(id) {
 	attachments.value = attachments.value.filter((image) => image.id !== id);
-}
-
-/** Bytes -> a file in nife's temp upload dir. XHR instead of fetch so the chip can show progress. */
-function uploadFile(file, onProgress) {
-	return new Promise((resolve, reject) => {
-		const request = new XMLHttpRequest();
-		request.open("POST", api("upload"));
-		request.setRequestHeader("x-file-name", encodeURIComponent(file.name || "file"));
-		request.upload.onprogress = (event) => {
-			if (event.lengthComputable) onProgress(event.loaded / event.total);
-		};
-		request.onload = () => {
-			if (request.status < 200 || request.status >= 300) {
-				reject(new Error((request.responseText || `upload failed (${request.status})`).slice(0, 200)));
-				return;
-			}
-			try {
-				resolve(JSON.parse(request.responseText));
-			} catch {
-				reject(new Error("bad upload response"));
-			}
-		};
-		request.onerror = () => reject(new Error("upload failed"));
-		request.send(file);
-	});
 }
 
 async function uploadFiles(dropped) {
@@ -1668,21 +1783,59 @@ function onDrop(event) {
 		dragging.value = false;
 		return;
 	}
+	if (editing.value) {
+		// the prompt being edited has its own drop target; the composer is not the one on screen
+		dragging.value = false;
+		return;
+	}
 	const files = [...(event.dataTransfer?.files ?? [])];
-	if (files.length === 0) return;
+	const types = [...(event.dataTransfer?.types ?? [])];
+	if (files.length === 0) {
+		// A drag that started in another page or app can carry a link and no bytes. Left alone the
+		// browser would navigate to it, which looks like the page hanging on a drop that "worked".
+		if (types.includes("Files") || (!types.includes("text/plain") && types.some((type) => type.startsWith("text/")))) {
+			event.preventDefault();
+			dragging.value = false;
+			void attachLink(event.dataTransfer);
+		}
+		return;
+	}
 	event.preventDefault();
 	dragging.value = false;
+	void attachDropped(files);
+}
+
+/**
+ * A drop with no bytes: our own pictures travel as `data:`/`blob:` links, so reusing one is a plain
+ * fetch and goes through the normal attachment path. A link from somewhere else cannot be read by
+ * the page (CORS), so it says so instead of silently doing nothing.
+ */
+async function attachLink(transfer) {
+	const link = transfer?.getData("text/uri-list") || transfer?.getData("text/plain") || "";
+	const own = imageLinkOf(link);
+	const file = own ? await imageFromLink(own) : null;
+	if (file) {
+		await attachFiles([file]);
+		return;
+	}
+	showNotice("that drag carried a link, not a file — paste the image instead");
+}
+
+/** Split a drop into pictures and files; a type the browser forgot is read from the header. */
+async function attachDropped(dropped) {
 	const images = [];
 	const others = [];
-	for (const file of files) {
-		if (imageMimeType(file)) images.push(file);
+	for (const file of dropped) {
+		const picture = await asImageFile(file);
+		if (picture) images.push(picture);
 		else others.push(file);
 	}
-	if (images.length > 0) void attachFiles(images);
-	if (others.length > 0) void uploadFiles(others);
+	if (images.length > 0) await attachFiles(images);
+	if (others.length > 0) await uploadFiles(others);
 }
 
 function onDragOver(event) {
+	if (editing.value) return; // the inline editor highlights itself
 	if (!event.dataTransfer?.types.includes("Files")) return;
 	event.preventDefault();
 	event.dataTransfer.dropEffect = "copy";
@@ -1810,6 +1963,15 @@ async function answer(value) {
 	await post("dialog", value === undefined ? { id: request.id } : { id: request.id, value });
 }
 
+/**
+ * Size chip: an upload shows its progress - or just "Uploading…" when the browser reports no total,
+ * which is what made a slow drop look stuck at 0% - a sent file its bytes, a restored one neither.
+ */
+const fileSize = (file) => {
+	if (!file.path) return file.progress > 0 ? `${Math.round(file.progress * 100)}%` : "Uploading…";
+	return Number.isFinite(file.size) ? formatBytes(file.size) : "attached";
+};
+
 function resize() {
 	const node = inputEl.value;
 	if (!node) return;
@@ -1865,6 +2027,7 @@ onMounted(async () => {
 		if (event.key !== "Escape") return;
 		menu.value = null;
 		tunnelMenu.value = false;
+		cancelEdit();
 		if (narrow.value) sidebarOpen.value = false;
 		// Answer, don't just hide: an unanswered dialog would block the agent on both sides.
 		if (dialog.value) answer(undefined);
@@ -2140,7 +2303,18 @@ onBeforeUnmount(() => {
 								</template>
 							</div>
 						</details>
-						<MessageItem v-else :item="row" :data-row="runStart + index" />
+						<MessageEdit
+							v-else-if="editing && editing.entryId === row.message?.entryId"
+							:item="row"
+							:data-row="runStart + index"
+							:busy="editing.busy"
+							:draft="editing.draft"
+							@cancel="cancelEdit"
+							@submit="submitEdit"
+							@draft="keepDraft"
+							@notice="showNotice"
+						/>
+						<MessageItem v-else :item="row" :data-row="runStart + index" @edit="openEdit" />
 					</template>
 
 					<!-- Only when there is something to draw: an empty live block still carries its margins,
@@ -2274,8 +2448,8 @@ onBeforeUnmount(() => {
 						/>
 					</svg>
 					<div v-if="attachments.length > 0 || files.length > 0" class="attachments">
-						<figure v-for="image in attachments" :key="image.id" class="attachment">
-							<img :src="image.url" :alt="image.name" :title="image.name" />
+						<figure v-for="image in attachments" :key="image.id" class="attachment" :class="{ loading: image.loading }">
+							<img :src="image.url" :alt="image.name" :title="image.loading ? 'preparing…' : image.name" />
 							<button type="button" class="attachment-remove" title="Remove image" @click="removeImage(image.id)">
 								×
 							</button>
@@ -2284,9 +2458,7 @@ onBeforeUnmount(() => {
 							<FileIcon :name="file.name" />
 							<span class="file-meta">
 								<span class="file-name ellipsis">{{ file.name }}</span>
-								<span class="file-size">
-									{{ file.path ? formatBytes(file.size) : `${Math.round(file.progress * 100)}%` }}
-								</span>
+								<span class="file-size">{{ fileSize(file) }}</span>
 							</span>
 							<button type="button" class="attachment-remove" title="Remove file" @click="removeFile(file.id)">
 								×
@@ -2399,21 +2571,31 @@ onBeforeUnmount(() => {
 							</p>
 						</div>
 
-						<button
-							type="button"
-							class="send"
-							:disabled="compacting"
-							:class="{ stop: streaming, ready: (text.trim().length > 0 || attachments.length > 0 || files.length > 0) && !streaming && !compacting }"
-							:title="streaming ? 'Stop' : 'Send'"
-							@click="streaming ? abort() : send()"
-						>
-							<svg v-if="streaming" viewBox="0 0 16 16" aria-hidden="true">
-								<rect x="4" y="4" width="8" height="8" rx="1.5" />
-							</svg>
-							<svg v-else viewBox="0 0 16 16" aria-hidden="true">
-								<path d="M8 12V4M4 8l4-4 4 4" />
-							</svg>
-						</button>
+						<div class="foot-right">
+							<button
+								type="button"
+								class="send"
+								:disabled="compacting || ((Boolean(editing) || preparing) && !streaming)"
+								:class="{ stop: streaming, ready: !editing && (text.trim().length > 0 || attachments.length > 0 || files.length > 0) && !streaming && !compacting }"
+								:title="
+									editing
+										? 'Finish the prompt you are editing first'
+										: preparing
+											? 'Preparing the attachments…'
+											: streaming
+												? 'Stop'
+												: 'Send'
+								"
+								@click="streaming ? abort() : send()"
+							>
+								<svg v-if="streaming" viewBox="0 0 16 16" aria-hidden="true">
+									<rect x="4" y="4" width="8" height="8" rx="1.5" />
+								</svg>
+								<svg v-else viewBox="0 0 16 16" aria-hidden="true">
+									<path d="M8 12V4M4 8l4-4 4 4" />
+								</svg>
+							</button>
+						</div>
 					</div>
 					<!-- compaction owns the session: dim the box and say why it does not take input -->
 					<div v-if="compacting" class="composer-mask">

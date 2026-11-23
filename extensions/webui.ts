@@ -320,6 +320,59 @@ function availableModels(ctx: ExtensionContext): AnyModel[] {
 	return scoped.length > 0 ? scoped : ctx.modelRegistry.getAvailable();
 }
 
+/**
+ * The session entry a message was just written to. nife fires `message_end` before it persists the
+ * message, so nothing carries the id at the time the event reaches an extension - but the page needs
+ * it to offer "edit and rerun" on a prompt the reader just sent (before this, the pencil only showed
+ * up after a reload, because only a snapshot carried ids).
+ */
+function entryIdOfMessage(b: Bridge, message: unknown): string | undefined {
+	// a prompt was appended at the leaf a moment ago: the id is within the last few entries
+	const tail = b.ctx.sessionManager.getBranch().slice(-8);
+	let newest: { id: string; message: unknown } | undefined;
+	for (let index = tail.length - 1; index >= 0; index -= 1) {
+		const entry = tail[index];
+		if (entry.type !== "message") continue;
+		if (entry.message === message) return entry.id;
+		newest ??= { id: entry.id, message: entry.message };
+	}
+	// the manager may hold a copy rather than the event's object: compare with the newest message,
+	// which is the one just written (a prompt can be large, so this runs at most once)
+	if (newest && sameMessageContent(newest.message, message)) return newest.id;
+	return undefined;
+}
+
+function sameMessageContent(left: unknown, right: unknown): boolean {
+	const a = left as { role?: string; content?: unknown } | undefined;
+	const b = right as { role?: string; content?: unknown } | undefined;
+	if (!a || !b || a.role !== b.role) return false;
+	try {
+		return JSON.stringify(a.content) === JSON.stringify(b.content);
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Tell every open tab which entry a prompt just landed in. Persistence happens a microtask after the
+ * extension handler returns, so the lookup is retried briefly rather than guessed.
+ */
+function announceMessageEntry(b: Bridge, message: unknown): void {
+	const role = (message as { role?: string } | undefined)?.role;
+	// only prompts can be edited, so nothing else is worth an id on the wire
+	if (role !== "user") return;
+	const attempt = (left: number) => {
+		if (store.__nifeWebui !== b) return;
+		const entryId = entryIdOfMessage(b, message);
+		if (entryId) {
+			broadcast(b, { type: "entry_id", entryId });
+			return;
+		}
+		if (left > 0) setTimeout(() => attempt(left - 1), 60);
+	};
+	setTimeout(() => attempt(4), 0);
+}
+
 /** System prompts and hidden extension messages are not conversation content. */
 function isHiddenMessage(message: { role: string; display?: boolean }): boolean {
 	return message.role === "system" || (message.role === "custom" && message.display === false);
@@ -522,6 +575,12 @@ interface TranscriptMessage {
 	role: string;
 	display?: boolean;
 	content?: unknown;
+	/**
+	 * Session entry this row came from. The tree navigator works in entry ids and nothing else, so a
+	 * prompt row carries its own id (and its parent's) for the page's "edit and rerun" action.
+	 */
+	entryId?: string;
+	parentId?: string | null;
 	/** set when the payload dropped the reasoning / output the collapsed row keeps hidden */
 	trimmed?: boolean;
 	toolCallId?: string;
@@ -554,7 +613,8 @@ function contextMessages(b: Bridge): TranscriptMessage[] {
 		}
 		for (const message of sessionEntryToContextMessages(entry)) {
 			const row = message as unknown as TranscriptMessage;
-			if (!isHiddenMessage(row)) out.push(row);
+			// copied, not mutated: these objects belong to the session, not to one response
+			if (!isHiddenMessage(row)) out.push({ ...row, entryId: entry.id, parentId: entry.parentId ?? null });
 		}
 	}
 	return out;
@@ -699,7 +759,7 @@ function requestSwitch(b: Bridge, args: string): Promise<SwitchOutcome> {
 	return new Promise<SwitchOutcome>((resolve) => {
 		const timer = setTimeout(() => {
 			if (b.switchRequest === settle) b.switchRequest = undefined;
-			resolve({ ok: false, message: "session switch timed out" });
+			resolve({ ok: false, message: "the session did not answer in time" });
 		}, 120_000);
 		const settle = (outcome: SwitchOutcome) => {
 			clearTimeout(timer);
@@ -709,6 +769,15 @@ function requestSwitch(b: Bridge, args: string): Promise<SwitchOutcome> {
 		// Dispatch through the runtime so the command handler receives a real command context.
 		api.sendUserMessage(`/${SWITCH_COMMAND} ${args}`, { expandPromptTemplates: true });
 	});
+}
+
+/**
+ * Move the leaf back to a prompt of the current branch. `navigateTree` lives on the command
+ * context, so this goes through the same internal command the session switches use. No branch
+ * summary: the page edits and resends the prompt, which is what the branch is for.
+ */
+function requestTree(b: Bridge, entryId: string): Promise<SwitchOutcome> {
+	return requestSwitch(b, ["tree", entryId].join(" "));
 }
 
 /**
@@ -1012,6 +1081,27 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		const outcome = await requestSwitch(b, "new");
 		if (!outcome.ok) return send(res, 409, outcome.message ?? "switch failed");
 		broadcast(b, { type: "session_switch" });
+		return send(res, 200, "ok");
+	}
+
+	/**
+	 * Edit and rerun: move the leaf to the parent of a prompt on the current branch, exactly like
+	 * `/tree` selecting a user message. The page does the rest - it puts the prompt back in the
+	 * composer and posts it again when the reader sends, which appends it as a new branch.
+	 */
+	if (req.method === "POST" && path === "/api/tree") {
+		const body = await readJson(req);
+		const entryId = typeof body.entryId === "string" ? body.entryId : "";
+		if (!entryId) return send(res, 400, "missing entryId");
+		// Only a prompt the transcript shows can be rerun: the entry has to be a user message on the
+		// current branch, which is exactly what the page offers the button for.
+		const target = contextMessages(b).find((message) => message.entryId === entryId);
+		if (!target) return send(res, 404, "unknown entry");
+		if (target.role !== "user") return send(res, 400, "only a prompt can be rerun");
+		const outcome = await requestTree(b, entryId);
+		if (!outcome.ok) return send(res, 409, outcome.message ?? "navigation failed");
+		// every open tab is now reading a different branch
+		broadcast(b, { type: "session_tree" });
 		return send(res, 200, "ok");
 	}
 
@@ -1777,6 +1867,15 @@ export default function webui(api: ExtensionAPI) {
 					settle(result.cancelled ? { ok: false, message: "new session cancelled" } : { ok: true });
 					return;
 				}
+				if (kind === "tree") {
+					const [entryId] = rest;
+					if (!entryId) throw new Error("missing entry id");
+					// nife's own navigateTree puts the prompt into the terminal editor as well, so both screens
+					// end up showing the same message ready to be edited
+					const result = await ctx.navigateTree(entryId);
+					settle(result.cancelled ? { ok: false, message: "navigation cancelled" } : { ok: true });
+					return;
+				}
 				throw new Error(`unknown switch kind: ${kind || "none"}`);
 			} catch (error) {
 				settle({ ok: false, message: error instanceof Error ? error.message : "switch failed" });
@@ -1820,6 +1919,10 @@ export default function webui(api: ExtensionAPI) {
 
 	// Do not stop on session_shutdown: the bridge outlives /new, /resume and /fork.
 	api.on("message_start", (event) => {
+		// The system prompt is re-appended at every branch point, and hidden extension messages are not
+		// conversation content: a snapshot drops them, so the live stream must not deliver them either
+		// (a forwarded system message used to show up as a stray "Note (system)" row until a reload).
+		if (isHiddenMessage(event.message)) return;
 		forward({ type: "message_start", message: event.message });
 	});
 	api.on("message_update", (event) => {
@@ -1827,7 +1930,9 @@ export default function webui(api: ExtensionAPI) {
 		forward({ type: "message_update", delta: event.assistantMessageEvent });
 	});
 	api.on("message_end", (event) => {
-		forward({ type: "message_end", message: event.message });
+		const b = store.__nifeWebui;
+		if (!isHiddenMessage(event.message)) forward({ type: "message_end", message: event.message });
+		if (b) announceMessageEntry(b, event.message);
 	});
 	api.on("agent_start", () => {
 		forward({ type: "agent_start" });

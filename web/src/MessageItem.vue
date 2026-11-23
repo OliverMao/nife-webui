@@ -12,6 +12,27 @@ const props = defineProps({
 	flat: { type: Boolean, default: false },
 });
 
+const emit = defineEmits(["edit"]);
+
+// Only a committed prompt of the current branch can be edited: the session entry id is what moves
+// the leaf back (see /api/tree), and a live turn has no entry yet.
+const editable = computed(() => props.item.message?.role === "user" && Boolean(props.item.message?.entryId));
+
+const copied = ref(false);
+let copyTimer;
+
+/** Same pair as the DeepSeek row: copy the prompt, or put it back in the composer to be edited. */
+async function copyPrompt() {
+	try {
+		await navigator.clipboard.writeText(userContent.value.text);
+		copied.value = true;
+		clearTimeout(copyTimer);
+		copyTimer = setTimeout(() => (copied.value = false), 1200);
+	} catch {
+		// clipboard blocked: leave the icon alone
+	}
+}
+
 // Dropped files travel as `[attached] <path>` lines; show chips instead of temp paths.
 const userContent = computed(() => splitAttachments(textOf(props.item.message.content)));
 const images = computed(() => imagesOf(props.item.message.content));
@@ -77,6 +98,37 @@ const noticeText = (message) => {
 					{{ file.name }}
 				</span>
 			</div>
+		</div>
+		<!-- Under the pill, in the row's own bottom margin, exactly like the DeepSeek row: nothing is
+		     reserved while the pointer is elsewhere, and no text label is needed for two icons. -->
+		<div v-if="editable" class="user-actions">
+			<button
+				v-if="userContent.text"
+				type="button"
+				class="user-action"
+				:title="copied ? 'Copied' : 'Copy this prompt'"
+				:aria-label="copied ? 'Copied' : 'Copy this prompt'"
+				@click="copyPrompt"
+			>
+				<svg v-if="copied" viewBox="0 0 16 16" aria-hidden="true">
+					<path d="M3.5 8.5l3 3 6-6.5" />
+				</svg>
+				<svg v-else viewBox="0 0 16 16" aria-hidden="true">
+					<rect x="5.5" y="5.5" width="8" height="8" rx="1.5" />
+					<path d="M10.5 3.5a1 1 0 0 0-1-1H3.5a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1" />
+				</svg>
+			</button>
+			<button
+				type="button"
+				class="user-action"
+				title="Edit this prompt and run it again from here"
+				aria-label="Edit this prompt"
+				@click="emit('edit', item)"
+			>
+				<svg viewBox="0 0 16 16" aria-hidden="true">
+					<path d="M10.4 2.9l2.7 2.7-6.9 6.9-3.4.7.7-3.4z" />
+				</svg>
+			</button>
 		</div>
 		<Teleport to="body">
 			<div v-if="viewer" class="image-viewer" @click="viewer = null">
