@@ -780,6 +780,14 @@ function requestTree(b: Bridge, entryId: string): Promise<SwitchOutcome> {
 	return requestSwitch(b, ["tree", entryId].join(" "));
 }
 
+/** Wait until the session grew a leaf past `before`: the just-sent prompt is persisted by then. */
+async function waitForLeafChange(b: Bridge, before: string | null, timeoutMs: number): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline && b.ctx.sessionManager.getLeafId() === before) {
+		await new Promise((done) => setTimeout(done, 25));
+	}
+}
+
 /**
  * The path this bridge should answer, whatever the tunnel did to it.
  *
@@ -1101,6 +1109,36 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		const outcome = await requestTree(b, entryId);
 		if (!outcome.ok) return send(res, 409, outcome.message ?? "navigation failed");
 		// every open tab is now reading a different branch
+		broadcast(b, { type: "session_tree" });
+		return send(res, 200, "ok");
+	}
+
+	/**
+	 * Retry: regenerate the answer to a prompt. The leaf moves to that prompt's parent and the prompt
+	 * is sent again exactly as it was recorded - same text, same images, same `[attached]` markers -
+	 * so the branch keeps one prompt and gets a fresh answer, which is what "retry" means.
+	 */
+	if (req.method === "POST" && path === "/api/retry") {
+		const body = await readJson(req);
+		const entryId = typeof body.entryId === "string" ? body.entryId : "";
+		if (!entryId) return send(res, 400, "missing entryId");
+		if (!b.ctx.isIdle()) return send(res, 409, "stop the current turn first");
+		const target = contextMessages(b).find((message) => message.entryId === entryId);
+		if (!target) return send(res, 404, "unknown entry");
+		if (target.role !== "user") return send(res, 400, "only a prompt can be retried");
+		const outcome = await requestTree(b, entryId);
+		if (!outcome.ok) return send(res, 409, outcome.message ?? "navigation failed");
+		// Broadcast only once the prompt is in the session: a page that reloads the truncated branch
+		// must find it there, or a tab that already received the `message_end` would either lose the
+		// row or show it twice depending on which response landed first.
+		const parent = b.ctx.sessionManager.getLeafId();
+		try {
+			// the recorded content, not a rebuilt string: images ride along untouched
+			b.api.sendUserMessage(target.content as string | (TextBlock | ImageBlock)[]);
+			await waitForLeafChange(b, parent, 2_000);
+		} catch (error) {
+			return send(res, 409, error instanceof Error ? error.message : "send failed");
+		}
 		broadcast(b, { type: "session_tree" });
 		return send(res, 200, "ok");
 	}

@@ -10,9 +10,11 @@ const props = defineProps({
 	item: { type: Object, required: true },
 	// inside a collapsed process group the steps are already behind one click: no second wrapper
 	flat: { type: Boolean, default: false },
+	// this is the newest answer of the branch: it is the one "retry" regenerates
+	retryable: { type: Boolean, default: false },
 });
 
-const emit = defineEmits(["edit"]);
+const emit = defineEmits(["edit", "retry"]);
 
 // Only a committed prompt of the current branch can be edited: the session entry id is what moves
 // the leaf back (see /api/tree), and a live turn has no entry yet.
@@ -21,10 +23,11 @@ const editable = computed(() => props.item.message?.role === "user" && Boolean(p
 const copied = ref(false);
 let copyTimer;
 
-/** Same pair as the DeepSeek row: copy the prompt, or put it back in the composer to be edited. */
-async function copyPrompt() {
+/** One icon, one clipboard write, a tick for a moment: used by the prompt and the answer rows. */
+async function copyText(value) {
+	if (!value) return;
 	try {
-		await navigator.clipboard.writeText(userContent.value.text);
+		await navigator.clipboard.writeText(value);
 		copied.value = true;
 		clearTimeout(copyTimer);
 		copyTimer = setTimeout(() => (copied.value = false), 1200);
@@ -32,6 +35,20 @@ async function copyPrompt() {
 		// clipboard blocked: leave the icon alone
 	}
 }
+
+/** The answer as text: the actions copy the answer itself, never the reasoning or a tool's output. */
+const answerText = computed(() => {
+	if (props.item.kind !== "assistant" || props.flat) return "";
+	return textOf(props.item.message.content).trim();
+});
+
+/**
+ * The strip exists only when it has a button: a failed turn has nothing to copy, so it is worth a
+ * row only when it is the newest answer and "retry" is therefore offered.
+ */
+const answerActions = computed(
+	() => !props.flat && Boolean(answerText.value || (props.retryable && props.item.message?.errorMessage)),
+);
 
 // Dropped files travel as `[attached] <path>` lines; show chips instead of temp paths.
 const userContent = computed(() => splitAttachments(textOf(props.item.message.content)));
@@ -101,14 +118,14 @@ const noticeText = (message) => {
 		</div>
 		<!-- Under the pill, in the row's own bottom margin, exactly like the DeepSeek row: nothing is
 		     reserved while the pointer is elsewhere, and no text label is needed for two icons. -->
-		<div v-if="editable" class="user-actions">
+		<div v-if="editable" class="msg-actions">
 			<button
 				v-if="userContent.text"
 				type="button"
-				class="user-action"
+				class="msg-action"
 				:title="copied ? 'Copied' : 'Copy this prompt'"
 				:aria-label="copied ? 'Copied' : 'Copy this prompt'"
-				@click="copyPrompt"
+				@click="copyText(userContent.text)"
 			>
 				<svg v-if="copied" viewBox="0 0 16 16" aria-hidden="true">
 					<path d="M3.5 8.5l3 3 6-6.5" />
@@ -120,7 +137,7 @@ const noticeText = (message) => {
 			</button>
 			<button
 				type="button"
-				class="user-action"
+				class="msg-action"
 				title="Edit this prompt and run it again from here"
 				aria-label="Edit this prompt"
 				@click="emit('edit', item)"
@@ -152,6 +169,39 @@ const noticeText = (message) => {
 			<BlockItem v-else :block="segment.block" :results="item.results" />
 		</template>
 		<div v-if="item.message.errorMessage" class="text error">{{ item.message.errorMessage }}</div>
+		<!-- Under the answer, right where it ends (the DeepSeek row): copy the text, or regenerate
+		     this turn. Retry only on the newest answer, since it rewrites the branch from there. -->
+		<div v-if="answerActions" class="msg-actions">
+			<button
+				v-if="answerText"
+				type="button"
+				class="msg-action"
+				:title="copied ? 'Copied' : 'Copy the answer'"
+				:aria-label="copied ? 'Copied' : 'Copy the answer'"
+				@click="copyText(answerText)"
+			>
+				<svg v-if="copied" viewBox="0 0 16 16" aria-hidden="true">
+					<path d="M3.5 8.5l3 3 6-6.5" />
+				</svg>
+				<svg v-else viewBox="0 0 16 16" aria-hidden="true">
+					<rect x="5.5" y="5.5" width="8" height="8" rx="1.5" />
+					<path d="M10.5 3.5a1 1 0 0 0-1-1H3.5a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1" />
+				</svg>
+			</button>
+			<button
+				v-if="retryable"
+				type="button"
+				class="msg-action"
+				title="Retry this answer"
+				aria-label="Retry this answer"
+				@click="emit('retry', item)"
+			>
+				<svg viewBox="0 0 16 16" aria-hidden="true">
+					<path d="M13 8a5 5 0 1 1-1.6-3.7" />
+					<path d="M13.2 2.3v3.2h-3.2" />
+				</svg>
+			</button>
+		</div>
 	</div>
 
 	<div v-else-if="item.kind === 'bash'" class="msg other">

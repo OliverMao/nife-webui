@@ -358,6 +358,20 @@ const items = computed(() => {
 const rows = computed(() => groupItems(items.value));
 
 /**
+ * The newest answer of the branch. Retry rewrites the conversation from there, so it is offered on
+ * that row alone - an older answer is reached by editing its prompt (or `/tree`) instead.
+ */
+const lastAnswerIndex = computed(() => {
+	let index = -1;
+	for (const item of items.value) {
+		if (item.kind !== "assistant") continue;
+		const answered = item.message.errorMessage || blocksOf(item.message).some((block) => block?.type === "text" && block.text?.trim());
+		if (answered) index = Math.max(index, item.index);
+	}
+	return index;
+});
+
+/**
  * Windowing. Mounting every message of a long session costs the browser its layout budget, and the
  * scroll then crawls. Only the tail is rendered: older rows leave the DOM while their exact height
  * moves into a spacer above, so nothing shifts visually. Scrolling up renders WIN_STEP more rows at
@@ -1682,6 +1696,44 @@ function cancelEdit() {
 	editing.value = null;
 }
 
+/** The nearest prompt before an answer, which is the turn "retry" regenerates. */
+function promptBefore(index) {
+	for (let position = messages.value.length - 1; position >= 0; position -= 1) {
+		if (loadedFrom.value + position >= index) continue;
+		const message = messages.value[position];
+		if (message.role === "user") return message;
+	}
+	return null;
+}
+
+/**
+ * Retry an answer: move the branch back to the prompt that produced it and send that prompt again,
+ * unchanged. One prompt, a fresh answer, exactly the branch `/tree` would give.
+ */
+async function retryAnswer(item) {
+	if (streaming.value || compacting.value || movingBranch.value) {
+		showNotice("stop the current turn first");
+		return;
+	}
+	const prompt = promptBefore(item.index);
+	if (!prompt?.entryId) {
+		showNotice("could not find the prompt behind this answer");
+		return;
+	}
+	movingBranch.value = true;
+	try {
+		const result = await postDetailed("retry", { entryId: prompt.entryId });
+		if (!result.ok) {
+			showNotice(result.message || "could not retry this answer");
+			return;
+		}
+		// the branch was truncated under our feet: reload before the new turn streams in
+		await loadState();
+	} finally {
+		movingBranch.value = false;
+	}
+}
+
 /** The prompt as one queue item, from what the inline editor still holds. */
 function editedItem(draft) {
 	queueSeq += 1;
@@ -2314,7 +2366,14 @@ onBeforeUnmount(() => {
 							@draft="keepDraft"
 							@notice="showNotice"
 						/>
-						<MessageItem v-else :item="row" :data-row="runStart + index" @edit="openEdit" />
+						<MessageItem
+							v-else
+							:item="row"
+							:data-row="runStart + index"
+							:retryable="row.index === lastAnswerIndex"
+							@edit="openEdit"
+							@retry="retryAnswer"
+						/>
 					</template>
 
 					<!-- Only when there is something to draw: an empty live block still carries its margins,

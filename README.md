@@ -190,6 +190,16 @@ From the browser:
   in a follow-up `entry_id` event that the page stamps on the prompt it just received; without that,
   the newest prompt only became editable after a reload. Only a user message on the current branch
   can be edited.
+- every answer carries two icons in its own bottom margin, right where the text ends (the DeepSeek
+  row): **copy** takes the answer's text alone - never the reasoning, the tool output or the
+  Markdown source of a code block - and **retry** regenerates that turn. Retry is offered only on
+  the newest answer, because it rewrites the conversation from there: `POST /api/retry` moves the
+  leaf to the parent of the prompt behind that answer (`ctx.navigateTree`, as `/tree` does) and
+  sends that prompt again exactly as it was recorded - same text, same images, same `[attached]`
+  markers - so the branch keeps one prompt and gets a fresh answer instead of a duplicate turn. A
+  failed turn has nothing to copy but is exactly what retry is for, so it keeps the strip whenever
+  it is the newest answer. The composer refuses to send while a turn streams or an upload runs, and
+  retry does the same (`stop the current turn first`)
 - the answer text is the only thing shown outside a collapsed run: thinking and tool calls always
   sit inside a closed `Worked · 3 tools · 1 thought` row, whether they arrived as separate
   process-only messages (`isProcessItem` in `web/src/transcript.js`) or as adjacent blocks inside a

@@ -436,15 +436,18 @@ svg {
 
 .msg.user {
 	align-items: flex-end;
-	/* the row's two icons hang in its bottom margin instead of taking a row of their own */
+}
+
+/* Both kinds of row carry a small icon strip - copy/edit under a prompt, copy/retry under an
+   answer. It hangs in the row's own bottom margin instead of taking a line of its own, so a
+   transcript of pure answers keeps its density and nothing moves when the pointer arrives. */
+.msg.user,
+.msg.assistant {
 	position: relative;
 }
 
-/* Hover-only, and inside the 26px gap below the bubble: a prompt that is done with does not need
-   permanent buttons, and nothing moves when the pointer arrives. Touch devices get them dimmed. */
-.user-actions {
+.msg-actions {
 	position: absolute;
-	right: 0;
 	bottom: -26px;
 	display: flex;
 	align-items: center;
@@ -453,18 +456,26 @@ svg {
 	transition: opacity 120ms ease-out;
 }
 
-.msg.user:hover .user-actions,
-.msg.user:focus-within .user-actions {
+.msg.user .msg-actions {
+	right: 0;
+}
+
+.msg.assistant .msg-actions {
+	left: 0;
+}
+
+.msg:hover .msg-actions,
+.msg:focus-within .msg-actions {
 	opacity: 1;
 }
 
 @media (hover: none) {
-	.user-actions {
+	.msg-actions {
 		opacity: 0.6;
 	}
 }
 
-.user-action {
+.msg-action {
 	width: 24px;
 	height: 22px;
 	display: grid;
@@ -473,12 +484,12 @@ svg {
 	color: var(--muted);
 }
 
-.user-action:hover {
+.msg-action:hover {
 	background: var(--hover);
 	color: var(--text);
 }
 
-.user-action svg {
+.msg-action svg {
 	width: 15px;
 	height: 15px;
 	fill: none;
