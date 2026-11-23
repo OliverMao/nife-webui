@@ -13,7 +13,7 @@ import { execFile, spawn, spawnSync } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync, rmSync, type Dirent } from "node:fs";
 import { readdirSync, readFileSync, readlinkSync } from "node:fs";
-import { mkdir, open, readdir, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, open, readdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { homedir, tmpdir } from "node:os";
@@ -21,11 +21,15 @@ import { basename, dirname, extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getAgentDir, SessionManager, sessionEntryToContextMessages, type SessionInfo } from "nife-coding-agent";
 import {
+	buildSessionProjection,
+	calculateContextTokens,
 	createAgentSession,
 	DefaultResourceLoader,
+	estimateTokens,
 	ModelRuntime,
 	SettingsManager,
 	type AgentSession,
+	type ContextUsage,
 	type ExtensionAPI,
 	type ExtensionContext,
 	type ExtensionUIContext,
@@ -1025,12 +1029,58 @@ const targetRunning = (b: Bridge, t: Target): boolean =>
 const targetWorkspace = (b: Bridge, t: Target): Workspace =>
 	t.kind === "host" ? currentWorkspace(b) : t.worker.workspace;
 const targetModel = (b: Bridge, t: Target): AnyModel | undefined =>
-	t.kind === "host" ? b.ctx.model : t.worker.session?.model ?? entryModel(b, t.worker.manager);
+	t.kind === "host"
+		? b.ctx.model
+		: // before the runtime exists the session only records a model after a switch; fall back to
+			// the one this process is using, which is what a fresh runtime would restore
+			t.worker.session?.model ?? entryModel(b, t.worker.manager) ?? b.ctx.model;
 const targetThinking = (b: Bridge, t: Target): string =>
 	t.kind === "host"
 		? String(b.ctx.thinkingLevel ?? "off")
-		: String(t.worker.session?.thinkingLevel ?? entryThinking(t.worker.manager) ?? "off");
-const targetUsage = (b: Bridge, t: Target) => (t.kind === "host" ? b.ctx.getContextUsage() ?? null : null);
+		: String(
+				t.worker.session?.thinkingLevel ?? entryThinking(t.worker.manager) ?? b.ctx.thinkingLevel ?? "off",
+			);
+const targetUsage = (b: Bridge, t: Target): ContextUsage | null => {
+	if (t.kind === "host") return b.ctx.getContextUsage() ?? null;
+	if (t.worker.session) return t.worker.session.getContextUsage() ?? null;
+	return estimatedUsage(t.worker.manager, targetModel(b, t));
+};
+
+/**
+ * Context usage for an attached session whose runtime is not up yet (or failed to start): the same
+ * numbers nife reports, taken from the session projection - the last assistant's usage plus the
+ * estimate of everything after it. Recomputed once the runtime exists.
+ */
+function estimatedUsage(manager: TargetManager, model: AnyModel | undefined): ContextUsage | null {
+	const contextWindow = model?.contextWindow ?? 0;
+	if (!model || contextWindow <= 0) return null;
+	const messages = buildSessionProjection(manager.getBranch()).messages as {
+		role?: string;
+		stopReason?: string;
+		usage?: unknown;
+	}[];
+	let tokens = 0;
+	let measured = -1;
+	for (let index = messages.length - 1; index >= 0; index -= 1) {
+		const message = messages[index];
+		if (message.role !== "assistant" || !message.usage) continue;
+		// aborted/error responses never carry the request's context size
+		if (message.stopReason === "aborted" || message.stopReason === "error") continue;
+		const used = calculateContextTokens(message.usage as never);
+		if (used <= 0) continue;
+		tokens = used;
+		measured = index;
+		break;
+	}
+	if (measured < 0) {
+		for (const message of messages) tokens += estimateTokens(message as never);
+	} else {
+		for (let index = measured + 1; index < messages.length; index += 1) {
+			tokens += estimateTokens(messages[index] as never);
+		}
+	}
+	return { tokens, contextWindow, percent: (tokens / contextWindow) * 100 };
+}
 
 /** The model a session was last switched to, for a worker whose runtime is not built yet. */
 function entryModel(b: Bridge, manager: TargetManager): AnyModel | undefined {
@@ -1172,6 +1222,12 @@ function attachSession(b: Bridge, rawPath: string): AttachOutcome {
 	b.workers.set(worker.sid, worker);
 	b.workersByPath.set(pathKey(path), worker.sid);
 	focusSession(b, worker.sid);
+	// Build the runtime in the background: the transcript is readable at once, and the composer gets
+	// the session's own model, thinking level and context usage a moment later. Failure is quiet -
+	// the page still reads the file, and the fallbacks above keep the header sane.
+	void ensureWorkerSession(b, worker).then((opened) => {
+		if (opened.ok) broadcast(b, { type: "state_changed", sid: worker.sid });
+	});
 	return { ok: true, sid: worker.sid };
 }
 
@@ -1464,11 +1520,368 @@ function broadcastStats(b: Bridge, target: Target): void {
 	});
 }
 
+/**
+ * The model manager. nife keeps every model in models.json (its catalog is no longer built in), so
+ * the page lists and edits that file: rows are the composed catalog, a models entry is edited in
+ * place, anything else lands in modelOverrides, and deleting removes whichever of the two exist.
+ * `modelRegistry.refresh()` re-reads the file; the page then displays the refreshed objects. Only
+ * the four base rates of `cost` are touched, so pricing tiers always survive.
+ */
+const modelsJsonPath = (): string => join(getAgentDir(), "models.json");
+
+/** The APIs a hand-written provider may declare (models.json's own `api` vocabulary). */
+const MODEL_APIS = ["openai-completions", "openai-responses", "anthropic-messages", "google-generative-ai"];
+
+type ModelsRoot = Record<string, any> & { providers?: Record<string, any> };
+type ModelPatch = {
+	name?: string;
+	reasoning?: boolean;
+	input?: ("text" | "image")[];
+	contextWindow?: number;
+	maxTokens?: number;
+	cost?: Partial<{ input: number; output: number; cacheRead: number; cacheWrite: number }>;
+};
+
+/**
+ * Read models.json. A missing file is not an error (the manager creates it); an unparseable one is,
+ * so a broken file is never silently rewritten. `content` is kept for the rollback path.
+ */
+async function readModelsJson(): Promise<{ root: ModelsRoot | null; content: string | null; error?: string }> {
+	const file = modelsJsonPath();
+	let content: string;
+	try {
+		content = await readFile(file, "utf-8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { root: null, content: null };
+		return {
+			root: null,
+			content: null,
+			error: `could not read ${file}: ${error instanceof Error ? error.message : String(error)}`,
+		};
+	}
+	try {
+		const parsed = JSON.parse(content.replace(/^\uFEFF/, ""));
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+			return { root: null, content, error: `${file} must contain an object with a "providers" entry.` };
+		}
+		return { root: parsed as ModelsRoot, content };
+	} catch (error) {
+		return {
+			root: null,
+			content,
+			error: `${file} is not valid JSON: ${error instanceof Error ? error.message : String(error)}. Fix it manually.`,
+		};
+	}
+}
+
+/** Write models.json atomically: a failed write never leaves a half-written catalog behind. */
+async function writeModelsJson(root: ModelsRoot): Promise<void> {
+	const file = modelsJsonPath();
+	await mkdir(dirname(file), { recursive: true });
+	const tmp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+	await writeFile(tmp, `${JSON.stringify(root, null, 2)}\n`, "utf-8");
+	await rename(tmp, file);
+}
+
+/**
+ * Write, reload the catalog, and undo the write when this provider fails to compose. nife validates
+ * models.json as a whole, so one bad entry would otherwise empty the whole catalog - the rollback
+ * keeps the previous file and the error text goes back to the page.
+ */
+async function saveCatalog(b: Bridge, root: ModelsRoot, original: string | null, provider: string): Promise<string | null> {
+	const file = modelsJsonPath();
+	// An existing broken entry in the same file must not block saving another row: compare the
+	// error text before and after and only report what this write introduced. The baseline is read
+	// after a refresh, so the file - not the last in-memory catalog - decides what "before" means.
+	await b.ctx.modelRegistry.refresh({ allowNetwork: false }).catch(() => undefined);
+	const baseline = catalogErrors(b);
+	await writeModelsJson(root);
+	const failure = await catalogFailure(b, provider, baseline);
+	if (!failure) return null;
+	if (original === null) await rm(file, { force: true });
+	else {
+		const tmp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+		await writeFile(tmp, original, "utf-8");
+		await rename(tmp, file);
+	}
+	await b.ctx.modelRegistry.refresh({ allowNetwork: false }).catch(() => undefined);
+	return failure;
+}
+
+/** Section-wise error text, without the availability noise a catalog refresh can carry. */
+function catalogErrors(b: Bridge): Set<string> {
+	const text = b.ctx.modelRegistry.getError() ?? "";
+	return new Set(
+		text
+			.split("\n\n")
+			.map((line) => line.trim())
+			.filter((line) => line && !line.startsWith("Availability refresh:")),
+	);
+}
+
+/** What this write broke: a refresh error for the provider, or a new catalog error section. */
+async function catalogFailure(b: Bridge, provider: string, baseline: Set<string>): Promise<string | null> {
+	const result = await b.ctx.modelRegistry.refresh({ allowNetwork: false }).catch((error: unknown) => ({
+		errors: new Map([[provider, error instanceof Error ? error : new Error(String(error))]]),
+	}));
+	const providerError = result.errors?.get(provider);
+	if (providerError) return providerError.message;
+	const fresh = [...catalogErrors(b)].filter((line) => !baseline.has(line));
+	return fresh[0] ?? null;
+}
+
+/** Where the model currently lives in models.json, so an edit or a delete lands in the right place. */
+function findModelEntry(
+	root: ModelsRoot,
+	provider: string,
+	id: string,
+): { kind: "models" | "overrides" | "none"; providerEntry?: Record<string, any>; entry?: Record<string, any> } {
+	const providerEntry =
+		root.providers?.[provider] && typeof root.providers[provider] === "object" ? root.providers[provider] : undefined;
+	if (!providerEntry) return { kind: "none" };
+	const models = Array.isArray(providerEntry.models) ? providerEntry.models : [];
+	const entry = models.find((candidate: any) => candidate && typeof candidate === "object" && candidate.id === id);
+	if (entry) return { kind: "models", providerEntry, entry };
+	const overrides = providerEntry.modelOverrides;
+	if (overrides && typeof overrides === "object" && !Array.isArray(overrides)) {
+		const override = overrides[id];
+		if (override && typeof override === "object") return { kind: "overrides", providerEntry, entry: override };
+	}
+	return { kind: "none", providerEntry };
+}
+
+/**
+ * Persist a patch against one model. models.json models are edited in place (they are the catalog
+ * entry); anything else lands in modelOverrides, which nife applies on top of the provider's
+ * catalog (built-in or extension-registered alike).
+ */
+function applyModelPatch(root: ModelsRoot, provider: string, id: string, patch: ModelPatch): "models" | "overrides" {
+	const providers = (root.providers ??= {});
+	const source = findModelEntry(root, provider, id);
+	if (source.kind === "models" && source.entry) {
+		const entry = source.entry;
+		if (patch.name !== undefined) entry.name = patch.name;
+		if (patch.reasoning !== undefined) entry.reasoning = patch.reasoning;
+		if (patch.input !== undefined) entry.input = patch.input;
+		if (patch.contextWindow !== undefined) entry.contextWindow = patch.contextWindow;
+		if (patch.maxTokens !== undefined) entry.maxTokens = patch.maxTokens;
+		if (patch.cost !== undefined) {
+			const existing =
+				entry.cost && typeof entry.cost === "object" ? entry.cost : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+			entry.cost = { ...existing, ...patch.cost };
+		}
+		return "models";
+	}
+	const providerEntry = source.providerEntry ?? (providers[provider] = {});
+	const overrides = (providerEntry.modelOverrides ??= {});
+	const existing = overrides[id] && typeof overrides[id] === "object" ? overrides[id] : undefined;
+	const merged: Record<string, any> = { ...(existing ?? {}) };
+	if (patch.name !== undefined) merged.name = patch.name;
+	if (patch.reasoning !== undefined) merged.reasoning = patch.reasoning;
+	if (patch.input !== undefined) merged.input = patch.input;
+	if (patch.contextWindow !== undefined) merged.contextWindow = patch.contextWindow;
+	if (patch.maxTokens !== undefined) merged.maxTokens = patch.maxTokens;
+	if (patch.cost !== undefined) merged.cost = { ...(existing?.cost ?? {}), ...patch.cost };
+	overrides[id] = merged;
+	return "overrides";
+}
+
+/** Remove a models entry and an override in one go; the row then really disappears. */
+function removeModel(root: ModelsRoot, provider: string, id: string): boolean {
+	const providerEntry = root.providers?.[provider];
+	if (!providerEntry || typeof providerEntry !== "object") return false;
+	let removed = false;
+	if (Array.isArray(providerEntry.models)) {
+		const kept = providerEntry.models.filter((candidate: any) => !(candidate && typeof candidate === "object" && candidate.id === id));
+		if (kept.length !== providerEntry.models.length) {
+			providerEntry.models = kept;
+			removed = true;
+		}
+	}
+	const overrides = providerEntry.modelOverrides;
+	if (overrides && typeof overrides === "object" && !Array.isArray(overrides) && id in overrides) {
+		delete overrides[id];
+		removed = true;
+	}
+	return removed;
+}
+
+/**
+ * Drop the scaffolding a delete leaves behind. An empty `models: []` or `{}` provider fails
+ * models.json validation, which would empty the whole catalog - so those keys go too.
+ */
+function pruneProvider(root: ModelsRoot, provider: string): void {
+	const providers = root.providers;
+	const providerEntry = providers?.[provider];
+	if (!providers || !providerEntry || typeof providerEntry !== "object") return;
+	if (Array.isArray(providerEntry.models) && providerEntry.models.length === 0) delete providerEntry.models;
+	const overrides = providerEntry.modelOverrides;
+	if (overrides && typeof overrides === "object" && !Array.isArray(overrides) && Object.keys(overrides).length === 0) {
+		delete providerEntry.modelOverrides;
+	}
+	if (Object.keys(providerEntry).length === 0) delete providers[provider];
+}
+
+/** The current target's model, re-read from the catalog: a models.json edit changes the object. */
+function displayModel(b: Bridge, target: Target): AnyModel | undefined {
+	const model = targetModel(b, target);
+	if (!model) return undefined;
+	return (b.ctx.modelRegistry.find(model.provider, model.id) as AnyModel | undefined) ?? model;
+}
+
+function costOf(model: AnyModel): Record<string, number> {
+	const cost = (model.cost ?? {}) as Record<string, any>;
+	return {
+		input: Number(cost.input) || 0,
+		output: Number(cost.output) || 0,
+		cacheRead: Number(cost.cacheRead) || 0,
+		cacheWrite: Number(cost.cacheWrite) || 0,
+	};
+}
+
+/** One row of the manager: the composed model plus where (and whether) it is stored. */
+function modelRow(root: ModelsRoot | null, b: Bridge, model: AnyModel, current: AnyModel | undefined): Record<string, unknown> {
+	return {
+		provider: model.provider,
+		id: model.id,
+		name: model.name ?? model.id,
+		reasoning: Boolean(model.reasoning),
+		input: Array.isArray(model.input) && model.input.length > 0 ? model.input : ["text"],
+		contextWindow: Number(model.contextWindow) || 0,
+		maxTokens: Number(model.maxTokens) || 0,
+		cost: costOf(model),
+		source: root ? findModelEntry(root, model.provider, model.id).kind : "none",
+		available: b.ctx.modelRegistry.hasConfiguredAuth(model),
+		current: current?.provider === model.provider && current?.id === model.id,
+	};
+}
+
+/**
+ * The manager's read: every composed model (not only the credentialed ones - a row with no key yet
+ * must stay visible so it can be finished or removed) plus the providers a new row can join.
+ */
+async function modelsPayload(b: Bridge, target: Target | null): Promise<Record<string, unknown>> {
+	const { root, error } = await readModelsJson();
+	const current = target ? displayModel(b, target) : undefined;
+	const models = b.ctx.modelRegistry
+		.getAll()
+		.map((model) => modelRow(root, b, model as AnyModel, current))
+		.sort(
+			(left, right) =>
+				Number(right.current) - Number(left.current) ||
+				String(left.provider).localeCompare(String(right.provider)) ||
+				String(left.name ?? left.id).localeCompare(String(right.name ?? right.id)),
+		);
+	const providers = new Map<string, { id: string; defined: boolean; api: string | null }>();
+	for (const [id, entry] of Object.entries(root?.providers ?? {})) {
+		if (!entry || typeof entry !== "object") continue;
+		providers.set(id, { id, defined: true, api: typeof entry.api === "string" ? entry.api : null });
+	}
+	for (const model of models) {
+		const id = String(model.provider);
+		if (providers.has(id)) continue;
+		providers.set(id, { id, defined: false, api: null });
+	}
+	return {
+		models,
+		providers: [...providers.values()].sort((left, right) => left.id.localeCompare(right.id)),
+		path: modelsJsonPath(),
+		writable: !error,
+		warning: error,
+	};
+}
+
+function readProviderId(value: unknown): { id: string; error?: string } {
+	if (typeof value !== "string") return { id: "", error: "provider must be a string" };
+	const id = value.trim();
+	if (!id) return { id, error: "provider cannot be empty" };
+	if (id.length > 100) return { id, error: "provider is too long (100 characters max)" };
+	if (/[\s/\\]/.test(id)) return { id, error: "provider cannot contain spaces or slashes" };
+	return { id };
+}
+
+function readModelId(value: unknown): { id: string; error?: string } {
+	if (typeof value !== "string") return { id: "", error: "id must be a string" };
+	const id = value.trim();
+	if (!id) return { id, error: "id cannot be empty" };
+	if (id.length > 200) return { id, error: "id is too long (200 characters max)" };
+	if (/[\u0000-\u001f\u007f]/.test(id)) return { id, error: "id cannot contain control characters" };
+	return { id };
+}
+
+function readModelPatch(body: Record<string, unknown>): { patch: ModelPatch; error?: string } {
+	const patch: ModelPatch = {};
+	if (body.name !== undefined) {
+		if (typeof body.name !== "string") return { patch, error: "name must be a string" };
+		const name = body.name.trim();
+		if (!name) return { patch, error: "name cannot be empty" };
+		if (name.length > 200) return { patch, error: "name is too long (200 characters max)" };
+		patch.name = name;
+	}
+	if (body.reasoning !== undefined) {
+		if (typeof body.reasoning !== "boolean") return { patch, error: "reasoning must be a boolean" };
+		patch.reasoning = body.reasoning;
+	}
+	if (body.input !== undefined) {
+		if (!Array.isArray(body.input) || body.input.some((entry) => entry !== "text" && entry !== "image")) {
+			return { patch, error: "input must be a mix of text and image" };
+		}
+		const input: ("text" | "image")[] = ["text"];
+		if (body.input.includes("image")) input.push("image");
+		patch.input = input;
+	}
+	if (body.contextWindow !== undefined) {
+		const value = readTokenCount(body.contextWindow);
+		if (value === undefined) return { patch, error: "context window must be a number, at least 1" };
+		patch.contextWindow = value;
+	}
+	if (body.maxTokens !== undefined) {
+		const value = readTokenCount(body.maxTokens);
+		if (value === undefined) return { patch, error: "max tokens must be a number, at least 1" };
+		patch.maxTokens = value;
+	}
+	if (body.cost !== undefined) {
+		if (typeof body.cost !== "object" || body.cost === null || Array.isArray(body.cost)) return { patch, error: "cost must be an object" };
+		const cost: ModelPatch["cost"] = {};
+		for (const key of ["input", "output", "cacheRead", "cacheWrite"] as const) {
+			const raw = (body.cost as Record<string, unknown>)[key];
+			if (raw === undefined) continue;
+			const value = typeof raw === "string" && raw.trim() ? Number(raw) : raw;
+			if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+				return { patch, error: `cost.${key} must be a number, at least 0` };
+			}
+			cost[key] = value;
+		}
+		if (Object.keys(cost).length > 0) patch.cost = cost;
+	}
+	return { patch };
+}
+
+/** A token count from a number or a numeric string; undefined when it is not a positive integer. */
+function readTokenCount(raw: unknown): number | undefined {
+	const value = typeof raw === "string" && raw.trim() ? Number(raw) : raw;
+	if (typeof value !== "number" || !Number.isFinite(value) || value < 1) return undefined;
+	return Math.round(value);
+}
+
+/** A brand-new models.json entry, filled with nife's documented defaults where the form is empty. */
+function modelEntryFromForm(id: string, patch: ModelPatch): Record<string, any> {
+	return {
+		id,
+		name: patch.name ?? id,
+		reasoning: patch.reasoning ?? false,
+		input: patch.input ?? ["text"],
+		contextWindow: patch.contextWindow ?? 128000,
+		maxTokens: patch.maxTokens ?? 16384,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, ...(patch.cost ?? {}) },
+	};
+}
+
 function snapshot(b: Bridge, target: Target, metaOnly = false): unknown {
 	const manager = targetManager(b, target);
 	const messages = contextMessages(manager);
 	const page = pageOf(messages, messages.length);
-	const model = targetModel(b, target);
+	const model = displayModel(b, target);
 	const stats = statsOf(messages);
 	return {
 		sid: target.sid,
@@ -2352,6 +2765,117 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 			await opened.session.setModel(model as never);
 		}
 		broadcast(b, { type: "state_changed", sid: target.sid });
+		return send(res, 200, "ok");
+	}
+
+	// The model manager's read: every catalog row, where it is stored, and the providers it can join.
+	if (req.method === "GET" && path === "/api/models") {
+		const target = requestTarget(b, url.searchParams.get("sid"));
+		if (!target) return send(res, 404, "unknown session");
+		return send(res, 200, JSON.stringify(await modelsPayload(b, target)), "application/json");
+	}
+
+	// Create: a models entry on an existing provider, or a whole new provider when the form says so.
+	if (req.method === "POST" && path === "/api/models") {
+		let body: Record<string, unknown>;
+		try {
+			body = await readJson(req);
+		} catch {
+			return send(res, 400, "bad JSON");
+		}
+		const providerId = readProviderId(body.provider);
+		if (providerId.error) return send(res, 400, providerId.error);
+		const modelId = readModelId(body.id);
+		if (modelId.error) return send(res, 400, modelId.error);
+		const { patch, error } = readModelPatch(body);
+		if (error) return send(res, 400, error);
+		const { root, content, error: loadError } = await readModelsJson();
+		if (loadError) return send(res, 409, loadError);
+		const fileRoot = root ?? { providers: {} };
+		if (findModelEntry(fileRoot, providerId.id, modelId.id).kind === "models") {
+			return send(res, 409, `models.json already has ${providerId.id}/${modelId.id}`);
+		}
+		const providers = (fileRoot.providers ??= {});
+		let providerEntry = providers[providerId.id];
+		if (!providerEntry || typeof providerEntry !== "object") {
+			// A provider nife does not know yet needs its endpoint, exactly like a hand-written entry.
+			const baseUrl = typeof body.baseUrl === "string" ? body.baseUrl.trim() : "";
+			const api = typeof body.api === "string" ? body.api.trim() : "";
+			if (!/^https?:\/\//i.test(baseUrl)) return send(res, 400, "base URL must start with http:// or https://");
+			if (!MODEL_APIS.includes(api)) return send(res, 400, `api must be one of ${MODEL_APIS.join(", ")}`);
+			const apiKey = typeof body.apiKey === "string" ? body.apiKey.trim() : "";
+			providerEntry = providers[providerId.id] = { name: providerId.id, baseUrl, api };
+			if (apiKey) providerEntry.apiKey = apiKey;
+		}
+		if (!Array.isArray(providerEntry.models)) providerEntry.models = [];
+		providerEntry.models.push(modelEntryFromForm(modelId.id, patch));
+		let failure: string | null;
+		try {
+			failure = await saveCatalog(b, fileRoot, content, providerId.id);
+		} catch (saveError) {
+			return send(res, 409, saveError instanceof Error ? saveError.message : String(saveError));
+		}
+		if (failure) return send(res, 409, failure);
+		broadcast(b, { type: "state_changed", sid: requestTarget(b, url.searchParams.get("sid"))?.sid ?? "host" });
+		return send(res, 200, JSON.stringify({ provider: providerId.id, id: modelId.id }), "application/json");
+	}
+
+	// Update: a models entry in place, a modelOverrides entry for anything else.
+	if (req.method === "POST" && path === "/api/models/update") {
+		let body: Record<string, unknown>;
+		try {
+			body = await readJson(req);
+		} catch {
+			return send(res, 400, "bad JSON");
+		}
+		const providerId = readProviderId(body.provider);
+		if (providerId.error) return send(res, 400, providerId.error);
+		const modelId = readModelId(body.id);
+		if (modelId.error) return send(res, 400, modelId.error);
+		const { patch, error } = readModelPatch(body);
+		if (error) return send(res, 400, error);
+		if (Object.keys(patch).length === 0) return send(res, 400, "nothing to save");
+		const { root, content, error: loadError } = await readModelsJson();
+		if (loadError) return send(res, 409, loadError);
+		const fileRoot = root ?? { providers: {} };
+		applyModelPatch(fileRoot, providerId.id, modelId.id, patch);
+		let failure: string | null;
+		try {
+			failure = await saveCatalog(b, fileRoot, content, providerId.id);
+		} catch (saveError) {
+			return send(res, 409, saveError instanceof Error ? saveError.message : String(saveError));
+		}
+		if (failure) return send(res, 409, failure);
+		broadcast(b, { type: "state_changed", sid: requestTarget(b, url.searchParams.get("sid"))?.sid ?? "host" });
+		return send(res, 200, "ok");
+	}
+
+	// Delete: the models entry and the override, then the scaffolding the removal leaves empty.
+	if (req.method === "POST" && path === "/api/models/delete") {
+		let body: Record<string, unknown>;
+		try {
+			body = await readJson(req);
+		} catch {
+			return send(res, 400, "bad JSON");
+		}
+		const providerId = readProviderId(body.provider);
+		if (providerId.error) return send(res, 400, providerId.error);
+		const modelId = readModelId(body.id);
+		if (modelId.error) return send(res, 400, modelId.error);
+		const { root, content, error: loadError } = await readModelsJson();
+		if (loadError) return send(res, 409, loadError);
+		if (!root || !removeModel(root, providerId.id, modelId.id)) {
+			return send(res, 404, `nothing in models.json for ${providerId.id}/${modelId.id}`);
+		}
+		pruneProvider(root, providerId.id);
+		let failure: string | null;
+		try {
+			failure = await saveCatalog(b, root, content, providerId.id);
+		} catch (saveError) {
+			return send(res, 409, saveError instanceof Error ? saveError.message : String(saveError));
+		}
+		if (failure) return send(res, 409, failure);
+		broadcast(b, { type: "state_changed", sid: requestTarget(b, url.searchParams.get("sid"))?.sid ?? "host" });
 		return send(res, 200, "ok");
 	}
 

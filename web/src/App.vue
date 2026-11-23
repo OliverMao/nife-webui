@@ -311,6 +311,14 @@ let turnPending = false;
 const menu = ref(null);
 const modelQuery = ref("");
 const thinkingDraft = ref(null);
+// The model manager: the catalog as rows, with create/edit/delete backed by models.json.
+const modelManager = ref(null); // { models, providers, path, writable, warning }
+const modelManagerBusy = ref(false);
+const modelManagerError = ref("");
+const modelFilter = ref("");
+const modelForm = ref(null); // create/edit view over one row
+const modelFormError = ref("");
+const modelDelete = ref(null); // row waiting for the inline delete confirmation
 const subagents = ref([]);
 const notice = ref("");
 const noticeStyle = ref({});
@@ -1466,6 +1474,8 @@ function handle(payload) {
 			}
 			// the prompt being edited belongs to the session that just went away
 			cancelEdit();
+			// the manager's highlight belongs to the session that just went away
+			closeModelManager();
 			loadState();
 			loadGroups({ reveal: true });
 			break;
@@ -2831,6 +2841,167 @@ async function pickModel(model) {
 	if (await post("model", { provider: model.provider, id: model.id })) await loadState();
 }
 
+/**
+ * The model manager. Rows are the composed catalog (not only the credentialed models), so a row
+ * with no key yet stays visible and can be finished or removed. Create/edit/delete write
+ * models.json - the shared catalog - and the state reload shows the result in the chip and the
+ * menu as well.
+ */
+const modelRows = computed(() => {
+	const query = modelFilter.value.trim().toLowerCase();
+	const rows = modelManager.value?.models ?? [];
+	if (!query) return rows;
+	return rows.filter(
+		(row) =>
+			row.id.toLowerCase().includes(query) ||
+			String(row.name ?? "").toLowerCase().includes(query) ||
+			row.provider.toLowerCase().includes(query),
+	);
+});
+
+/** A new row on a provider nife does not have yet must carry its endpoint. */
+const modelFormNeedsEndpoint = computed(() => {
+	const form = modelForm.value;
+	if (!form || form.mode !== "create") return false;
+	return !(modelManager.value?.providers ?? []).some((provider) => provider.id === form.provider && provider.defined);
+});
+
+async function openModelManager() {
+	menu.value = null;
+	modelManagerError.value = "";
+	modelFilter.value = "";
+	const response = await fetch(api("models"));
+	if (!response.ok) {
+		showNotice((await response.text()).slice(0, 200) || "could not load models");
+		return;
+	}
+	try {
+		modelManager.value = await response.json();
+	} catch {
+		showNotice("bad models response");
+	}
+}
+
+async function loadModelManager() {
+	const response = await fetch(api("models"));
+	if (!response.ok) {
+		modelManagerError.value = (await response.text()).slice(0, 200) || "could not reload models";
+		return;
+	}
+	try {
+		modelManager.value = await response.json();
+	} catch {
+		modelManagerError.value = "bad models response";
+	}
+}
+
+function closeModelManager() {
+	if (modelManagerBusy.value) return;
+	modelManager.value = null;
+	modelForm.value = null;
+	modelDelete.value = null;
+	modelFilter.value = "";
+	modelManagerError.value = "";
+	modelFormError.value = "";
+}
+
+function startCreateModel() {
+	const providers = modelManager.value?.providers ?? [];
+	modelDelete.value = null;
+	modelFormError.value = "";
+	modelForm.value = {
+		mode: "create",
+		provider: (providers.find((provider) => provider.defined) ?? providers[0])?.id ?? "",
+		id: "",
+		name: "",
+		reasoning: false,
+		input: ["text"],
+		contextWindow: 128000,
+		maxTokens: 16384,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		baseUrl: "",
+		api: "openai-completions",
+		apiKey: "",
+	};
+}
+
+function startEditModel(row) {
+	modelDelete.value = null;
+	modelFormError.value = "";
+	modelForm.value = {
+		mode: "edit",
+		provider: row.provider,
+		id: row.id,
+		name: row.name ?? row.id,
+		reasoning: Boolean(row.reasoning),
+		input: [...(row.input ?? ["text"])],
+		contextWindow: row.contextWindow,
+		maxTokens: row.maxTokens,
+		cost: { ...row.cost },
+	};
+}
+
+function cancelModelForm() {
+	if (modelManagerBusy.value) return;
+	modelForm.value = null;
+	modelFormError.value = "";
+}
+
+async function saveModelForm() {
+	const form = modelForm.value;
+	if (!form || modelManagerBusy.value) return;
+	modelManagerBusy.value = true;
+	modelFormError.value = "";
+	const fields = {
+		name: form.name,
+		reasoning: form.reasoning,
+		input: form.input,
+		contextWindow: form.contextWindow,
+		maxTokens: form.maxTokens,
+		cost: form.cost,
+	};
+	const result =
+		form.mode === "create"
+			? await postDetailed("models", {
+					provider: form.provider,
+					id: form.id,
+					...fields,
+					...(modelFormNeedsEndpoint.value ? { baseUrl: form.baseUrl, api: form.api, apiKey: form.apiKey } : {}),
+				})
+			: await postDetailed("models/update", { provider: form.provider, id: form.id, ...fields });
+	modelManagerBusy.value = false;
+	if (!result.ok) {
+		modelFormError.value = result.message || "could not save the model";
+		return;
+	}
+	modelForm.value = null;
+	await loadModelManager();
+	await loadState();
+	showNotice(form.mode === "create" ? "Model added" : "Model saved");
+}
+
+function askDeleteModel(row) {
+	modelForm.value = null;
+	modelManagerError.value = "";
+	modelDelete.value = { provider: row.provider, id: row.id, name: row.name ?? row.id };
+}
+
+async function confirmDeleteModel() {
+	const row = modelDelete.value;
+	if (!row || modelManagerBusy.value) return;
+	modelManagerBusy.value = true;
+	const result = await postDetailed("models/delete", { provider: row.provider, id: row.id });
+	modelManagerBusy.value = false;
+	modelDelete.value = null;
+	if (!result.ok) {
+		modelManagerError.value = result.message || "could not delete the model";
+		return;
+	}
+	await loadModelManager();
+	await loadState();
+	showNotice("Model deleted");
+}
+
 async function onThinkingChange(index) {
 	const level = thinkingLevels.value[index];
 	if (!level) return;
@@ -3043,6 +3214,14 @@ onMounted(async () => {
 		}
 		if (searchOpen.value) {
 			closeSearch();
+			return;
+		}
+		if (modelForm.value) {
+			cancelModelForm();
+			return;
+		}
+		if (modelManager.value) {
+			closeModelManager();
 			return;
 		}
 		cancelEdit();
@@ -4082,6 +4261,22 @@ onBeforeUnmount(() => {
 										</button>
 										<p class="proxy-time">{{ proxyLine }}</p>
 									</div>
+									<!-- manual control over the catalog entry, not over the turn -->
+									<div class="menu-footer">
+										<div class="menu-label">Model</div>
+										<button
+											type="button"
+											class="menu-action"
+											:title="'Add, edit or delete models in models.json'"
+											@click.stop="openModelManager"
+										>
+											<svg viewBox="0 0 16 16" aria-hidden="true">
+												<path d="M11.2 2.3l2.5 2.5-8 8-3.4.9.9-3.4 8-8z" />
+												<path d="M9.6 4l2.4 2.4" />
+											</svg>
+											<span class="ellipsis">Manage models</span>
+										</button>
+									</div>
 								</div>
 							</div>
 
@@ -4168,5 +4363,170 @@ onBeforeUnmount(() => {
 				</div>
 			</div>
 		</div>
+
+	<!-- The model manager: rows are the catalog; create, edit and delete write models.json. -->
+	<div v-if="modelManager" class="modal" @click.self="closeModelManager">
+		<div class="modal-card model-manager-card" role="dialog" aria-modal="true" aria-labelledby="model-manager-title">
+			<div class="model-manager-head">
+				<h2 id="model-manager-title">Models</h2>
+				<button v-if="!modelForm" type="button" class="model-manager-add" :disabled="modelManagerBusy" @click="startCreateModel">
+					<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3.5v9M3.5 8h9" /></svg>
+					<span>Add model</span>
+				</button>
+			</div>
+			<p class="model-manager-path">{{ modelManager.path }}</p>
+
+			<!-- create/edit: one row's fields, and the endpoint when the provider is new -->
+			<template v-if="modelForm">
+				<div class="model-form">
+				<div class="model-edit-grid">
+					<template v-if="modelForm.mode === 'create'">
+						<label class="model-edit-field">
+							<span>Provider</span>
+							<input v-model.trim="modelForm.provider" type="text" list="model-provider-ids" spellcheck="false" placeholder="provider id" />
+							<datalist id="model-provider-ids">
+								<option v-for="provider in modelManager.providers" :key="provider.id" :value="provider.id" />
+							</datalist>
+						</label>
+						<label class="model-edit-field">
+							<span>Model id</span>
+							<input v-model.trim="modelForm.id" type="text" maxlength="200" spellcheck="false" placeholder="id sent to the API" />
+						</label>
+					</template>
+					<template v-else>
+						<p class="model-edit-identity">{{ modelForm.provider }} · {{ modelForm.id }}</p>
+					</template>
+					<label class="model-edit-field model-edit-span">
+						<span>Name</span>
+						<input v-model="modelForm.name" type="text" maxlength="200" spellcheck="false" :placeholder="modelForm.id || 'display name'" />
+					</label>
+					<div class="model-edit-row">
+						<label class="model-edit-check">
+							<input type="checkbox" v-model="modelForm.reasoning" />
+							<span>Reasoning</span>
+						</label>
+						<div class="model-edit-inputs">
+							<span class="muted model-edit-label">Input</span>
+							<label class="model-edit-check" title="Text input is required">
+								<input type="checkbox" :value="'text'" v-model="modelForm.input" disabled />
+								<span>text</span>
+							</label>
+							<label class="model-edit-check">
+								<input type="checkbox" :value="'image'" v-model="modelForm.input" />
+								<span>image</span>
+							</label>
+						</div>
+					</div>
+					<label class="model-edit-field">
+						<span>Context window</span>
+						<input v-model.number="modelForm.contextWindow" type="number" min="1" step="1" />
+					</label>
+					<label class="model-edit-field">
+						<span>Max output tokens</span>
+						<input v-model.number="modelForm.maxTokens" type="number" min="1" step="1" />
+					</label>
+					<div class="model-edit-cost">
+						<p class="muted model-edit-label">Cost per 1M tokens</p>
+						<div class="model-edit-cost-grid">
+							<label class="model-edit-field"><span>Input</span><input v-model.number="modelForm.cost.input" type="number" min="0" step="any" /></label>
+							<label class="model-edit-field"><span>Output</span><input v-model.number="modelForm.cost.output" type="number" min="0" step="any" /></label>
+							<label class="model-edit-field"><span>Cache read</span><input v-model.number="modelForm.cost.cacheRead" type="number" min="0" step="any" /></label>
+							<label class="model-edit-field"><span>Cache write</span><input v-model.number="modelForm.cost.cacheWrite" type="number" min="0" step="any" /></label>
+						</div>
+					</div>
+					<template v-if="modelFormNeedsEndpoint">
+						<label class="model-edit-field model-edit-span">
+							<span>Base URL</span>
+							<input v-model.trim="modelForm.baseUrl" type="text" spellcheck="false" placeholder="https://host/v1" />
+						</label>
+						<label class="model-edit-field">
+							<span>API</span>
+							<select v-model="modelForm.api">
+								<option value="openai-completions">openai-completions</option>
+								<option value="openai-responses">openai-responses</option>
+								<option value="anthropic-messages">anthropic-messages</option>
+								<option value="google-generative-ai">google-generative-ai</option>
+							</select>
+						</label>
+						<label class="model-edit-field model-edit-span">
+							<span>API key <span class="muted">optional — literal, $ENV_VAR or !command</span></span>
+							<input v-model="modelForm.apiKey" type="text" spellcheck="false" placeholder="sk-…" />
+						</label>
+					</template>
+				</div>
+				</div>
+				<p v-if="modelFormError" class="model-edit-error" role="alert">{{ modelFormError }}</p>
+				<div class="modal-actions">
+					<button type="button" class="ghost" :disabled="modelManagerBusy" @click="cancelModelForm">Cancel</button>
+					<button type="button" class="primary" :disabled="modelManagerBusy || !modelManager.writable" @click="saveModelForm">
+						{{ modelManagerBusy ? "Saving…" : modelForm.mode === "create" ? "Add model" : "Save" }}
+					</button>
+				</div>
+			</template>
+
+			<!-- the rows: this is the manager -->
+			<template v-else>
+				<input
+					v-if="modelManager.models.length > 8"
+					v-model="modelFilter"
+					class="menu-search model-manager-filter"
+					placeholder="Filter models"
+				/>
+				<p v-if="modelManagerError" class="model-edit-error" role="alert">{{ modelManagerError }}</p>
+				<p v-else-if="modelManager.warning" class="model-edit-error" role="alert">{{ modelManager.warning }}</p>
+				<div class="model-rows">
+					<div
+						v-for="row in modelRows"
+						:key="`${row.provider}/${row.id}`"
+						class="model-row"
+						:class="{ current: row.current, confirming: modelDelete && modelDelete.provider === row.provider && modelDelete.id === row.id }"
+					>
+						<template v-if="modelDelete && modelDelete.provider === row.provider && modelDelete.id === row.id">
+							<span class="model-row-name ellipsis">Delete “{{ modelDelete.name }}”?</span>
+							<span class="model-row-actions">
+								<button type="button" class="ghost" :disabled="modelManagerBusy" @click="modelDelete = null">Cancel</button>
+								<button type="button" class="danger" :disabled="modelManagerBusy" @click="confirmDeleteModel">
+									{{ modelManagerBusy ? "Deleting…" : "Delete" }}
+								</button>
+							</span>
+						</template>
+						<template v-else>
+							<button type="button" class="model-row-main" @click="startEditModel(row)">
+								<span class="model-row-name ellipsis">{{ row.name || row.id }}</span>
+								<span class="model-row-meta">{{ row.provider }}</span>
+								<span class="model-row-meta model-row-limits">{{ compact(row.contextWindow) }} ctx · {{ compact(row.maxTokens) }} out</span>
+								<span v-if="row.source === 'overrides'" class="model-row-tag" title="Stored as a modelOverrides entry">override</span>
+								<span v-if="!row.available" class="model-row-tag muted-tag" title="No credentials for this provider yet">no key</span>
+								<span v-if="row.current" class="model-row-tag current-tag">current</span>
+							</button>
+							<span class="model-row-actions">
+								<button type="button" class="iconbtn" title="Edit this model" @click="startEditModel(row)">
+									<svg viewBox="0 0 16 16" aria-hidden="true">
+										<path d="M11.2 2.3l2.5 2.5-8 8-3.4.9.9-3.4 8-8z" />
+										<path d="M9.6 4l2.4 2.4" />
+									</svg>
+								</button>
+								<button
+									type="button"
+									class="iconbtn"
+									:disabled="row.source === 'none'"
+									:title="row.source === 'none' ? 'Nothing in models.json to delete' : 'Delete this model'"
+									@click="askDeleteModel(row)"
+								>
+									<svg viewBox="0 0 16 16" aria-hidden="true">
+										<path d="M3.5 4.5h9M6.5 4.5V3h3v1.5M5 4.5l.5 8h5l.5-8" />
+									</svg>
+								</button>
+							</span>
+						</template>
+					</div>
+					<p v-if="modelRows.length === 0" class="muted pad">No models</p>
+				</div>
+				<div class="modal-actions">
+					<button type="button" class="ghost" :disabled="modelManagerBusy" @click="closeModelManager">Close</button>
+				</div>
+			</template>
+		</div>
+	</div>
 	</div>
 </template>

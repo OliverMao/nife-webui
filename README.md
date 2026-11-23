@@ -302,6 +302,18 @@ From the browser:
   input is used in both states
 - model chip in the composer lists available/scoped models with a filter, `setModel` runs in the CLI
   session so the terminal switches too; models without credentials are reported, not switched
+- `Manage models` in the model menu opens the catalog as rows: every composed model - including the
+  ones whose provider has no credentials yet, tagged `no key` - with the current model highlighted,
+  a filter, and per-row edit/delete. `Add model` writes a new row (provider id from the known list,
+  or a brand-new provider with its base URL, API and optional key), edit rewrites a `models` entry
+  in place or a `modelOverrides` entry for anything else, delete removes both and prunes the
+  scaffolding it leaves empty (an empty `models: []` would fail the whole file). Fields are name,
+  reasoning, input (text/image), context window, max output tokens and the four cost rates - pricing
+  tiers are always kept. `GET/POST /api/models` plus `/api/models/update` and `/api/models/delete`
+  write `~/.nife/agent/models.json` atomically, refresh the catalog, and roll the write back with
+  the compose error when the new entry would not load (a pre-existing broken provider in the same
+  file never blocks another row); a models.json that does not parse is read-only (409) and is left
+  untouched
 - `Compact context` sits in its own divided `Tools` section at the bottom of the model menu (below
   the Reasoning slider, with the current context percentage) and summarizes the context: `POST /api/compact` calls `ctx.compact()` and waits for the
   summarization call to finish, so the row shows `Compacting…` and reports the failure text when

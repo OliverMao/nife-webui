@@ -4056,3 +4056,319 @@ img {
 		animation: none;
 	}
 }
+
+/* The model manager: rows are the catalog, the form is one row */
+.model-manager-card {
+	width: min(620px, 100%);
+	max-height: min(88vh, 760px);
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+	overflow: hidden;
+}
+
+.model-manager-head,
+.model-manager-path,
+.model-manager-filter,
+.model-manager-card > .modal-actions,
+.model-manager-card > .model-edit-error {
+	flex: 0 0 auto;
+}
+
+.model-form {
+	flex: 1 1 auto;
+	min-height: 0;
+	overflow-y: auto;
+	margin: 0 -6px;
+	padding: 2px 6px;
+}
+
+.model-manager-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+}
+
+.model-manager-head h2 {
+	margin: 0;
+	font-size: 15px;
+	font-weight: 600;
+}
+
+.model-manager-add {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	padding: 5px 10px;
+	border-radius: 8px;
+	border: 1px solid var(--line);
+	background: #2a2a2a;
+	color: var(--text);
+	font-size: 12px;
+}
+
+.model-manager-add:hover:not(:disabled) {
+	background: #333;
+}
+
+.model-manager-add:disabled {
+	opacity: 0.55;
+	cursor: not-allowed;
+}
+
+.model-manager-add svg {
+	width: 13px;
+	height: 13px;
+	color: var(--muted);
+}
+
+.model-manager-path {
+	margin: 0;
+	color: var(--dim);
+	font-size: 11px;
+	word-break: break-all;
+}
+
+.model-manager-filter {
+	margin: 0;
+}
+
+.model-rows {
+	flex: 1 1 auto;
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	min-height: 120px;
+	overflow-y: auto;
+	margin: 0 -6px;
+	padding: 2px 6px;
+}
+
+.model-row {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	border-radius: 8px;
+	padding: 0 4px 0 0;
+}
+
+.model-row:hover {
+	background: var(--hover);
+}
+
+.model-row.current {
+	background: #262b38;
+}
+
+.model-row.confirming {
+	background: #332427;
+	padding-left: 8px;
+	gap: 10px;
+}
+
+.model-row-main {
+	flex: 1 1 auto;
+	min-width: 0;
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding: 8px 8px;
+	text-align: left;
+	font-size: 13px;
+	color: var(--text);
+}
+
+.model-row-name {
+	flex: 1 1 auto;
+	min-width: 0;
+	font-weight: 500;
+}
+
+.model-row-meta {
+	flex: 0 0 auto;
+	color: var(--muted);
+	font-size: 11px;
+	white-space: nowrap;
+}
+
+.model-row-limits {
+	color: var(--dim);
+	font-variant-numeric: tabular-nums;
+}
+
+.model-row-tag {
+	flex: 0 0 auto;
+	padding: 1px 6px;
+	border-radius: 999px;
+	border: 1px solid var(--line);
+	color: var(--dim);
+	font-size: 10px;
+	line-height: 1.5;
+	letter-spacing: 0.02em;
+}
+
+.model-row-tag.current-tag {
+	border-color: rgb(107 143 232 / 45%);
+	color: var(--accent);
+}
+
+.model-row-tag.muted-tag {
+	border-color: rgb(229 192 123 / 35%);
+	color: var(--warn);
+}
+
+.model-row-actions {
+	flex: 0 0 auto;
+	display: inline-flex;
+	align-items: center;
+	gap: 2px;
+}
+
+.model-row-actions .ghost,
+.model-row-actions .danger {
+	padding: 4px 10px;
+	border-radius: 7px;
+	font-size: 12px;
+}
+
+.model-row-actions .ghost {
+	background: #2a2a2a;
+	color: var(--text);
+}
+
+.model-row-actions .danger {
+	background: var(--error);
+	color: #fff;
+	font-weight: 600;
+}
+
+.model-row-actions .iconbtn:disabled {
+	opacity: 0.35;
+	cursor: not-allowed;
+}
+
+.model-row-actions .iconbtn:disabled:hover {
+	background: transparent;
+	color: var(--muted);
+}
+
+.model-edit-identity {
+	grid-column: 1 / -1;
+	margin: 0;
+	color: var(--muted);
+	font-size: 12px;
+	word-break: break-all;
+}
+
+.model-edit-span {
+	grid-column: 1 / -1;
+}
+
+.model-edit-field select {
+	background: #1a1a1a;
+	color: var(--text);
+	border: 1px solid var(--line);
+	border-radius: 8px;
+	padding: 7px 9px;
+	font: inherit;
+	width: 100%;
+	outline: none;
+}
+
+/* Manual model-info editor */
+.model-edit-grid {
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+	gap: 10px 12px;
+}
+
+.model-edit-field {
+	display: flex;
+	flex-direction: column;
+	gap: 5px;
+	font-size: 12px;
+	color: var(--muted);
+}
+
+.model-edit-field input,
+.model-edit-row input {
+	background: #1a1a1a;
+	color: var(--text);
+	border: 1px solid var(--line);
+	border-radius: 8px;
+	padding: 7px 9px;
+	font: inherit;
+	outline: none;
+	width: 100%;
+}
+
+.model-edit-field input:focus {
+	border-color: var(--accent);
+}
+
+.model-edit-row {
+	grid-column: 1 / -1;
+	display: flex;
+	align-items: center;
+	gap: 18px;
+	font-size: 12px;
+	color: var(--muted);
+}
+
+.model-edit-inputs {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding-left: 18px;
+	border-left: 1px solid var(--line);
+}
+
+.model-edit-label {
+	margin: 0;
+	font-size: 12px;
+}
+
+.model-edit-check {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	cursor: pointer;
+	color: var(--text);
+	font-size: 13px;
+}
+
+.model-edit-check input {
+	width: 15px;
+	height: 15px;
+	margin: 0;
+	accent-color: var(--accent);
+	cursor: pointer;
+}
+
+.model-edit-cost {
+	grid-column: 1 / -1;
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+
+.model-edit-cost-grid {
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+	gap: 8px 12px;
+}
+
+.model-edit-error {
+	margin: 0;
+	color: var(--error);
+	font-size: 12px;
+	white-space: pre-wrap;
+}
+
+
+/* A disabled primary reads as "not now", not as a live call to action. */
+.modal-actions .primary:disabled {
+	background: #3c4a66;
+	color: #aab4c8;
+}
