@@ -1,7 +1,7 @@
 // UI-level task queue. nife has its own steer/followUp queue that injects into the *running* turn;
 // this one is deliberately dumber: the next task is sent as a new message only after the previous
 // turn settled, so what the user typed stays a separate turn.
-import { attachedLine } from "./files.js";
+import { attachedLine, inlineAttachedBlock } from "./files.js";
 
 export const QUEUE_MAX_ITEMS = 20;
 export const QUEUE_MAX_IMAGE_BYTES = 40 * 1024 * 1024;
@@ -35,7 +35,10 @@ export function metaOf(item) {
 	return parts.join(" · ");
 }
 
-/** The prompt body for a queued item: typed text plus one marker line per dropped file. */
+/** The prompt body for a queued item: typed text plus each file, by path or inlined for Chat. */
 export function promptTextOf(item) {
-	return [item.text, ...(item.files ?? []).map((file) => attachedLine(file))].filter(Boolean).join("\n\n");
+	const files = (item.files ?? []).map((file) =>
+		typeof file.text === "string" ? inlineAttachedBlock(file) : attachedLine(file),
+	);
+	return [item.text, ...files].filter(Boolean).join("\n\n");
 }

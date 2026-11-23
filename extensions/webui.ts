@@ -10,16 +10,16 @@
  */
 
 import { execFile, spawn, spawnSync } from "node:child_process";
-import { randomBytes } from "node:crypto";
-import { existsSync, rmSync } from "node:fs";
+import { randomBytes, randomUUID } from "node:crypto";
+import { existsSync, rmSync, type Dirent } from "node:fs";
 import { readdirSync, readFileSync, readlinkSync } from "node:fs";
-import { mkdir, readdir, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, open, readdir, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import { tmpdir } from "node:os";
-import { dirname, extname, join, resolve, sep } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { basename, dirname, extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { getAgentDir, SessionManager, sessionEntryToContextMessages } from "nife-coding-agent";
+import { getAgentDir, SessionManager, sessionEntryToContextMessages, type SessionInfo } from "nife-coding-agent";
 import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "nife-coding-agent";
 
 /** Whatever ctx.model is; the package does not export the model type itself. */
@@ -33,6 +33,7 @@ const DEBUG = process.env.NIFE_WEBUI_DEBUG === "1";
 const CONTENT_TYPES: Record<string, string> = {
 	".html": "text/html; charset=utf-8",
 	".js": "text/javascript; charset=utf-8",
+	".mjs": "text/javascript; charset=utf-8",
 	".css": "text/css; charset=utf-8",
 	".json": "application/json; charset=utf-8",
 	".svg": "image/svg+xml",
@@ -57,8 +58,8 @@ const IMAGE_MIME_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
 const MAX_IMAGES = 4;
 const MAX_IMAGE_BASE64 = Math.floor(4.5 * 1024 * 1024);
 const BASE64 = /^[A-Za-z0-9+/]+={0,2}$/;
-/** Four just-under-limit images plus the text. */
-const PROMPT_MAX_BODY = MAX_IMAGES * MAX_IMAGE_BASE64 + 256 * 1024;
+/** Four just-under-limit images plus typed text and Chat's inlined files. */
+const PROMPT_MAX_BODY = MAX_IMAGES * MAX_IMAGE_BASE64 + 2 * 1024 * 1024;
 
 type ImageBlock = { type: "image"; mimeType: string; data: string };
 type TextBlock = { type: "text"; text: string };
@@ -79,6 +80,75 @@ const SESSION_TITLE_MAX = 100;
 const SEARCH_QUERY_MAX = 200;
 const SEARCH_RESULT_MAX = 40;
 const SEARCH_MATCH_MAX = 6;
+
+/**
+ * Nife's chat-mode prompt. Chat workspace sessions declare no tools and use this prompt; the
+ * workspace is a property of the session file, not a flag inside one conversation.
+ */
+const CHAT_SYSTEM_PROMPT = `You are a helpful conversation assistant. You are in chat mode and have no access to any tools: you cannot read or write files, run commands, browse the web, or take any other actions. Answer the user's questions using only your own knowledge and reasoning. Be clear, concise, and direct, and let the user know when a question would be better answered if tools were available.`;
+/**
+ * Web UI sessions are global on purpose: the page is a project switcher, so its list is not scoped
+ * to the directory nife happened to start in. A session header carries the project cwd, which lets
+ * `switchSession` rebuild the runtime (and its tools) for that directory.
+ */
+const WEBUI_DATA_DIR = join(dirname(getAgentDir()), "webui");
+const WORK_SESSION_DIR = join(WEBUI_DATA_DIR, "work");
+const CHAT_SESSION_DIR = join(WEBUI_DATA_DIR, "chat");
+/** Old Chat sessions lived under each project's nife session directory. Keep reading them. */
+const LEGACY_CHAT_DIR = "webui-chat";
+/** New sessions start here unless the page picks another project directory. */
+const PROJECTS_ROOT = join(dirname(getAgentDir()), "project");
+/** Upper bound on the folders one directory read returns to the picker. */
+const BROWSE_DIR_MAX = 200;
+/**
+ * Temp locations are sandbox runs (tests, throwaway agents), never projects: their sessions stay
+ * out of every list and the files are removed the moment a scan reads them. The OS temp dir and
+ * TMPDIR/TEMP/TMP cover Windows (%LOCALAPPDATA%\Temp, C:\Windows\Temp) and the Unix roots; a
+ * drive letter or "/" on its own is dropped, so one bad value cannot match every session.
+ */
+function tempRoots(): string[] {
+	const raw: (string | undefined)[] = [tmpdir(), process.env.TMPDIR, process.env.TEMP, process.env.TMP];
+	if (process.platform === "win32") {
+		if (process.env.SystemRoot) raw.push(join(process.env.SystemRoot, "Temp"));
+		if (process.env.LOCALAPPDATA) raw.push(join(process.env.LOCALAPPDATA, "Temp"));
+	} else {
+		raw.push("/tmp", "/var/tmp", "/private/tmp");
+	}
+	const roots = new Set<string>();
+	for (const value of raw) {
+		const clean = String(value ?? "").trim();
+		if (!clean) continue;
+		// no trailing separator: comparisons add their own, and "/" or "C:\" alone is too broad
+		const root = resolve(clean).replace(/[\\/]+$/, "");
+		if (!root || /^[A-Za-z]:$/.test(root)) continue;
+		roots.add(root);
+	}
+	return [...roots];
+}
+
+const TEMP_ROOTS = tempRoots();
+/** Any path segment with one of these names is a temp folder, on every platform: tmp, TMP, Temp. */
+const TEMP_SEGMENTS = new Set(["tmp", "temp"]);
+/** Session file format written by nife 0.4.x. SessionManager.open migrates older versions. */
+const SESSION_VERSION = 3;
+type Workspace = "work" | "chat";
+
+/** A project's session files, discovered from headers only. Full transcripts stay lazy. */
+interface SessionRef {
+	path: string;
+	cwd: string;
+	modified: Date;
+	/** A header-only New Work / New Chat placeholder is not a Recents row. */
+	hasMessage: boolean;
+}
+
+interface ProjectGroupInfo {
+	cwd: string;
+	name: string;
+	count: number;
+	modified: Date;
+	current: boolean;
+}
 
 /** Directories to remove on exit, kept module-wide so a reloaded extension still cleans up. */
 const trackedUploadDirs = new Set<string>();
@@ -186,6 +256,17 @@ interface Bridge {
 	persistedFile: string | undefined;
 	/** Session ids whose automatic title was attempted, so a failure does not retry every turn. */
 	titleTried: Set<string>;
+	/** Last active session per workspace + project while this bridge lives. */
+	workspaceFiles: Record<string, string>;
+	/** Header-only project index, shared by the sidebar's groups. */
+	sessionIndexCache: Partial<Record<Workspace, { at: number; refs: SessionRef[] }>>;
+	/** Fully parsed sessions, but only for a project the reader expanded. */
+	projectSessionCache: Record<string, { at: number; sessions: SessionInfo[] }>;
+	/**
+	 * Session directory this process started in. It keeps per-project sessions from the old layout
+	 * visible after the page moves the runtime into the global web-ui directories.
+	 */
+	legacyWorkDir: string | undefined;
 	/** Uploaded drop target for this bridge; created on first drop, removed when the process exits. */
 	uploadDir: string | undefined;
 	/** no_proxy values saved when the page switched the proxy off, so it can be restored. */
@@ -226,6 +307,118 @@ const PATCHED = Symbol.for("nife-webui.patched");
 function broadcast(b: Bridge, payload: unknown): void {
 	const line = `event: message\ndata: ${JSON.stringify(payload)}\n\n`;
 	for (const client of b.clients) client.write(line);
+}
+
+function hasMessages(ctx: ExtensionContext): boolean {
+	return ctx.sessionManager.getEntries().some((entry) => entry.type === "message");
+}
+
+/** Windows compares paths case-insensitively (`C:\Users\X` is `c:\users\x`); POSIX does not. */
+const pathKey = (value: string): string => {
+	const clean = resolve(value);
+	return process.platform === "win32" ? clean.toLowerCase() : clean;
+};
+const samePath = (left: string, right: string): boolean => pathKey(left) === pathKey(right);
+const workspaceKey = (workspace: Workspace, cwd: string): string => `${workspace}\n${pathKey(cwd)}`;
+
+/** The project session directory behind a session dir, also when an old Chat dir is passed in. */
+function legacyWorkDirOf(sessionDir: string): string {
+	return basename(sessionDir).toLowerCase() === LEGACY_CHAT_DIR ? dirname(sessionDir) : sessionDir;
+}
+
+function currentWorkspace(b: Bridge): Workspace {
+	const file = b.ctx.sessionManager.getSessionFile();
+	if (!file) return "work";
+	const path = resolve(file);
+	const chat = resolve(CHAT_SESSION_DIR);
+	if (path === chat || path.startsWith(chat + sep)) return "chat";
+	// Old Chat sessions sit under <project session dir>/webui-chat.
+	return basename(dirname(path)).toLowerCase() === LEGACY_CHAT_DIR ? "chat" : "work";
+}
+
+function workspaceDir(b: Bridge, workspace: Workspace): string {
+	return workspace === "chat" ? CHAT_SESSION_DIR : WORK_SESSION_DIR;
+}
+
+/** Remember the live session before a switch, so an empty New Work is not lost. */
+function rememberCurrent(b: Bridge): void {
+	const file = b.ctx.sessionManager.getSessionFile();
+	if (file) b.workspaceFiles[workspaceKey(currentWorkspace(b), b.ctx.cwd)] = file;
+}
+
+/** A header-only session file: enough for switchSession, invisible in Recents until it has a message. */
+async function writeSessionHeader(path: string, cwd: string): Promise<void> {
+	// nife names files `<timestamp>_<session-id>.jsonl`; keep the header id in step with it.
+	const name = basename(path);
+	const at = name.lastIndexOf("_");
+	const id = (at >= 0 ? name.slice(at + 1, -".jsonl".length) : "") || randomUUID();
+	const header = { type: "session", version: SESSION_VERSION, id, timestamp: new Date().toISOString(), cwd };
+	await mkdir(dirname(path), { recursive: true });
+	try {
+		await writeFile(path, `${JSON.stringify(header)}\n`, { encoding: "utf8", flag: "wx" });
+	} catch (error) {
+		// Another process created it between existsSync and here; keep its contents.
+		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+	}
+}
+
+async function createSessionFile(dir: string, cwd: string): Promise<string> {
+	const timestamp = new Date().toISOString();
+	const path = join(dir, `${timestamp.replace(/[:.]/g, "-")}_${randomUUID()}.jsonl`);
+	await writeSessionHeader(path, cwd);
+	return path;
+}
+
+/** The session the selector should land on for this project: last active, recent, or a fresh one. */
+async function workspaceSessionPath(b: Bridge, workspace: Workspace, cwd: string): Promise<string> {
+	const remembered = b.workspaceFiles[workspaceKey(workspace, cwd)];
+	if (remembered) {
+		if (existsSync(remembered)) return remembered;
+		// nife only writes a new session on its first message. We already left that manager behind, so
+		// writing the header now lets the selector return to the same empty New Work / New Chat.
+		await writeSessionHeader(remembered, cwd);
+		return remembered;
+	}
+	const sessions = await projectSessionsForCwd(b, workspace, cwd);
+	const recent = sessions.find((session) => session.messageCount > 0);
+	return recent?.path ?? createSessionFile(workspaceDir(b, workspace), cwd);
+}
+
+/** Move the runtime to the other workspace's session, keeping the current project directory. */
+async function switchWorkspace(b: Bridge, target: Workspace): Promise<SwitchOutcome> {
+	if (target === currentWorkspace(b)) return { ok: true };
+	if (!b.ctx.isIdle()) return { ok: false, message: "stop the current turn first" };
+	const file = b.ctx.sessionManager.getSessionFile();
+	// `--no-session` has no directory to switch between; do not quietly create files on disk.
+	if (!file) return { ok: false, message: "workspaces need a saved session" };
+	const cwd = b.ctx.cwd;
+	rememberCurrent(b);
+	const path = await workspaceSessionPath(b, target, cwd);
+	const outcome = await requestSwitch(b, `resume ${path}`);
+	if (outcome.ok) {
+		b.workspaceFiles[workspaceKey(target, cwd)] = path;
+		broadcast(b, { type: "session_switch" });
+	}
+	return outcome;
+}
+
+/** Create a header for a project and move the runtime there. */
+async function createAndSwitch(
+	b: Bridge,
+	workspace: Workspace,
+	cwd: string,
+): Promise<SwitchOutcome & { path?: string }> {
+	if (!b.ctx.isIdle()) return { ok: false, message: "stop the current turn first" };
+	rememberCurrent(b);
+	const path = await createSessionFile(workspaceDir(b, workspace), cwd);
+	const outcome = await requestSwitch(b, `resume ${path}`);
+	if (!outcome.ok) {
+		await rm(path, { force: true }).catch(() => {});
+		return outcome;
+	}
+	b.workspaceFiles[workspaceKey(workspace, cwd)] = path;
+	broadcast(b, { type: "session_switch" });
+	return { ...outcome, path };
 }
 
 function forward(payload: Record<string, unknown>): void {
@@ -392,6 +585,7 @@ function announceSessionFile(b: Bridge, left = 5): void {
 	const file = b.ctx.sessionManager.getSessionFile();
 	if (file && file !== b.persistedFile && existsSync(file)) {
 		b.persistedFile = file;
+		invalidateSessions(b);
 		broadcast(b, { type: "sessions_changed" });
 		return;
 	}
@@ -454,6 +648,7 @@ async function autoTitle(b: Bridge): Promise<void> {
 		const title = cleanTitle(searchableText(result));
 		if (!title) return;
 		b.api.setSessionName(title);
+		invalidateSessions(b);
 		broadcast(b, { type: "sessions_changed" });
 	} catch {
 		// Cosmetic: the first-message fallback is still a usable name.
@@ -765,6 +960,7 @@ function snapshot(b: Bridge, metaOnly = false): unknown {
 		model: model ? { id: model.id, name: model.name, provider: model.provider } : null,
 		thinkingLevel: ctx.thinkingLevel,
 		thinkingLevels: supportedLevels(ctx.model),
+		mode: currentWorkspace(b),
 		models: availableModels(ctx).map((model) => ({
 			provider: model.provider,
 			id: model.id,
@@ -804,11 +1000,305 @@ async function serveStatic(pathname: string, res: ServerResponse): Promise<void>
 	}
 }
 
-async function listSessions(b: Bridge): Promise<unknown> {
-	// SessionManager.list parses only what was appended since the previous listing of these files.
-	const sessions = await SessionManager.list(b.ctx.cwd);
+const SESSION_CACHE_MS = 2500;
+const INDEX_CACHE_MS = 4000;
+
+function invalidateSessions(b: Bridge): void {
+	b.sessionIndexCache = {};
+	b.projectSessionCache = {};
+}
+
+/** Bounded concurrency: a large session tree should not open hundreds of descriptors at once. */
+async function mapLimit<T, R>(items: T[], limit: number, run: (item: T) => Promise<R>): Promise<R[]> {
+	const out: R[] = [];
+	for (let index = 0; index < items.length; index += limit) {
+		out.push(...(await Promise.all(items.slice(index, index + limit).map(run))));
+	}
+	return out;
+}
+
+/** Read only the session header: project discovery must not parse every old transcript. */
+async function readSessionRef(path: string): Promise<SessionRef | null> {
+	try {
+		const handle = await open(path, "r");
+		try {
+			const info = await handle.stat();
+			if (!info.isFile()) return null;
+			const buffer = Buffer.alloc(64 * 1024);
+			const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+			const chunk = buffer.subarray(0, bytesRead);
+			const newline = chunk.indexOf(0x0a);
+			const first = chunk.toString("utf8", 0, newline < 0 ? bytesRead : newline);
+			const header = JSON.parse(first) as { type?: string; cwd?: unknown };
+			if (header.type !== "session") return null;
+			let hasMessage = false;
+			for (const line of chunk.toString("utf8").split("\n")) {
+				if (!line.trim()) continue;
+				try {
+					if ((JSON.parse(line) as { type?: string }).type === "message") {
+						hasMessage = true;
+						break;
+					}
+				} catch {
+					// malformed line: the full parser will decide later
+				}
+			}
+			// A first message beyond the 64KB probe (huge system prompt) is still a real session.
+			if (!hasMessage && info.size > bytesRead) hasMessage = true;
+			return {
+				path,
+				cwd: typeof header.cwd === "string" ? header.cwd : "",
+				modified: info.mtime,
+				hasMessage,
+			};
+		} finally {
+			await handle.close();
+		}
+	} catch {
+		return null;
+	}
+}
+
+async function sessionRefsIn(dir: string): Promise<SessionRef[]> {
+	let entries: Dirent[];
+	try {
+		entries = (await readdir(dir, { withFileTypes: true })) as Dirent[];
+	} catch {
+		return [];
+	}
+	const files = entries
+		.filter((entry) => (entry.isFile() || entry.isSymbolicLink()) && entry.name.endsWith(".jsonl"))
+		.map((entry) => join(dir, entry.name));
+	const refs = await mapLimit(files, 24, readSessionRef);
+	return refs.filter((ref): ref is SessionRef => ref !== null);
+}
+
+/** Every project nife knows about, plus global web-ui stores, without reading transcript bodies. */
+async function nifeSessionDirs(): Promise<string[]> {
+	try {
+		const root = join(getAgentDir(), "sessions");
+		const entries = await readdir(root, { withFileTypes: true });
+		return entries
+			.filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
+			.map((entry) => join(root, entry.name));
+	} catch {
+		return [];
+	}
+}
+
+async function workspaceRefs(b: Bridge, workspace: Workspace): Promise<SessionRef[]> {
+	const cached = b.sessionIndexCache[workspace];
+	if (cached && Date.now() - cached.at < INDEX_CACHE_MS) return cached.refs;
+	const dirs = new Set<string>();
+	const add = (dir: string) => dirs.add(resolve(dir));
+	const currentDir = b.ctx.sessionManager.getSessionDir();
+	if (workspace === "work") {
+		add(WORK_SESSION_DIR);
+		if (b.legacyWorkDir) add(b.legacyWorkDir);
+		if (currentWorkspace(b) === "work" && currentDir) add(currentDir);
+		for (const dir of await nifeSessionDirs()) add(dir);
+	} else {
+		add(CHAT_SESSION_DIR);
+		if (b.legacyWorkDir) add(join(b.legacyWorkDir, LEGACY_CHAT_DIR));
+		if (currentDir) {
+			if (basename(currentDir).toLowerCase() === LEGACY_CHAT_DIR) add(currentDir);
+			else add(join(currentDir, LEGACY_CHAT_DIR));
+		}
+		for (const dir of await nifeSessionDirs()) add(join(dir, LEGACY_CHAT_DIR));
+	}
+	const groups = await mapLimit([...dirs], 8, sessionRefsIn);
+	const live = b.ctx.sessionManager.getSessionFile();
+	const livePath = live ? resolve(live) : "";
+	const byPath = new Map<string, SessionRef>();
+	let dropped = false;
+	for (const ref of groups.flat()) {
+		// A session whose project or file lives under a temp path is a throwaway run: forget the row
+		// and delete the file, so neither this scan nor the next one has to look at it again. The
+		// session this process is running is never deleted, even when it happens to live there.
+		if (isTempPath(ref.cwd) || isTempPath(ref.path)) {
+			if (resolve(ref.path) !== livePath) {
+				await rm(ref.path, { force: true }).catch(() => {});
+				dropped = true;
+			}
+			for (const [key, path] of Object.entries(b.workspaceFiles)) {
+				if (path === ref.path) delete b.workspaceFiles[key];
+			}
+			continue;
+		}
+		byPath.set(ref.path, ref);
+	}
+	// The per-project cache may still hold the sessions that were just removed with their files.
+	if (dropped) b.projectSessionCache = {};
+	const refs = [...byPath.values()].sort((left, right) => right.modified.getTime() - left.modified.getTime());
+	b.sessionIndexCache[workspace] = { at: Date.now(), refs };
+	return refs;
+}
+
+/** A path under a temp root or with a tmp/temp segment: a sandbox run, not a workspace. */
+function isTempPath(value: string): boolean {
+	const clean = String(value || "").trim();
+	if (!clean) return false;
+	const probe = resolve(clean).toLowerCase();
+	if (
+		TEMP_ROOTS.some((root) => {
+			const base = root.toLowerCase();
+			return probe === base || probe.startsWith(`${base}/`) || probe.startsWith(`${base}\\`);
+		})
+	) {
+		return true;
+	}
+	// Case-insensitive on purpose: Windows writes "Temp\", TMPDIR setups write "tmp/".
+	return probe.split(/[\\/]+/).some((segment) => TEMP_SEGMENTS.has(segment));
+}
+
+function projectGroups(b: Bridge, refs: SessionRef[]): ProjectGroupInfo[] {
+	const groups = new Map<string, ProjectGroupInfo>();
+	for (const ref of refs) {
+		if (!ref.hasMessage) continue;
+		// group by the comparable path, but keep the spelling the session recorded: the page passes
+		// that `cwd` back when it asks for one project's rows
+		const key = ref.cwd ? pathKey(ref.cwd) : "";
+		let group = groups.get(key);
+		if (!group) {
+			group = { cwd: ref.cwd || "", name: ref.cwd ? basename(ref.cwd) || ref.cwd : "Unknown project", count: 0, modified: ref.modified, current: Boolean(ref.cwd) && samePath(ref.cwd, b.ctx.cwd) };
+			groups.set(key, group);
+		}
+		group.count += 1;
+		if (ref.modified.getTime() > group.modified.getTime()) group.modified = ref.modified;
+	}
+	const list = [...groups.values()];
+	const current = list.findIndex((group) => group.current);
+	if (current > 0) list.unshift(list.splice(current, 1)[0]);
+	return list.sort((left, right) => (right.current ? 1 : 0) - (left.current ? 1 : 0) || right.modified.getTime() - left.modified.getTime());
+}
+
+/** Parse one full session, but only after its project group was expanded. */
+async function sessionInfoFromPath(path: string): Promise<SessionInfo | null> {
+	try {
+		const info = await stat(path);
+		const manager = SessionManager.open(path);
+		const header = manager.getHeader();
+		if (!header) return null;
+		let messageCount = 0;
+		let firstMessage = "";
+		const texts: string[] = [];
+		for (const entry of manager.getEntries()) {
+			if (entry.type !== "message") continue;
+			messageCount += 1;
+			for (const message of sessionEntryToContextMessages(entry)) {
+				const role = (message as { role?: string }).role;
+				if (role !== "user" && role !== "assistant") continue;
+				const text = searchableText(message);
+				if (!text) continue;
+				texts.push(text);
+				if (!firstMessage && role === "user") firstMessage = text;
+			}
+		}
+		const created = new Date(header.timestamp);
+		return {
+			path,
+			id: manager.getSessionId(),
+			cwd: manager.getCwd(),
+			name: manager.getSessionName(),
+			parentSessionPath: header.parentSession,
+			created: Number.isNaN(created.getTime()) ? info.mtime : created,
+			modified: info.mtime,
+			messageCount,
+			firstMessage: firstMessage || "(no messages)",
+			allMessagesText: texts.join(" "),
+		};
+	} catch {
+		return null;
+	}
+}
+
+async function projectSessionsForCwd(b: Bridge, workspace: Workspace, cwd: string): Promise<SessionInfo[]> {
+	const key = `${workspace}\n${cwd}`;
+	const cached = b.projectSessionCache[key];
+	if (cached && Date.now() - cached.at < SESSION_CACHE_MS) return cached.sessions;
+	const refs = (await workspaceRefs(b, workspace)).filter(
+		(ref) => ref.hasMessage && (cwd ? samePath(ref.cwd, cwd) : ref.cwd === ""),
+	);
+	const infos = await mapLimit(refs, 8, (ref) => sessionInfoFromPath(ref.path));
+	const sessions = infos
+		.filter((session): session is SessionInfo => session !== null && session.messageCount > 0)
+		.sort((left, right) => right.modified.getTime() - left.modified.getTime());
+	b.projectSessionCache[key] = { at: Date.now(), sessions };
+	return sessions;
+}
+
+/** Every known session path; delete/rename validation should not parse transcripts. */
+async function allSessionPaths(b: Bridge): Promise<Set<string>> {
+	const [work, chat] = await Promise.all([workspaceRefs(b, "work"), workspaceRefs(b, "chat")]);
+	return new Set([...work, ...chat].map((ref) => ref.path));
+}
+
+/** `~` is the user's home; relative names are resolved from the current project, not this process. */
+function projectPath(b: Bridge, value: string): string {
+	const input = value.trim();
+	if (!input) return PROJECTS_ROOT;
+	if (input === "~") return homedir();
+	if (input.startsWith("~/") || input.startsWith("~\\")) return resolve(homedir(), input.slice(2));
+	return resolve(b.ctx.cwd || PROJECTS_ROOT, input);
+}
+
+/** The new-session picker: the default root, its child projects, and projects with history. */
+async function listProjects(b: Bridge) {
+	const found = new Map<string, { path: string; name: string; kind: "default" | "project" | "current" | "recent" }>();
+	const add = (path: string, kind: "default" | "project" | "current" | "recent") => {
+		if (!path) return;
+		const clean = resolve(path);
+		const existing = found.get(clean);
+		if (existing) {
+			if (kind === "current") existing.kind = "current";
+			return;
+		}
+		found.set(clean, { path: clean, name: basename(clean) || clean, kind });
+	};
+	add(PROJECTS_ROOT, "default");
+	try {
+		const children = (await readdir(PROJECTS_ROOT, { withFileTypes: true }))
+			.filter((entry) => (entry.isDirectory() || entry.isSymbolicLink()) && !entry.name.startsWith("."))
+			.map((entry) => join(PROJECTS_ROOT, entry.name))
+			.sort((left, right) => left.localeCompare(right));
+		for (const child of children) add(child, "project");
+	} catch {
+		// the default root appears on first use
+	}
+	if (b.ctx.cwd && !isTempPath(b.ctx.cwd)) add(b.ctx.cwd, "current");
+	try {
+		const [work, chat] = await Promise.all([workspaceRefs(b, "work"), workspaceRefs(b, "chat")]);
+		const recent = [...work, ...chat].sort((left, right) => right.modified.getTime() - left.modified.getTime());
+		for (const ref of recent) if (ref.cwd && ref.hasMessage) add(ref.cwd, "recent");
+	} catch {
+		// the picker still works with the default path and the current project
+	}
+	return { default: PROJECTS_ROOT, projects: [...found.values()] };
+}
+
+/** Sidebar metadata: every project, but no transcript bodies. */
+async function listGroups(b: Bridge): Promise<unknown> {
+	const refs = await workspaceRefs(b, currentWorkspace(b));
+	const groups = projectGroups(b, refs);
+	// Only projects with a saved conversation are listed. The current project is not injected as an
+	// empty group: a New Work / New Chat still has no row, and deleting a workspace has to remove it
+	// from the sidebar right away instead of leaving its name behind with "No sessions". The group
+	// comes back with the first message, because that message is what puts a row in it.
+	return {
+		current: b.ctx.cwd,
+		currentFile: b.ctx.sessionManager.getSessionFile(),
+		mode: currentWorkspace(b),
+		groups,
+	};
+}
+
+async function listSessions(b: Bridge, cwd: string): Promise<unknown> {
+	// Header-only sessions are the empty target of a workspace switch; they join Recents with their
+	// first message, not before.
+	const sessions = await projectSessionsForCwd(b, currentWorkspace(b), cwd);
 	return {
 		current: b.ctx.sessionManager.getSessionFile(),
+		cwd,
 		sessions: sessions.map((session) => ({
 			path: session.path,
 			id: session.id,
@@ -855,7 +1345,7 @@ function searchMatches(rows: { entryId: string; message: unknown }[], query: str
 
 /**
  * Deleting a session mirrors the TUI selector: prefer the `trash` CLI so the file is recoverable,
- * fall back to unlink. Only paths that SessionManager lists for this cwd are ever passed here.
+ * fall back to unlink. Only paths that SessionManager lists for a project are ever passed here.
  */
 async function deleteSessionFile(
 	sessionPath: string,
@@ -1022,8 +1512,54 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		return send(res, 200, JSON.stringify({ messages: messages.slice(start, stop), from: start }), "application/json");
 	}
 
+	if (req.method === "GET" && path === "/api/projects") {
+		return send(res, 200, JSON.stringify(await listProjects(b)), "application/json");
+	}
+
+	/**
+	 * Directory browser for the new-session picker: one level of subdirectories per request, so the
+	 * picker works without typing a path. Hidden entries are skipped, symlinks only when they point
+	 * at a directory, and an unreadable path answers 400 with the text the picker shows.
+	 */
+	if (req.method === "GET" && path === "/api/dirs") {
+		const target = projectPath(b, url.searchParams.get("path") ?? "~");
+		try {
+			if (!(await stat(target)).isDirectory()) return send(res, 400, `不是文件夹：${target}`);
+		} catch {
+			return send(res, 400, `无法打开：${target}`);
+		}
+		const entries = await readdir(target, { withFileTypes: true }).catch(() => [] as Dirent[]);
+		const dirs: { name: string; path: string }[] = [];
+		for (const entry of entries) {
+			// A home directory can be huge; the picker scrolls instead of reading everything.
+			if (dirs.length >= BROWSE_DIR_MAX) break;
+			if (entry.name.startsWith(".")) continue;
+			const child = join(target, entry.name);
+			if (entry.isDirectory()) {
+				dirs.push({ name: entry.name, path: child });
+				continue;
+			}
+			if (!entry.isSymbolicLink()) continue;
+			const linked = await stat(child).catch(() => null);
+			if (linked?.isDirectory()) dirs.push({ name: entry.name, path: child });
+		}
+		dirs.sort((left, right) => left.name.localeCompare(right.name, "zh"));
+		const parent = dirname(target);
+		return send(
+			res,
+			200,
+			JSON.stringify({ path: target, parent: parent === target ? null : parent, home: homedir(), dirs }),
+			"application/json",
+		);
+	}
+
+	if (req.method === "GET" && path === "/api/groups") {
+		return send(res, 200, JSON.stringify(await listGroups(b)), "application/json");
+	}
+
 	if (req.method === "GET" && path === "/api/sessions") {
-		return send(res, 200, JSON.stringify(await listSessions(b)), "application/json");
+		const cwd = url.searchParams.get("cwd");
+		return send(res, 200, JSON.stringify(await listSessions(b, cwd ?? b.ctx.cwd)), "application/json");
 	}
 
 	// Full-text search across this project's conversations. `SessionManager.list` already read every
@@ -1034,10 +1570,12 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		if (!raw) return send(res, 200, JSON.stringify({ results: [] }), "application/json");
 		if (raw.length > SEARCH_QUERY_MAX) return send(res, 400, "query too long");
 		const query = raw.toLowerCase();
-		const sessions = await SessionManager.list(b.ctx.cwd);
+		const refs = await workspaceRefs(b, currentWorkspace(b));
 		const results: unknown[] = [];
-		for (const session of sessions) {
-			if (!session.allMessagesText.toLowerCase().includes(query)) continue;
+		for (const ref of refs) {
+			if (!ref.hasMessage) continue;
+			const session = await sessionInfoFromPath(ref.path);
+			if (!session || session.messageCount === 0 || !session.allMessagesText.toLowerCase().includes(query)) continue;
 			let manager: SessionManager;
 			try {
 				manager = SessionManager.open(session.path);
@@ -1054,6 +1592,7 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 				path: session.path,
 				id: session.id,
 				name: session.name,
+				cwd: session.cwd,
 				modified: session.modified,
 				firstMessage: session.firstMessage.replace(/\s+/g, " ").trim().slice(0, SESSION_TITLE_MAX),
 				matches,
@@ -1216,10 +1755,19 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		return send(res, 200, "ok");
 	}
 
+	if (req.method === "POST" && path === "/api/mode") {
+		const body = await readJson(req, 1024);
+		if (body.mode !== "work" && body.mode !== "chat") return send(res, 400, "mode must be work or chat");
+		const outcome = await switchWorkspace(b, body.mode);
+		if (!outcome.ok) return send(res, 409, outcome.message ?? "switch failed");
+		return send(res, 200, JSON.stringify({ mode: currentWorkspace(b) }), "application/json");
+	}
+
 	if (req.method === "POST" && path === "/api/resume") {
 		const body = await readJson(req);
 		const sessionPath = typeof body.path === "string" ? body.path : "";
 		if (!sessionPath) return send(res, 400, "missing path");
+		rememberCurrent(b);
 		const outcome = await requestSwitch(b, `resume ${sessionPath}`);
 		if (!outcome.ok) return send(res, 409, outcome.message ?? "switch failed");
 		broadcast(b, { type: "session_switch" });
@@ -1233,29 +1781,33 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		const requested = Array.isArray(body.paths) ? body.paths : [body.path];
 		const targets = [...new Set(requested.filter((entry): entry is string => typeof entry === "string" && entry.length > 0))];
 		if (targets.length === 0) return send(res, 400, "missing path");
-		// Never delete arbitrary paths: every target has to be a session this project lists.
-		const known = new Set((await SessionManager.list(b.ctx.cwd)).map((session) => session.path));
+		// Never delete arbitrary paths: every target has to be a session either workspace lists.
+		const known = await allSessionPaths(b);
 		if (targets.some((target) => !known.has(target))) return send(res, 404, "unknown session");
 		const active = b.ctx.sessionManager.getSessionFile();
 		if (active && targets.includes(active)) {
 			// The active session can go too, but not while it is being written to. Move the runtime to
-			// a fresh session first, then remove the file the old session pointed at.
+			// a fresh session in the same project first, then remove the old file.
 			if (!b.ctx.isIdle()) return send(res, 409, "stop the current turn first");
-			const outcome = await requestSwitch(b, "new");
+			const outcome = await createAndSwitch(b, currentWorkspace(b), b.ctx.cwd);
 			if (!outcome.ok) return send(res, 409, outcome.message ?? "switch failed");
-			broadcast(b, { type: "session_switch" });
 		}
 		const methods: string[] = [];
 		for (const target of targets) {
 			const result = await deleteSessionFile(target);
+			for (const [key, path] of Object.entries(b.workspaceFiles)) {
+				if (path === target) delete b.workspaceFiles[key];
+			}
 			if (!result.ok) {
 				// Earlier targets in a batch are already gone; let every tab refresh instead of
 				// leaving rows that no longer exist on disk.
+				invalidateSessions(b);
 				broadcast(b, { type: "sessions_changed" });
 				return send(res, 500, result.error ?? "delete failed");
 			}
 			methods.push(result.method);
 		}
+		invalidateSessions(b);
 		broadcast(b, { type: "sessions_changed" });
 		return send(res, 200, JSON.stringify({ methods }));
 	}
@@ -1266,8 +1818,8 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		const name = typeof body.name === "string" ? body.name.replace(/[\r\n]+/g, " ").trim() : "";
 		if (!target) return send(res, 400, "missing path");
 		if (name.length > 200) return send(res, 400, "name too long");
-		// Same rule as delete: only a session this project lists can be renamed.
-		const known = (await SessionManager.list(b.ctx.cwd)).some((session) => session.path === target);
+		// Same rule as delete: only a session either workspace lists can be renamed.
+		const known = (await allSessionPaths(b)).has(target);
 		if (!known) return send(res, 404, "unknown session");
 		if (target === b.ctx.sessionManager.getSessionFile()) {
 			// Goes through the live session so its own event updates every attached page.
@@ -1276,15 +1828,25 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 			// Not running: append the same session_info entry the live path writes.
 			SessionManager.open(target).appendSessionInfo(name);
 		}
+		invalidateSessions(b);
 		broadcast(b, { type: "sessions_changed" });
 		return send(res, 200, "ok");
 	}
 
 	if (req.method === "POST" && path === "/api/new") {
-		const outcome = await requestSwitch(b, "new");
+		const body = await readJson(req, 16 * 1024);
+		if (!b.ctx.isIdle()) return send(res, 409, "stop the current turn first");
+		const mode: Workspace = body.mode === "chat" ? "chat" : body.mode === "work" ? "work" : currentWorkspace(b);
+		const cwd = projectPath(b, typeof body.cwd === "string" ? body.cwd : "");
+		try {
+			await mkdir(cwd, { recursive: true });
+			if (!(await stat(cwd)).isDirectory()) return send(res, 400, "working directory is not a directory");
+		} catch (error) {
+			return send(res, 400, `could not use ${cwd}: ${error instanceof Error ? error.message : "not a directory"}`);
+		}
+		const outcome = await createAndSwitch(b, mode, cwd);
 		if (!outcome.ok) return send(res, 409, outcome.message ?? "switch failed");
-		broadcast(b, { type: "session_switch" });
-		return send(res, 200, "ok");
+		return send(res, 200, JSON.stringify({ path: outcome.path, cwd, mode }), "application/json");
 	}
 
 	/**
@@ -1985,8 +2547,12 @@ async function start(api: ExtensionAPI, ctx: ExtensionContext): Promise<Bridge> 
 		children: new Map(),
 		autoOpened: false,
 		switchRequest: undefined,
-		persistedFile: sessionFile && existsSync(sessionFile) ? sessionFile : undefined,
+		persistedFile: sessionFile && existsSync(sessionFile) && hasMessages(ctx) ? sessionFile : undefined,
 		titleTried: new Set(),
+		workspaceFiles: {},
+		sessionIndexCache: {},
+		projectSessionCache: {},
+		legacyWorkDir: legacyWorkDirOf(ctx.sessionManager.getSessionDir()),
 		uploadDir: undefined,
 		proxyBypassSaved: undefined,
 		publicUrls: new Map(),
@@ -2089,10 +2655,15 @@ export default function webui(api: ExtensionAPI) {
 				b.switchRequest = undefined;
 				request?.(outcome);
 			};
-			const [kind, ...rest] = args.trim().split(/\s+/);
+			// Keep the rest of a resume argument byte-for-byte: a project directory may contain
+			// repeated spaces, which splitting and joining would collapse.
+			const trimmed = args.trim();
+			const at = trimmed.search(/\s/);
+			const kind = at < 0 ? trimmed : trimmed.slice(0, at);
+			const rest = at < 0 ? "" : trimmed.slice(at + 1);
 			try {
 				if (kind === "resume") {
-					const sessionPath = rest.join(" ");
+					const sessionPath = rest;
 					if (!sessionPath) throw new Error("missing session path");
 					const result = await ctx.switchSession(sessionPath);
 					settle(result.cancelled ? { ok: false, message: "switch cancelled" } : { ok: true });
@@ -2104,7 +2675,7 @@ export default function webui(api: ExtensionAPI) {
 					return;
 				}
 				if (kind === "tree") {
-					const [entryId] = rest;
+					const [entryId] = rest.split(/\s+/);
 					if (!entryId) throw new Error("missing entry id");
 					// nife's own navigateTree puts the prompt into the terminal editor as well, so both screens
 					// end up showing the same message ready to be edited
@@ -2141,9 +2712,10 @@ export default function webui(api: ExtensionAPI) {
 		// New session: same bridge, same port and token, rebound to the live context.
 		b.api = api;
 		b.ctx = ctx;
-		// A fresh session has a file path before its first prompt, but no file on disk yet.
+		// A fresh session has a file path before its first prompt, but no file on disk yet. An empty
+		// header-only session also waits for its first message before it belongs in Recents.
 		const file = ctx.sessionManager.getSessionFile();
-		b.persistedFile = file && existsSync(file) ? file : undefined;
+		b.persistedFile = file && existsSync(file) && hasMessages(ctx) ? file : undefined;
 		patchDialogs(ctx, b);
 		// /reload keeps the bridge (globalThis) but not this module's fields, and it drops the timer
 		// that watched the tunnel: fill both back in instead of leaving a dead public URL behind.
@@ -2153,8 +2725,27 @@ export default function webui(api: ExtensionAPI) {
 		b.tunnelRevives ??= 0;
 		b.tunnelBusy ??= false;
 		b.titleTried ??= new Set();
+		b.workspaceFiles ??= {};
+		b.sessionIndexCache ??= {};
+		b.projectSessionCache ??= {};
+		invalidateSessions(b);
+		b.legacyWorkDir ??= legacyWorkDirOf(ctx.sessionManager.getSessionDir());
 		if (b.publicUrls.size) scheduleTunnel(b, TUNNEL_HEARTBEAT_MS);
+		const workspace = currentWorkspace(b);
+		if (file) b.workspaceFiles[workspaceKey(workspace, ctx.cwd)] = file;
+		// Chat workspace sessions never declare tools. Work sessions get nife's defaults from the
+		// fresh runtime created by switchSession/newSession.
+		if (workspace === "chat") b.api.setActiveTools([]);
 		broadcast(b, { type: "session_start", reason: event.reason });
+		broadcast(b, { type: "mode_changed", mode: workspace });
+	});
+
+	api.on("before_agent_start", () => {
+		const b = store.__nifeWebui;
+		if (!b || currentWorkspace(b) !== "chat") return;
+		// A terminal /chat toggle or reload must not put tools back into the chat workspace.
+		if (b.api.getActiveTools().length > 0) b.api.setActiveTools([]);
+		return { systemPrompt: CHAT_SYSTEM_PROMPT };
 	});
 
 	// Do not stop on session_shutdown: the bridge outlives /new, /resume and /fork.

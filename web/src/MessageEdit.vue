@@ -3,6 +3,7 @@ import { computed, nextTick, onMounted, ref, watch } from "vue";
 import FileIcon from "./FileIcon.vue";
 import { uploadFile } from "./bridge.js";
 import { formatBytes, splitAttachments } from "./files.js";
+import { INLINE_MAX_CHARS, INLINE_TOTAL_CHARS, inlineTextOf } from "./inline.js";
 import { previewImage } from "./images.js";
 import { dataUrl, imagesOf, textOf } from "./message-utils.js";
 import { IMAGE_MAX_COUNT, asImageFile, imageMimeType } from "./paste.js";
@@ -19,6 +20,8 @@ const props = defineProps({
 	// what was typed so far, when this card had to be unmounted (the transcript only keeps a window
 	// of rows mounted, so scrolling far enough away would otherwise lose the edit)
 	draft: { type: Object, default: null },
+	// Chat inlines text instead of handing the model a path it has no tool to read.
+	chat: { type: Boolean, default: false },
 });
 
 // `notice` is the composer's toast: the card is too small for its own error line
@@ -90,16 +93,28 @@ async function addImages(incoming) {
 const patchFile = (id, patch) =>
 	(files.value = files.value.map((entry) => (entry.id === id ? { ...entry, ...patch } : entry)));
 
-/** Dropped non-images: the browser has no path, so the bytes go to the bridge's upload dir first. */
+/** Dropped non-images: Work uploads a temp path, Chat reads the text here. */
 async function addFiles(incoming) {
 	for (const file of incoming) {
 		seq += 1;
 		const id = `new-${seq}`;
-		const chip = { id, name: file.name || "file", size: file.size, progress: 0, path: "" };
+		const chip = { id, name: file.name || "file", size: file.size, progress: 0, path: "", reading: props.chat };
 		files.value = [...files.value, chip];
 		try {
-			const uploaded = await uploadFile(file, (fraction) => patchFile(id, { progress: fraction }));
-			patchFile(id, { progress: 1, path: uploaded.path, name: uploaded.name || chip.name });
+			if (props.chat) {
+				const text = await inlineTextOf(file);
+				if (text.length > INLINE_MAX_CHARS) {
+					throw new Error(`file is too long for Chat (limit ${Math.round(INLINE_MAX_CHARS / 1000)}k characters)`);
+				}
+				const used = files.value.reduce((total, entry) => total + (entry.text?.length ?? 0), 0);
+				if (used + text.length > INLINE_TOTAL_CHARS) {
+					throw new Error(`Chat can inline at most ${Math.round(INLINE_TOTAL_CHARS / 1000)}k characters per message`);
+				}
+				patchFile(id, { reading: false, progress: 1, text });
+			} else {
+				const uploaded = await uploadFile(file, (fraction) => patchFile(id, { progress: fraction }));
+				patchFile(id, { progress: 1, path: uploaded.path, name: uploaded.name || chip.name });
+			}
 		} catch (error) {
 			files.value = files.value.filter((entry) => entry.id !== id);
 			emit("notice", error instanceof Error ? error.message : "upload failed");
@@ -175,9 +190,11 @@ async function attachDropped(dropped) {
 	if (rest.length > 0) await addFiles(rest);
 }
 
-const uploading = computed(() => files.value.some((file) => !file.path));
+const uploading = computed(() => files.value.some((file) => !file.path && typeof file.text !== "string"));
 const preparing = computed(() => images.value.some((image) => image.loading));
 const fileSize = (file) => {
+	if (file.reading) return "Reading…";
+	if (typeof file.text === "string") return formatBytes(file.size ?? file.text.length);
 	if (!file.path) return file.progress > 0 ? `${Math.round(file.progress * 100)}%` : "Uploading…";
 	return Number.isFinite(file.size) ? formatBytes(file.size) : "";
 };
@@ -190,8 +207,10 @@ const empty = computed(
 const draftOf = () => ({
 	text: text.value.trim(),
 	images: images.value.filter((image) => !image.loading).map(({ mimeType, data }) => ({ mimeType, data })),
-	// a file that is still uploading has no path yet: it is not part of the draft (and cannot be sent)
-	files: files.value.filter((file) => file.path).map(({ name, path }) => ({ name, path })),
+	// a file that is still uploading has no path and no text: it is not part of the draft
+	files: files.value
+		.filter((file) => file.path || typeof file.text === "string")
+		.map(({ name, path, size, text }) => ({ name, path, size, text })),
 });
 
 // Hand every change back, so the draft survives being scrolled out of the rendered window.
@@ -236,7 +255,11 @@ function onKeydown(event) {
 						<span class="file-size">{{ fileSize(file) }}</span>
 					</span>
 					<button type="button" class="attachment-remove" title="Remove file" @click="removeFile(file.id)">×</button>
-					<span v-if="!file.path" class="file-progress" :style="{ width: `${Math.round(file.progress * 100)}%` }"></span>
+					<span
+						v-if="!file.path && typeof file.text !== 'string'"
+						class="file-progress"
+						:style="{ width: `${Math.round(file.progress * 100)}%` }"
+					></span>
 				</div>
 			</div>
 			<textarea

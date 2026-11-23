@@ -110,7 +110,7 @@ const noticeText = (message) => {
 		<div v-if="userContent.text || userContent.files.length > 0" class="bubble">
 			<div v-if="userContent.text" class="text">{{ userContent.text }}</div>
 			<div v-if="userContent.files.length > 0" class="bubble-files">
-				<span v-for="(file, i) in userContent.files" :key="i" class="bubble-file" :title="file.path">
+				<span v-for="(file, i) in userContent.files" :key="i" class="bubble-file" :title="file.path || file.name">
 					<FileIcon :name="file.name" />
 					{{ file.name }}
 				</span>

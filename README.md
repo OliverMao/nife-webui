@@ -33,6 +33,8 @@ web/src/transcript.js  collapses thinking/tool runs into one row
 web/src/images.js     pasted image -> canvas resize -> base64 ImageContent
 web/src/paste.js      text-paste markers + image mime/size rules
 web/src/files.js      dropped-file marker lines, names, sizes, type icons
+web/src/inline.js     Chat attachments: text/PDF extraction, size caps
+web/src/pdf.js        lazy pdf.js text extraction for Chat
 web/src/FileIcon.vue  one stroked 16px glyph per file category
 web/src/style.css     all styling
 web/dist/             built output, served by the extension
@@ -151,25 +153,70 @@ so 700ms later) and the page ignores ports that were already there for the first
 
 From the browser:
 
-- left sidebar lists sessions for the current working directory, click to switch (`/resume`)
+- `Nife Work` and `Nife Chat` are separate workspaces with separate session histories. New
+  sessions live in a global web-ui store (`~/.nife/webui/work` and `~/.nife/webui/chat`), not in
+  the directory nife was started from; each header records the project `cwd`, and opening it makes
+  nife rebuild the runtime (and its tools) for that directory. Every nife project directory and
+  every old `webui-chat/` directory is discovered, but only session headers are read during
+  discovery; transcript bodies wait until the project is expanded. Sessions that belong to a temp
+  location are throwaway sandbox runs: any path segment named `tmp` or `temp` (case-insensitive),
+  `os.tmpdir()`, `TMPDIR`/`TEMP`/`TMP`, `%LOCALAPPDATA%\Temp` and `%SystemRoot%\Temp` on Windows,
+  `/tmp` and `/var/tmp` on Unix - for the project `cwd` or for the session file itself. They never
+  show up as projects, and discovery deletes the file instead of remembering it (the session this
+  process is running is the one exception - hidden from the lists, never deleted from under itself)
+- `New Work` / `New Chat` starts the empty session immediately in the last directory used and puts
+  the project chip in the composer, because the directory is part of the prompt. Clicking it opens
+  a picker that works without knowing any paths: the folders of the current project with a
+  breadcrumb (and an up button) to walk anywhere, plus shortcuts for the home directory,
+  `~/.nife/project` and the current project. Typing filters known projects and history and also
+  accepts any path (`~` expanded); a name that matches a known project opens it, anything else
+  becomes a new directory on the server. The picker is backed by `GET /api/dirs`, which lists one
+  level of subdirectories without leaving the server. Picking another directory moves the
+  still-empty session there, the last choice is remembered in `localStorage`, and once the first
+  message is sent the chip disappears: nife fixes a session's `cwd` at that point
+- left sidebar lists sessions for the current workspace across **all projects**, click to switch
+  (`/resume`). Rows are grouped under foldable project headers; the active/most recent project is
+  expanded and marked with a dot, other groups follow by latest activity and are collapsed. The
+  first group's rows load immediately; expanding any other group fetches just that project's
+  sessions, so a large old session tree does not delay the first paint. A trash button on each
+  project header deletes that workspace's conversations after one confirmation; the project
+  directory and its files are left untouched, and the header disappears with its last conversation
+  instead of lingering as an empty group. A project only appears once it has a saved conversation:
+  an empty New Work / New Chat is not a row, so there is no group to leave behind either. The
+  footer always shows the active project. Search scans every conversation in the current workspace,
+  again across projects, and its results carry a project label
+- the mode selector switches workspace but keeps the current project directory: it resumes that
+  project's last session in the target workspace, or opens an empty New Work / New Chat for it.
+  Switching pauses the page queue because the active session changed. Each workspace has its own
+  Recents, pins and search
+- Chat workspace sessions always declare no tools and use nife's chat system prompt. The workspace
+  is derived from the session file location, so `/new`, `/resume` and `/fork` stay inside it.
+  Dropped images attach as image content for vision models; text, code, CSV, Markdown, JSON and
+  selectable PDF text are read in the browser and carried inside the prompt, so Chat needs no tool
+  to read them. Binary/Office files still need Work. The terminal's own `/resume` selector keeps
+  nife's project-local behavior; the page is the cross-project switcher
 - hovering a session reveals a `⋯` menu with `重命名`, `置顶`, `多选` and `删除`. Rename edits the
   row in place (Enter commits, Escape cancels) and prefers the stored `session_info` name over the
-  first prompt. Pinned rows sort above the rest and keep a pin mark; the pin list is stored in
-  `localStorage` per project directory, because it is a browser preference, not session content
+  first prompt. Pinned rows sort above the rest **within their project group** and keep a pin mark;
+  the pin list is stored in `localStorage` per workspace (not per project), because it is a browser
+  preference, not session content
 - after a new conversation's first turn settles, the bridge asks the current model for a short
   title (a separate request, never part of the transcript) and writes the same `session_info` entry
   a manual rename writes. The sidebar updates through `sessions_changed`. A manual name always
   wins; if the title request fails, the first-prompt fallback stays in place
-- the sidebar header keeps the existing `Nife` wordmark, with search and panel buttons on the
-  right. Search opens an animated centred palette and scans the user/assistant text of every
-  conversation in this project: results group matching snippets under their session title and
-  highlight the query. Clicking a snippet switches to that session and jumps to the matching
-  message. Escape or the X closes the palette; the compact pill opens the same one
+- the sidebar header keeps the existing `Nife` wordmark, with the mode selector right beside it and
+  the search/panel buttons on the right. Search opens an animated centred palette and scans the
+  user/assistant text of every conversation in this workspace and all its projects: results group
+  matching snippets under their session title and highlight the query. Clicking a snippet switches
+  to that session (and its project) and
+  jumps to the matching message. Escape or the X closes the palette; the compact pill opens the
+  same one
 - entering `多选` from a row's `⋯` menu turns rows into circular
   checkboxes, the header counts the selection, and the footer offers `置顶` plus `删除`. Bulk pin
   toggles all checked rows; bulk delete asks once in the same centred modal. The active session can
-  be deleted too: the bridge first switches to a fresh session, so the page lands on the New chat
-  screen. Deletion uses the `trash` CLI when it is installed and falls back to `unlink`, mirroring
+  be deleted too: the bridge first switches to a fresh session in the same project, so the page
+  lands on that workspace's New Work / New Chat screen. Deletion uses the `trash` CLI when it is
+  installed and falls back to `unlink`, mirroring
   the TUI selector, and every open tab refreshes via the `sessions_changed` event
 - sending while a turn is running **queues** the task instead of interrupting it: a strip 20px
   narrower than the composer sits flush on its top edge, listing FIFO items with a text preview, a
@@ -194,8 +241,9 @@ From the browser:
   thumbnails with the corner remove badge, `file-chip`s with name and size, a progress bar while an
   upload runs. Paste goes through `prepareImage` (a clipboard item's type is trusted, and a File that
   arrives with an empty type is re-typed before it - a screenshot otherwise looked like a plain
-  file, with no preview and no image block for the model), drop uploads non-images to the bridge's
-  temp dir first, and `Send` waits while an upload is still running. `Cancel` (or Escape) puts the bubble
+  file, with no preview and no image block for the model), drop uploads non-images in Work and
+  inlines them in Chat, and `Send` waits while a file is still being read or uploaded. `Cancel` (or
+  Escape) puts the bubble
   back. `Send` first posts the prompt's session entry id to `POST /api/tree` - which runs
   `ctx.navigateTree` for that prompt, no branch summary, exactly like `/tree` - reloads the
   truncated branch, and only then posts the edited prompt, so it lands on the branch it edits and
@@ -313,12 +361,15 @@ From the browser:
   thread and the spinner keeps turning. Until the swap happens the send button is disabled
   (`Preparing the attachments…`), and `Cancel`/`×` drops the placeholder too
 - files can be dropped anywhere on the page: the composer outline turns into the drop target, and
-  dropped images land in the same thumbnail row as pasted ones. Any other file is uploaded to
-  `$TMPDIR/nife-webui/<pid>-<token>/` (`POST /api/upload`, 25MB cap) under a **generated** name,
+  dropped images land in the same thumbnail row as pasted ones. In Work, any other file is uploaded
+  to `$TMPDIR/nife-webui/<pid>-<token>/` (`POST /api/upload`, 25MB cap) under a **generated** name,
   `<16 hex><sanitized extension>`; the uploaded name is only a label and never picks a path, a
   length or a collision. The endpoint returns `{ path, name }`, and the chip shows the name with a
   type icon (`web/src/files.js`: pdf, image, doc, sheet, slides, archive, code, text, audio,
-  video, generic, each with its own accent colour). A drag can also carry *no bytes* at all - a
+  video, generic, each with its own accent colour). In Chat, text-like files are read with
+  `TextDecoder` and selectable PDF text with lazy-loaded `pdfjs-dist`, then inlined into the prompt
+  (150k characters per file, 300k per message, 2MB raw text / 25MB PDF); binary and Office formats
+  are refused with a notice to use Work. A drag can also carry *no bytes* at all - a
   picture dragged out of the transcript, or a link dragged from another page. Our own pictures are
   `data:`/`blob:` URLs, so that case is fetched back into a File and attached like any other image
   (`attachLink`), and a remote link is refused with `that drag carried a link, not a file — paste
@@ -413,16 +464,38 @@ No build step for the extension itself: plain `node:http` + SSE, no runtime depe
   request's file name is reduced to a label (directory parts dropped, `<>:"|?*` and control
   characters replaced, 80 chars max) and only a `[a-z0-9]` extension is carried over, so a header
   cannot choose a directory, overwrite another drop, or smuggle a name into a shell command.
-- `POST /api/delete` accepts `path` or a `paths` array; every target must be a path that
-  `SessionManager.list(cwd)` returns for this project, so the endpoint cannot be pointed at an
-  arbitrary file. The active session is allowed while idle: the runtime moves to a fresh session
-  before any file is removed, and a batch is validated before the first unlink.
-- `POST /api/rename` takes `path` and `name`; the active session goes through
-  `api.setSessionName`, an inactive one through `SessionManager.open(path).appendSessionInfo(name)`,
-  so the name the list shows is the same `session_info` entry the terminal writes.
-- `GET /api/search?q=` scans the `allMessagesText` of every session listed for this cwd, opens only
-  the sessions that can hit, and returns up to 40 groups with up to 6 snippets each. A snippet
-  carries its `entryId`, so the page can reveal that message after switching sessions.
+- `GET /api/groups` discovers every project from session headers across the global web-ui stores
+  and every nife project directory, and returns only `{ path, name, count, modified, current }`
+  metadata. The header index is cached for 4s; transcript bodies are not opened.
+- `GET /api/sessions?cwd=<project>` parses full sessions for **one** expanded project only and
+  returns its rows. Per-project result sets are cached for 2.5s. New first prompts, rename, title
+  and delete invalidate both caches, so sidebar event bursts do not rescan the tree.
+- `POST /api/delete` accepts `path` or a `paths` array; every target must be a session path the
+  bridge lists for one of the two workspaces, so the endpoint cannot be pointed at an arbitrary
+  file. The active session is allowed while idle: the runtime moves to a fresh session in the same
+  project and workspace before any file is removed, and a batch is validated before the first
+  unlink.
+- `POST /api/rename` takes `path` and `name`; the target must be a session from either workspace.
+  The active session goes through `api.setSessionName`, an inactive one through
+  `SessionManager.open(path).appendSessionInfo(name)`, so the name the list shows is the same
+  `session_info` entry the terminal writes.
+- `POST /api/new` takes `{"cwd":"<project>","mode":"work"|"chat"}` (mode optional). It creates the
+  directory when needed, writes a header-only session into the global work/chat store with that
+  `cwd`, and switches the runtime to it, so the first prompt is already a project session. The
+  body is limited to 16KB and `~`/relative paths are resolved server-side.
+- `GET /api/projects` returns `{ default, projects: [{ path, name, kind }] }`: the default
+  `~/.nife/project`, its child directories, the current project and projects that already have
+  history. It is the picker's data source, not a filesystem-control endpoint.
+- `POST /api/mode` takes `{"mode":"work"|"chat"}` and switches workspaces while staying in the
+  current project directory: it remembers the current session, resumes a session for that `cwd` in
+  the target workspace, or creates a header-only one. `state.mode` is derived from the active
+  session file (`webui/work`, `webui/chat`, or a legacy `webui-chat/`). `before_agent_start` keeps
+  Chat sessions tool-free and supplies the chat prompt. Because the extension API has no
+  `setChatMode`, the workspace uses those public hooks instead.
+- `GET /api/search?q=` scans the `allMessagesText` of the current workspace's sessions across all
+  projects, opens only the sessions that can hit, and returns up to 40 groups with up to 6 snippets
+  each. A snippet carries its `entryId`, so the page can reveal that message after switching
+  sessions. The other workspace is not searched until the selector switches to it.
 - There is no login: the URL carries the token, so treat a published URL as a credential. The port
   itself still binds `127.0.0.1`; the only public path is the nifetun tunnel (`/tunnel down` closes
   it). For anything else use an SSH tunnel or Tailscale rather than a reverse proxy.
@@ -487,28 +560,36 @@ task, so opening the page shows the current prompt rather than something from th
 
 ## Known limits
 
+- The web UI's global sessions are not in nife's per-project `/resume` selector; open them from
+  the page. The terminal keeps nife's project-local behavior.
+- The new-session picker uses server-side paths and creates a missing directory recursively; a typo
+  therefore creates an empty project directory instead of failing.
 - Pasting both text and an image (rich content from an office app) attaches the image only; plain
   text paste is unaffected.
-- Dropped files travel as text, so the terminal still shows the `[attached] <path>` lines the web
-  UI hides behind chips: nife has no file content block to carry them any other way.
+- Work files travel as `[attached] <path>` lines, so the terminal still shows them even though the
+  web UI hides them behind chips: nife has no file content block to carry them any other way. Chat
+  files are inlined as an `[attached-inline]` block instead, so they are part of the message and do
+  not depend on a live temp path - the terminal transcript therefore shows the file text too.
 - The rail marks user prompts only: a jump lands on what you asked, not on a particular answer, and
   it carries the newest 300 prompts (older ones fall out of `state.tasks`). A window parked inside
   the history shows an approximate scroll height until those rows are rendered again.
 - The task queue lives in the page, not on the bridge: a reload or a closed tab drops it, and there
   is no background draining (a paused queue stays paused until you resume it in that tab).
-- Dropped files are temporary: the path in the prompt only resolves while that nife process is
-  alive, so a session resumed later sees a dead path.
-- A dropped PDF (or any binary) reaches the model as a path, not as content: nife's `read` treats
-  it as UTF-8 text and there is no document block in the message model, so the agent has to run
-  something like `pdftotext` itself. Extracting PDF text in the browser needs `pdfjs-dist` and is
-  not implemented.
+- Work files are temporary: the path in the prompt only resolves while that nife process is
+  alive, so a session resumed later sees a dead path. Chat's inlined text is part of the message
+  and survives.
+- A PDF dropped in Work reaches the model as a path, and nife's `read` treats it as UTF-8 text.
+  Chat extracts selectable text with `pdfjs-dist`; a scanned/image-only PDF has no text layer and
+  still needs Work (or converting its pages to images).
 - `ctx.ui.custom()`, `setWidget`, `setFooter`, `setEditorComponent` receive TUI render functions
   and cannot render in a browser. Extensions that draw their own TUI screens (plan mode style)
   stay terminal-only.
 - Slash commands are not sent as commands: `/model`, `/tree`, `/settings`, `/compact`, `/export`,
   `/hotkeys` and friends are handled by interactive-mode, which an extension cannot call, and the
   page sends text literally. Model, thinking level, compaction, new and resume have their own
-  controls.
+  controls; the `Nife Chat` workspace uses the active-tool and system-prompt hooks, and typing
+  `/chat` alone in the composer switches workspace instead of sending it. Terminal `/chat` still
+  toggles nife's in-session flag; it does not move the web selector between workspaces.
 - Dialog timeouts (`opts.timeout`) are not forwarded; a browser dialog waits until answered.
 - If a browser tab closes while a dialog is open, the terminal dialog takes over on the next turn.
 - Markdown is rendered as plain pre-wrapped text. No syntax highlighting yet.

@@ -9,6 +9,7 @@ import { api, uploadFile } from "./bridge.js";
 import { previewImage } from "./images.js";
 import FileIcon from "./FileIcon.vue";
 import { formatBytes } from "./files.js";
+import { INLINE_MAX_CHARS, INLINE_TOTAL_CHARS, inlineTextOf } from "./inline.js";
 import { blocksOf } from "./message-utils.js";
 import {
 	IMAGE_MAX_COUNT,
@@ -45,6 +46,10 @@ const inputEl = ref(null);
 const composerBox = ref(null);
 const sidebarOpen = ref(false);
 const collapsed = ref(localStorage.getItem("nife-webui.collapsed") === "1");
+// Conversation mode: Work declares the coding tools; Chat declares none and uses nife's chat prompt.
+const mode = ref("work");
+const modeMenu = ref(false);
+const isChat = computed(() => mode.value === "chat");
 // Conversation search: a centred palette over the page, backed by the bridge's full-text scan.
 const searchOpen = ref(false);
 const searchQuery = ref("");
@@ -55,7 +60,13 @@ const searchError = ref("");
 let searchTimer = 0;
 let searchAbort;
 const narrow = ref(false);
-const sessions = ref([]);
+// Sidebar metadata is lazy: groups arrive first, transcripts only when a project is expanded.
+const groups = ref([]);
+const sessionsByProject = ref({});
+const sessions = computed(() => Object.values(sessionsByProject.value).flat());
+const expandedProjects = ref([]);
+const loadingProjects = ref([]);
+const groupsMode = ref("");
 const currentFile = ref("");
 // The footer button publishes this page through nifetun and comes back with the public URL; from the
 // public page the same button tears the tunnel down and reloads the local URL. The local origin is
@@ -254,14 +265,34 @@ async function finishTunnelDisconnect() {
 }
 // Session row with its three-dot menu open: { session, top, left }.
 const sessionMenu = ref(null);
+// New session: the project choice lives in the composer instead of a modal, because it is part of
+// the prompt the user is about to type. `freshSession` marks the empty session the page just made,
+// so the chip disappears with the first message - nife fixes a session's cwd at that point.
+const freshSession = ref(false);
+const workspaceMenu = ref(false);
+const newCwd = ref("");
+const newBusy = ref(false);
+const newError = ref("");
+const newInput = ref(null);
+// Directory browser in the picker: the folder on screen, its children, and the home shortcut.
+const browseDir = ref("");
+const browseParent = ref(null);
+const browseHome = ref("");
+const browseDirs = ref([]);
+const browseBusy = ref(false);
+const browseError = ref("");
+const projectRoot = ref("");
+const projectDirs = ref([]);
 // Sessions waiting for delete confirmation in the centred modal.
 const deleteQueue = ref([]);
+// When the queue came from a project header, say so and leave the directory itself alone.
+const deleteWorkspace = ref(null);
 const deleting = ref(false);
 // Inline rename: path of the row being edited, its draft, and the input to focus.
 const renaming = ref("");
 const renameText = ref("");
 const renameEl = ref(null);
-// Pinned sessions live in localStorage, keyed by the project directory.
+// Pinned sessions live in localStorage, shared by every project in the workspace.
 const pinnedPaths = ref([]);
 // Multi-select: rows become checkboxes and the sidebar footer turns into its action bar.
 const selecting = ref(false);
@@ -949,7 +980,10 @@ const sessionTitle = (session) => {
 };
 
 const title = computed(
-	() => state.value.name || sessionTitle(sessions.value.find((s) => s.path === currentFile.value)) || "new session",
+	() =>
+		state.value.name ||
+		sessionTitle(sessions.value.find((s) => s.path === currentFile.value)) ||
+		(isChat.value ? "Nife Chat" : "Nife Work"),
 );
 
 const LABEL_BLUE = [77, 147, 248];
@@ -1348,6 +1382,17 @@ function handle(payload) {
 		case "state_changed":
 			loadState();
 			break;
+		case "mode_changed": {
+			const next = payload.mode === "chat" ? "chat" : "work";
+			if (next !== mode.value && (attachments.value.length > 0 || files.value.length > 0)) {
+				attachments.value = [];
+				files.value = [];
+				showNotice("attachments cleared after switching workspace");
+			}
+			mode.value = next;
+			modeMenu.value = false;
+			break;
+		}
 		case "stats":
 			// pushed after every committed step, so a long tool loop keeps the footer honest
 			state.value.stats = payload.stats;
@@ -1371,6 +1416,7 @@ function handle(payload) {
 			break;
 		case "session_start":
 		case "session_switch":
+			workspaceMenu.value = false;
 			// a queued task belongs to the conversation it was typed in
 			if (queue.value.length > 0) {
 				queuePaused.value = true;
@@ -1379,10 +1425,10 @@ function handle(payload) {
 			// the prompt being edited belongs to the session that just went away
 			cancelEdit();
 			loadState();
-			loadSessions();
+			loadGroups({ reveal: true });
 			break;
 		case "sessions_changed":
-			loadSessions();
+			loadGroups({ refresh: true });
 			break;
 		case "entry_id":
 			stampEntryId(payload.entryId);
@@ -1436,6 +1482,7 @@ async function loadState() {
 	if (!response.ok) throw new Error(`state ${response.status}`);
 	const loaded = await response.json();
 	state.value = loaded;
+	mode.value = loaded.mode === "chat" ? "chat" : "work";
 	subagents.value = loaded.subagents ?? [];
 	// rows are keyed by message index, so an open row means nothing after a session switch; the same
 	// goes for "this row already has its steps", which is keyed the same way
@@ -1461,37 +1508,274 @@ async function refreshMeta() {
 	if (!response.ok) return;
 	const loaded = await response.json();
 	state.value = { ...state.value, ...loaded, messages: state.value.messages };
+	mode.value = loaded.mode === "chat" ? "chat" : "work";
 }
 
-async function loadSessions() {
-	const response = await fetch(api("sessions"));
+/** The last path segment, for compact project labels next to rows from other projects. */
+function projectName(path) {
+	return String(path || "").split(/[\\/]/).filter(Boolean).pop() || path || "";
+}
+
+/** Only rows from another project need the extra label; the current one is already in the footer. */
+const projectTag = (session) => {
+	const cwd = session?.cwd || "";
+	return cwd && cwd !== state.value.cwd ? projectName(cwd) : "";
+};
+
+/** Everything the new-session picker can suggest: default root, its children, this project, history. */
+const projectOptions = computed(() => {
+	const seen = new Set();
+	const list = [];
+	const add = (path, name, kind) => {
+		const clean = String(path || "").trim();
+		if (!clean || seen.has(clean)) return;
+		seen.add(clean);
+		list.push({ path: clean, name: name || projectName(clean), kind });
+	};
+	add(projectRoot.value, "project", "default");
+	for (const entry of projectDirs.value) add(entry.path, entry.name, entry.kind);
+	add(state.value.cwd, projectName(state.value.cwd), "current");
+	for (const session of sessions.value) add(session.cwd, projectName(session.cwd), "recent");
+	return list;
+});
+
+const filteredProjects = computed(() => {
+	const query = newCwd.value.trim().toLowerCase();
+	if (!query) return projectOptions.value;
+	// A complete choice still shows every alternative; only a partial path narrows the list.
+	if (projectOptions.value.some((entry) => entry.path.toLowerCase() === query)) return projectOptions.value;
+	return projectOptions.value.filter(
+		(entry) => entry.path.toLowerCase().includes(query) || entry.name.toLowerCase().includes(query),
+	);
+});
+
+/** Breadcrumb segments, so the browser can walk back up without typing a path. */
+function pathCrumbs(path) {
+	const value = String(path || "");
+	const sep = value.includes("\\") && !value.includes("/") ? "\\" : "/";
+	const parts = value.split(/[\\/]/).filter(Boolean);
+	const crumbs = [];
+	let acc = value.startsWith(sep) ? sep : "";
+	if (acc) crumbs.push({ name: sep, path: sep });
+	for (const part of parts) {
+		if (!acc) acc = /^[A-Za-z]:$/.test(part) ? part + sep : part;
+		else acc = acc.endsWith(sep) ? acc + part : acc + sep + part;
+		crumbs.push({ name: part, path: acc });
+	}
+	return crumbs;
+}
+
+const browseCrumbs = computed(() => pathCrumbs(browseDir.value));
+
+/** Shortcuts for people who do not know any paths: home, the default root, this project. */
+const quickSpots = computed(() => {
+	const seen = new Set();
+	const list = [];
+	const add = (name, path) => {
+		const clean = String(path || "").trim();
+		if (!clean || seen.has(clean)) return;
+		seen.add(clean);
+		list.push({ name, path: clean });
+	};
+	add("主目录", browseHome.value);
+	add("默认项目目录", projectRoot.value);
+	add("当前项目", state.value.cwd);
+	return list;
+});
+
+/** One level of subdirectories; the empty path means home, the same rule the server applies. */
+async function loadBrowse(path) {
+	browseBusy.value = true;
+	browseError.value = "";
+	try {
+		const response = await fetch(api(`dirs?path=${encodeURIComponent(path ?? "")}`));
+		if (!response.ok) {
+			browseError.value = (await response.text()).slice(0, 200) || "无法打开这个文件夹";
+			return;
+		}
+		const data = await response.json();
+		browseDir.value = data.path ?? "";
+		browseParent.value = data.parent ?? null;
+		browseHome.value = data.home || browseHome.value;
+		browseDirs.value = Array.isArray(data.dirs) ? data.dirs : [];
+	} catch {
+		browseError.value = "无法打开这个文件夹";
+	} finally {
+		browseBusy.value = false;
+	}
+}
+
+function enterDir(path) {
+	if (!path) return;
+	void loadBrowse(path);
+}
+
+/**
+ * Typing a known project's name should open that project, not create a folder called like it: an
+ * exact path wins, then an exact name from the filtered list. Anything else is a path to create.
+ */
+const typedPick = computed(() => {
+	const query = newCwd.value.trim().replace(/[\\/]+$/, "");
+	if (!query) return null;
+	const lower = query.toLowerCase();
+	const byPath = projectOptions.value.find(
+		(entry) => entry.path.replace(/[\\/]+$/, "").toLowerCase() === lower,
+	);
+	if (byPath) return byPath;
+	return filteredProjects.value.find((entry) => entry.name.toLowerCase() === lower) ?? null;
+});
+
+/** The directory the footer button and Enter would start the conversation in. */
+const targetPath = computed(() => {
+	const query = newCwd.value.trim();
+	if (!query) return browseDir.value || "";
+	return typedPick.value?.path ?? query;
+});
+
+/** A typed path that is not already one of the suggestions still deserves its own row. */
+const newPathRow = computed(() => Boolean(newCwd.value.trim()) && !typedPick.value);
+
+/** Same rule as the bridge (a tmp/temp segment): say it here before the session cannot be kept. */
+const targetIsTemp = computed(() =>
+	targetPath.value
+		.split(/[\\/]+/)
+		.some((segment) => segment.toLowerCase() === "tmp" || segment.toLowerCase() === "temp"),
+);
+
+async function loadProjects() {
+	try {
+		const response = await fetch(api("projects"));
+		if (!response.ok) return;
+		const data = await response.json();
+		projectRoot.value = data.default || "";
+		projectDirs.value = Array.isArray(data.projects) ? data.projects : [];
+	} catch {
+		// the text field still accepts a path when discovery fails
+	}
+}
+
+const pendingGroups = new Map();
+let groupGeneration = 0;
+
+const groupLoaded = (key) => Object.prototype.hasOwnProperty.call(sessionsByProject.value, key);
+const groupCollapsed = (key) => !expandedProjects.value.includes(key);
+
+function expandProject(key) {
+	if (!expandedProjects.value.includes(key)) expandedProjects.value = [...expandedProjects.value, key];
+}
+
+async function ensureGroup(key, force = false) {
+	if (!force && groupLoaded(key)) return;
+	const pending = pendingGroups.get(key);
+	if (pending) return pending;
+	const generation = groupGeneration;
+	if (!loadingProjects.value.includes(key)) loadingProjects.value = [...loadingProjects.value, key];
+	const job = (async () => {
+		try {
+			const response = await fetch(api(`sessions?cwd=${encodeURIComponent(key)}`));
+			if (!response.ok) return;
+			const data = await response.json();
+			if (generation !== groupGeneration) return;
+			sessionsByProject.value = { ...sessionsByProject.value, [key]: data.sessions ?? [] };
+			if (data.current) currentFile.value = data.current;
+		} catch {
+			// the group stays folded-empty; opening it again retries
+		} finally {
+			if (generation === groupGeneration) {
+				loadingProjects.value = loadingProjects.value.filter((entry) => entry !== key);
+				pendingGroups.delete(key);
+			}
+		}
+	})();
+	pendingGroups.set(key, job);
+	return job;
+}
+
+async function toggleProjectGroup(group) {
+	const key = group.cwd || "";
+	if (expandedProjects.value.includes(key)) {
+		expandedProjects.value = expandedProjects.value.filter((entry) => entry !== key);
+		return;
+	}
+	expandProject(key);
+	await ensureGroup(key);
+}
+
+/** Reveal a group and load it, used by session switches, search jumps and new sessions. */
+async function revealProject(cwd) {
+	const key = cwd || "";
+	expandProject(key);
+	await ensureGroup(key);
+}
+
+async function loadGroups(options = {}) {
+	const { refresh = false, reveal = false } = options;
+	const response = await fetch(api("groups"));
 	if (!response.ok) return;
 	const data = await response.json();
-	sessions.value = data.sessions ?? [];
-	currentFile.value = data.current ?? "";
-	sessionMenu.value = null;
-	// Drop selection/pin entries whose file is gone, so the bar and sort never count ghosts.
-	const paths = new Set(sessions.value.map((session) => session.path));
-	if (selectedPaths.value.some((path) => !paths.has(path))) {
-		selectedPaths.value = selectedPaths.value.filter((path) => paths.has(path));
+	const next = Array.isArray(data.groups) ? data.groups : [];
+	groups.value = next;
+	if (data.currentFile) currentFile.value = data.currentFile;
+	if (groupsMode.value !== (data.mode || "work")) {
+		groupsMode.value = data.mode || "work";
+		groupGeneration += 1;
+		pendingGroups.clear();
+		expandedProjects.value = [];
+		sessionsByProject.value = {};
+		loadingProjects.value = [];
 	}
-	const pins = pinnedPaths.value.filter((path) => paths.has(path));
-	if (pins.length !== pinnedPaths.value.length) {
-		pinnedPaths.value = pins;
-		savePinned();
+	const keys = new Set(next.map((group) => group.cwd || ""));
+	const kept = {};
+	for (const [key, rows] of Object.entries(sessionsByProject.value)) {
+		if (keys.has(key)) kept[key] = rows;
 	}
-	if (renaming.value && !paths.has(renaming.value)) cancelRename();
+	sessionsByProject.value = kept;
+	expandedProjects.value = expandedProjects.value.filter((key) => keys.has(key));
+	if (expandedProjects.value.length === 0) {
+		// Expand the current project when it has rows. An empty New Work, or a workspace whose
+		// conversations were just deleted, has no group at all: opening another project then would
+		// read as if the current one had moved there.
+		const active = next.find((group) => group.current)?.cwd;
+		if (active !== undefined) expandProject(active);
+	}
+	if (reveal) {
+		const active = next.find((group) => group.current)?.cwd;
+		if (active !== undefined) {
+			expandProject(active);
+			await ensureGroup(active, true);
+		}
+	}
+	if (refresh) {
+		const loaded = Object.keys(sessionsByProject.value);
+		await Promise.all(loaded.map((key) => ensureGroup(key, true)));
+	} else if (expandedProjects.value.length > 0) {
+		const first = expandedProjects.value[0];
+		if (keys.has(first)) await ensureGroup(first);
+	}
 }
 
-/** Pinned rows first; the backend order is kept inside each group. */
-const orderedSessions = computed(() => {
+/** One section per project; rows arrive from ensureGroup when the section is opened. */
+const sessionGroups = computed(() => {
 	const pinned = new Set(pinnedPaths.value);
-	if (pinned.size === 0) return sessions.value;
-	const first = [];
-	const rest = [];
-	for (const session of sessions.value) (pinned.has(session.path) ? first : rest).push(session);
-	return [...first, ...rest];
+	return groups.value.map((group) => {
+		const key = group.cwd || "";
+		const loaded = groupLoaded(key);
+		const raw = sessionsByProject.value[key] ?? [];
+		const first = [];
+		const rest = [];
+		for (const session of raw) (pinned.has(session.path) ? first : rest).push(session);
+		return {
+			...group,
+			key,
+			loaded,
+			loading: loadingProjects.value.includes(key),
+			count: loaded ? raw.length : group.count,
+			sessions: [...first, ...rest],
+		};
+	});
 });
+
+const orderedSessions = computed(() => sessionGroups.value.flatMap((group) => group.sessions));
 
 const selectedSessions = computed(() =>
 	orderedSessions.value.filter((session) => selectedPaths.value.includes(session.path)),
@@ -1501,12 +1785,19 @@ const allSelectedPinned = computed(
 	() => selectedSessions.value.length > 0 && selectedSessions.value.every((session) => isPinned(session.path)),
 );
 
-const pinKey = () => `nife-webui.pinned:${state.value.cwd || ""}`;
+const pinKey = () => `nife-webui.pinned:workspace:${mode.value}`;
 
 function loadPinned() {
 	try {
-		const parsed = JSON.parse(localStorage.getItem(pinKey()) ?? "[]");
+		const key = pinKey();
+		// Pins belong to the workspace now, not to one project. Carry the old per-directory list over
+		// once, then keep every project's pins together.
+		const oldKey = `nife-webui.pinned:${state.value.cwd || ""}:${mode.value}`;
+		const olderKey = `nife-webui.pinned:${state.value.cwd || ""}`;
+		const raw = localStorage.getItem(key) ?? localStorage.getItem(oldKey) ?? (mode.value === "work" ? localStorage.getItem(olderKey) : null);
+		const parsed = JSON.parse(raw ?? "[]");
 		pinnedPaths.value = Array.isArray(parsed) ? parsed.filter((path) => typeof path === "string") : [];
+		if (raw !== null && localStorage.getItem(key) === null) savePinned();
 	} catch {
 		pinnedPaths.value = [];
 	}
@@ -1520,7 +1811,12 @@ function savePinned() {
 	}
 }
 
-watch(() => state.value.cwd, loadPinned, { immediate: true });
+watch([() => state.value.cwd, mode], loadPinned, { immediate: true });
+
+// A session stops being "new" the moment it has a message or a turn: the project is settled then.
+watch([() => messages.value.length, streaming], ([count, busy]) => {
+	if (count > 0 || busy) freshSession.value = false;
+});
 
 const isPinned = (path) => pinnedPaths.value.includes(path);
 
@@ -1541,10 +1837,10 @@ function toggleSessionMenu(event, session) {
 		return;
 	}
 	const rect = event.currentTarget.getBoundingClientRect();
-	const width = 176;
+	const width = 160;
 	sessionMenu.value = {
 		session,
-		top: Math.max(8, Math.min(rect.bottom + 4, window.innerHeight - 186)),
+		top: Math.max(8, Math.min(rect.bottom + 4, window.innerHeight - 150)),
 		left: Math.max(8, Math.min(rect.left - 4, window.innerWidth - width - 8)),
 	};
 }
@@ -1613,33 +1909,51 @@ async function commitRename(session) {
 		showNotice(result.message || "could not rename the session");
 		return;
 	}
-	await loadSessions();
+	await loadGroups({ refresh: true });
 	if (session.path === currentFile.value) await refreshMeta();
 }
 
 /** The menu only asks; the modal is where the file actually goes. */
 function askDeleteSession(session) {
 	sessionMenu.value = null;
+	deleteWorkspace.value = null;
 	deleteQueue.value = [session];
 }
 
 function askDeleteSelected() {
 	if (!selectedSessions.value.length) return;
+	deleteWorkspace.value = null;
 	deleteQueue.value = [...selectedSessions.value];
+}
+
+/** A project header deletes its conversations; the project directory and its files stay. */
+async function askDeleteProject(group) {
+	if (selecting.value) return;
+	if (!group.loaded) await ensureGroup(group.key);
+	const sessions = sessionsByProject.value[group.key] ?? [];
+	if (!sessions.length) {
+		showNotice("No sessions to delete");
+		return;
+	}
+	sessionMenu.value = null;
+	deleteWorkspace.value = { name: group.name, cwd: group.cwd };
+	deleteQueue.value = [...sessions];
 }
 
 function cancelDelete() {
 	if (deleting.value) return;
 	deleteQueue.value = [];
+	deleteWorkspace.value = null;
 }
 
 /**
  * Delete one session or a selection. The bridge moves the runtime to a fresh session first when the
- * active one is included, so the page just reloads and lands on the New chat screen.
+ * active one is included, so the page just reloads and lands on that workspace's New Work / New Chat screen.
  */
 async function confirmDeleteSessions() {
 	const targets = deleteQueue.value;
 	if (!targets.length || deleting.value) return;
+	const workspace = deleteWorkspace.value;
 	const wasCurrent = targets.some((session) => session.path === currentFile.value);
 	deleting.value = true;
 	try {
@@ -1655,22 +1969,35 @@ async function confirmDeleteSessions() {
 		const payload = await response.json().catch(() => ({}));
 		const methods = Array.isArray(payload.methods) ? payload.methods : [];
 		const gone = new Set(targets.map((session) => session.path));
-		sessions.value = sessions.value.filter((entry) => !gone.has(entry.path));
+		const kept = {};
+		for (const [key, rows] of Object.entries(sessionsByProject.value)) {
+			kept[key] = rows.filter((entry) => !gone.has(entry.path));
+		}
+		sessionsByProject.value = kept;
+		selectedPaths.value = selectedPaths.value.filter((path) => !gone.has(path));
+		pinnedPaths.value = pinnedPaths.value.filter((path) => !gone.has(path));
+		savePinned();
 		if (wasCurrent) await loadState();
-		await loadSessions();
+		await loadGroups({ refresh: true });
 		exitSelect();
+		if (workspace && localStorage.getItem("nife-webui.new-cwd") === workspace.cwd) {
+			localStorage.removeItem("nife-webui.new-cwd");
+		}
 		showNotice(
-			targets.length > 1
-				? `${targets.length} sessions deleted`
-				: methods[0] === "trash"
-					? "session moved to trash"
-					: "session deleted",
+			workspace
+				? `${workspace.name}: ${targets.length} sessions deleted`
+				: targets.length > 1
+					? `${targets.length} sessions deleted`
+					: methods[0] === "trash"
+						? "session moved to trash"
+						: "session deleted",
 		);
 	} catch {
 		showNotice("could not delete the session");
 	} finally {
 		deleting.value = false;
 		deleteQueue.value = [];
+		deleteWorkspace.value = null;
 	}
 }
 
@@ -1680,7 +2007,15 @@ async function postDetailed(path, body) {
 		headers: { "content-type": "application/json" },
 		body: body === undefined ? undefined : JSON.stringify(body),
 	});
-	return { ok: response.ok, message: response.ok ? "" : (await response.text()).slice(0, 200) };
+	const text = await response.text();
+	if (!response.ok) return { ok: false, message: text.slice(0, 200), data: null };
+	let data = null;
+	try {
+		data = JSON.parse(text);
+	} catch {
+		// some endpoints answer with a plain "ok"
+	}
+	return { ok: true, message: "", data };
 }
 
 async function post(path, body) {
@@ -1692,8 +2027,8 @@ const pastes = new Map();
 
 // Pasted images waiting to be sent: { id, name, mimeType, data, url }.
 const attachments = ref([]);
-// Dropped non-images waiting to be sent: { id, name, size, progress, path }. No path yet means the
-// upload is still running, which is what the chip's progress bar shows.
+// Dropped files waiting to be sent: Work has { path, progress }, Chat has { text, reading }.
+// A Work file with no path yet is still uploading; a Chat chip reading is still extracting text.
 const files = ref([]);
 const dragging = ref(false);
 let imageSeq = 0;
@@ -1735,15 +2070,17 @@ function scheduleDrain() {
 
 /** Attachments still being prepared (image resize) or uploaded: nothing can be sent yet. */
 const preparing = computed(
-	() => attachments.value.some((image) => image.loading) || files.value.some((file) => !file.path),
+	() =>
+		attachments.value.some((image) => image.loading) ||
+		files.value.some((file) => !file.path && typeof file.text !== "string"),
 );
 
 /** The composer as one queue item, or null when it is not sendable yet (the notice says why). */
 function composedItem() {
 	const value = expandPastes(text.value, pastes).trim();
 	const images = attachments.value.map(({ name, mimeType, data }) => ({ name, mimeType, data }));
-	const queuedFiles = files.value.map(({ name, path, size }) => ({ name, path, size }));
-	if (files.value.some((file) => !file.path)) {
+	const queuedFiles = files.value.map(({ name, path, size, text }) => ({ name, path, size, text }));
+	if (files.value.some((file) => !file.path && typeof file.text !== "string")) {
 		showNotice("still uploading, try again in a moment");
 		return null;
 	}
@@ -1768,6 +2105,16 @@ async function send() {
 		showNotice("still preparing the attachments, try again in a moment");
 		return;
 	}
+	// The one slash command the page can honour itself: nife's /chat toggles chat mode.
+	if (text.value.trim() === "/chat") {
+		if (attachments.value.length > 0 || files.value.length > 0) {
+			showNotice("send /chat on its own");
+			return;
+		}
+		clearComposer();
+		await pickMode(isChat.value ? "work" : "chat");
+		return;
+	}
 	const item = composedItem();
 	if (!item) return;
 	const blocked = queueProblem(queue.value, item);
@@ -1775,6 +2122,8 @@ async function send() {
 		showNotice(blocked);
 		return;
 	}
+	// The directory choice ends with the first prompt: from here on the session owns its project.
+	freshSession.value = false;
 	clearComposer();
 	await deliver(item);
 }
@@ -1881,7 +2230,7 @@ function editQueued(index) {
 	});
 	files.value = item.files.map((file) => {
 		fileSeq += 1;
-		return { id: fileSeq, name: file.name, size: file.size, progress: 1, path: file.path };
+		return { id: fileSeq, name: file.name, size: file.size, progress: 1, path: file.path, text: file.text };
 	});
 	nextTick(() => {
 		inputEl.value?.focus();
@@ -2029,6 +2378,39 @@ function removeImage(id) {
 	attachments.value = attachments.value.filter((image) => image.id !== id);
 }
 
+/** Chat has no tools: read the file here and carry its text in the prompt instead of a path. */
+async function inlineFiles(dropped) {
+	for (const file of dropped) {
+		fileSeq += 1;
+		const chip = {
+			id: fileSeq,
+			name: file.name || `file ${fileSeq}`,
+			size: file.size,
+			progress: 0,
+			path: "",
+			reading: true,
+		};
+		files.value = [...files.value, chip];
+		const update = (patch) => {
+			files.value = files.value.map((entry) => (entry.id === chip.id ? { ...entry, ...patch } : entry));
+		};
+		try {
+			const text = await inlineTextOf(file);
+			if (text.length > INLINE_MAX_CHARS) {
+				throw new Error(`file is too long for Chat (limit ${Math.round(INLINE_MAX_CHARS / 1000)}k characters)`);
+			}
+			const used = files.value.reduce((total, entry) => total + (entry.text?.length ?? 0), 0);
+			if (used + text.length > INLINE_TOTAL_CHARS) {
+				throw new Error(`Chat can inline at most ${Math.round(INLINE_TOTAL_CHARS / 1000)}k characters per message`);
+			}
+			update({ reading: false, progress: 1, text });
+		} catch (error) {
+			files.value = files.value.filter((entry) => entry.id !== chip.id);
+			showNotice(error instanceof Error ? error.message : "could not read the file");
+		}
+	}
+}
+
 async function uploadFiles(dropped) {
 	for (const file of dropped) {
 		fileSeq += 1;
@@ -2108,7 +2490,11 @@ async function attachDropped(dropped) {
 		else others.push(file);
 	}
 	if (images.length > 0) await attachFiles(images);
-	if (others.length > 0) await uploadFiles(others);
+	if (others.length > 0) {
+		// No tools in chat: text files are inlined, Work keeps the temp-path flow.
+		if (isChat.value) await inlineFiles(others);
+		else await uploadFiles(others);
+	}
 }
 
 function onDragOver(event) {
@@ -2170,6 +2556,7 @@ async function abort() {
 }
 
 function toggleSidebar() {
+	modeMenu.value = false;
 	if (narrow.value) {
 		sidebarOpen.value = !sidebarOpen.value;
 		return;
@@ -2184,6 +2571,7 @@ function toggleSidebar() {
 
 /** Search is an overlay: it works from the expanded header and the compact pill alike. */
 async function openSearch() {
+	modeMenu.value = false;
 	if (selecting.value) exitSelect();
 	searchOpen.value = true;
 	searchQuery.value = "";
@@ -2269,6 +2657,7 @@ async function openSearchResult(group, match) {
 	const entryId = match?.entryId ?? group.matches?.[0]?.entryId ?? "";
 	const path = group.path;
 	closeSearch();
+	if (group.cwd) await revealProject(group.cwd);
 	if (path !== currentFile.value) {
 		const result = await postDetailed("resume", { path });
 		if (!result.ok) {
@@ -2276,7 +2665,7 @@ async function openSearchResult(group, match) {
 			return;
 		}
 		await loadState();
-		await loadSessions();
+		await loadGroups({ reveal: true });
 	}
 	if (entryId) await revealEntry(entryId);
 }
@@ -2301,6 +2690,24 @@ function openFirstSearchResult() {
 function toggleMenu(name) {
 	menu.value = menu.value === name ? null : name;
 	modelQuery.value = "";
+}
+
+/** Switch between the coding agent and a plain conversation, then re-read the bridge's truth. */
+async function pickMode(next) {
+	modeMenu.value = false;
+	if (next === mode.value) return;
+	const result = await postDetailed("mode", { mode: next });
+	if (!result.ok) {
+		showNotice(result.message || "could not switch mode");
+		return;
+	}
+	if (selecting.value) exitSelect();
+	sidebarOpen.value = false;
+	freshSession.value = false;
+	workspaceMenu.value = false;
+	await loadState();
+	loadPinned();
+	await loadGroups({ reveal: true });
 }
 
 async function pickModel(model) {
@@ -2335,27 +2742,98 @@ async function toggleProxy() {
 async function switchTo(path) {
 	sidebarOpen.value = false;
 	sessionMenu.value = null;
+	freshSession.value = false;
+	workspaceMenu.value = false;
 	const result = await postDetailed("resume", { path });
 	if (!result.ok) {
 		showNotice(result.message || "could not switch session");
 		return;
 	}
 	await loadState();
-	await loadSessions();
+	await loadGroups({ reveal: true });
 }
 
+/**
+ * New Work / New Chat: start the empty session right away in the last project used, then let the
+ * composer's directory chip move it elsewhere until the first prompt arrives.
+ */
 async function newSession() {
 	sidebarOpen.value = false;
 	sessionMenu.value = null;
 	closeSearch();
 	exitSelect();
-	const result = await postDetailed("new");
-	if (!result.ok) {
-		showNotice(result.message || "could not start a new session");
+	workspaceMenu.value = false;
+	newError.value = "";
+	await loadProjects();
+	const cwd = localStorage.getItem("nife-webui.new-cwd") || projectRoot.value || "~/.nife/project";
+	await startNewSession(cwd);
+}
+
+/**
+ * Create and switch to an empty session in `cwd`. From the picker a failure stays inline (the menu
+ * is still open); from the sidebar there is no picker to write into, so it becomes a notice.
+ */
+async function startNewSession(path, { inline = false } = {}) {
+	if (newBusy.value) return;
+	const cwd = String(path || "").trim();
+	if (!cwd) {
+		if (inline) newError.value = "Enter a working directory";
 		return;
 	}
+	newBusy.value = true;
+	newError.value = "";
+	const result = await postDetailed("new", { cwd, mode: mode.value });
+	newBusy.value = false;
+	if (!result.ok) {
+		const message = result.message || "could not start a new session";
+		if (inline) {
+			newError.value = message;
+		} else {
+			showNotice(message);
+		}
+		return;
+	}
+	const resolved = typeof result.data?.cwd === "string" ? result.data.cwd : cwd;
+	localStorage.setItem("nife-webui.new-cwd", resolved);
+	newCwd.value = resolved;
+	freshSession.value = true;
+	workspaceMenu.value = false;
 	await loadState();
-	await loadSessions();
+	await loadGroups({ reveal: true });
+	inputEl.value?.focus();
+}
+
+/** Open the project picker above the composer, starting at the directory this session runs in. */
+function toggleWorkspacePicker() {
+	workspaceMenu.value = !workspaceMenu.value;
+	if (!workspaceMenu.value) return;
+	newError.value = "";
+	newCwd.value = "";
+	// the recents list grows while the session runs, so re-read it instead of trusting the first load
+	void loadProjects();
+	void loadBrowse(state.value.cwd || browseHome.value || "~");
+	nextTick(() => {
+		newInput.value?.focus();
+		newInput.value?.select();
+	});
+}
+
+/** Closing with the keyboard has to hand the caret back to the prompt, not to the page. */
+function closeWorkspacePicker() {
+	if (!workspaceMenu.value) return;
+	workspaceMenu.value = false;
+	inputEl.value?.focus();
+}
+
+/** Picking the directory the session already runs in is a no-op, not another empty session. */
+async function pickWorkspace(path) {
+	const cwd = String(path || "").trim();
+	if (!cwd) return;
+	if (cwd === state.value.cwd) {
+		closeWorkspacePicker();
+		return;
+	}
+	await startNewSession(cwd, { inline: true });
 }
 
 async function answer(value) {
@@ -2369,6 +2847,8 @@ async function answer(value) {
  * which is what made a slow drop look stuck at 0% - a sent file its bytes, a restored one neither.
  */
 const fileSize = (file) => {
+	if (file.reading) return "Reading…";
+	if (typeof file.text === "string") return formatBytes(file.size ?? file.text.length);
 	if (!file.path) return file.progress > 0 ? `${Math.round(file.progress * 100)}%` : "Uploading…";
 	return Number.isFinite(file.size) ? formatBytes(file.size) : "attached";
 };
@@ -2409,6 +2889,8 @@ onMounted(async () => {
 		menu.value = null;
 		tunnelMenu.value = false;
 		sessionMenu.value = null;
+		modeMenu.value = false;
+		workspaceMenu.value = false;
 	});
 	window.addEventListener("dragover", onDragOver);
 	window.addEventListener("dragleave", onDragLeave);
@@ -2430,6 +2912,14 @@ onMounted(async () => {
 		menu.value = null;
 		tunnelMenu.value = false;
 		sessionMenu.value = null;
+		if (modeMenu.value) {
+			modeMenu.value = false;
+			return;
+		}
+		if (workspaceMenu.value) {
+			closeWorkspacePicker();
+			return;
+		}
 		if (deleteQueue.value.length) {
 			cancelDelete();
 			return;
@@ -2459,7 +2949,7 @@ onMounted(async () => {
 		servicesReady = true;
 	}, 3000);
 	await finishTunnelDisconnect();
-	await loadSessions();
+	await loadGroups({ reveal: true });
 	connect();
 	inputEl.value?.focus();
 	// Streaming markdown, collapsing tool rows, loading images and a growing textarea all change the
@@ -2482,7 +2972,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-	<div class="app" :class="{ collapsed }">
+	<div class="app" :class="{ collapsed, chat: isChat }">
 		<nav class="sidebar" :class="{ open: sidebarOpen }">
 			<div v-if="selecting" class="sidebar-head select-head">
 				<span class="select-title">已选择 {{ selectedCount }} 个对话</span>
@@ -2491,7 +2981,57 @@ onBeforeUnmount(() => {
 				</button>
 			</div>
 			<div v-else class="sidebar-head">
-				<span class="brand">Nife</span>
+				<div class="brand-group">
+					<span class="brand">Nife</span>
+					<button
+						type="button"
+						class="mode-trigger"
+						:class="{ open: modeMenu }"
+						:aria-expanded="modeMenu"
+						aria-haspopup="menu"
+						:aria-label="`Switch workspace, current Nife ${isChat ? 'Chat' : 'Work'}`"
+						@click.stop="modeMenu = !modeMenu"
+					>
+						<span>{{ isChat ? "Chat" : "Work" }}</span>
+						<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4.5 6.5L8 10l3.5-3.5" /></svg>
+					</button>
+					<Transition name="mode-pop">
+						<div v-if="modeMenu" class="mode-menu" role="menu" @click.stop>
+							<button
+								type="button"
+								class="mode-option"
+								:class="{ active: !isChat }"
+								role="menuitemradio"
+								:aria-checked="!isChat"
+								@click="pickMode('work')"
+							>
+								<span class="mode-copy">
+									<strong>Nife Work</strong>
+									<small>构建、调试与发布</small>
+								</span>
+								<svg v-if="!isChat" class="mode-check" viewBox="0 0 16 16" aria-hidden="true">
+									<path d="M3.5 8.5l3 3 6-7" />
+								</svg>
+							</button>
+							<button
+								type="button"
+								class="mode-option"
+								:class="{ active: isChat }"
+								role="menuitemradio"
+								:aria-checked="isChat"
+								@click="pickMode('chat')"
+							>
+								<span class="mode-copy">
+									<strong>Nife Chat</strong>
+									<small>专注思考与交流</small>
+								</span>
+								<svg v-if="isChat" class="mode-check" viewBox="0 0 16 16" aria-hidden="true">
+									<path d="M3.5 8.5l3 3 6-7" />
+								</svg>
+							</button>
+						</div>
+					</Transition>
+				</div>
 				<div class="head-actions">
 					<button
 						type="button"
@@ -2516,14 +3056,50 @@ onBeforeUnmount(() => {
 
 			<button v-if="!selecting" type="button" class="new-chat" @click="newSession">
 				<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
-				New chat
+				{{ isChat ? "New Chat" : "New Work" }}
 			</button>
 
-			<div v-if="!selecting" class="section-label">Recents</div>
+			<div v-if="!selecting" class="section-label">{{ isChat ? "Chats" : "Recents" }}</div>
 			<div class="session-list" :class="{ picking: selecting }">
-				<p v-if="sessions.length === 0" class="muted pad">No sessions in this directory.</p>
+				<p v-if="groups.length === 0" class="muted pad">{{ isChat ? "No chats yet." : "No sessions yet." }}</p>
+				<div v-for="group in sessionGroups" :key="group.key" class="session-group">
+					<div
+						class="session-group-head"
+						:class="{ current: group.current, disabled: selecting }"
+						:title="group.cwd || 'Unknown project'"
+					>
+						<button
+							type="button"
+							class="session-group-toggle"
+							:aria-expanded="!groupCollapsed(group.key)"
+							@click="toggleProjectGroup(group)"
+						>
+							<svg class="session-group-chevron" :class="{ collapsed: groupCollapsed(group.key) }" viewBox="0 0 16 16" aria-hidden="true">
+								<path d="M4.5 6.5L8 10l3.5-3.5" />
+							</svg>
+							<span v-if="group.current" class="session-group-current" title="Current project"></span>
+							<span class="session-group-name">{{ group.name }}</span>
+							<span class="session-group-count">{{ group.count }}</span>
+						</button>
+						<button
+							v-if="!selecting"
+							type="button"
+							class="session-group-delete"
+							title="删除工作区会话"
+							aria-label="删除工作区会话"
+							@click.stop="askDeleteProject(group)"
+						>
+							<svg viewBox="0 0 16 16" aria-hidden="true">
+								<path d="M3 4.5h10M6.5 4.5V2.5h3v2M4.8 4.5l.6 9h5.2l.6-9" />
+							</svg>
+						</button>
+					</div>
+					<div class="session-group-body" :class="{ collapsed: groupCollapsed(group.key) }">
+						<div class="session-group-inner">
+							<p v-if="group.loading && !group.loaded" class="session-group-hint">Loading…</p>
+							<p v-else-if="group.loaded && group.sessions.length === 0" class="session-group-hint">No sessions</p>
 				<div
-					v-for="session in orderedSessions"
+					v-for="session in group.sessions"
 					:key="session.path"
 					:class="[
 						'session',
@@ -2537,7 +3113,9 @@ onBeforeUnmount(() => {
 								<path d="M3.5 8.5l3 3 6-7" />
 							</svg>
 						</span>
-						<span class="session-name">{{ sessionTitle(session) }}</span>
+						<span class="session-copy">
+							<span class="session-name">{{ sessionTitle(session) }}</span>
+						</span>
 					</button>
 					<input
 						v-else-if="renaming === session.path"
@@ -2552,7 +3130,9 @@ onBeforeUnmount(() => {
 					/>
 					<template v-else>
 						<button type="button" class="session-main" @click="switchTo(session.path)">
-							<span class="session-name">{{ sessionTitle(session) }}</span>
+							<span class="session-copy">
+								<span class="session-name">{{ sessionTitle(session) }}</span>
+							</span>
 							<span v-if="isPinned(session.path)" class="session-pin" title="Pinned">
 								<svg viewBox="0 0 16 16" aria-hidden="true">
 									<path d="M9.6 2.4l4 4-1.7.5-2.3 2.3.5 2.2-1 1L4.4 7.7l1-1 2.2.5L9.9 4.9z" />
@@ -2576,6 +3156,9 @@ onBeforeUnmount(() => {
 							</svg>
 						</button>
 					</template>
+				</div>
+						</div>
+					</div>
 				</div>
 			</div>
 
@@ -2730,7 +3313,7 @@ onBeforeUnmount(() => {
 		<Teleport to="body">
 			<Transition name="search-pop">
 				<div v-if="searchOpen" class="search-modal" @click.self="closeSearch">
-					<div class="search-panel" role="dialog" aria-modal="true" aria-label="搜索全部对话内容">
+					<div class="search-panel" role="dialog" aria-modal="true" aria-label="搜索当前工作区的所有项目">
 						<div class="search-input-row">
 							<svg viewBox="0 0 16 16" aria-hidden="true">
 								<circle cx="7" cy="7" r="4.2" />
@@ -2740,8 +3323,8 @@ onBeforeUnmount(() => {
 								ref="searchInput"
 								v-model="searchQuery"
 								type="text"
-								placeholder="搜索全部对话内容"
-								aria-label="搜索全部对话内容"
+								placeholder="搜索当前工作区的所有项目"
+								aria-label="搜索当前工作区的所有项目"
 								@keydown.esc.prevent.stop="closeSearch"
 								@keydown.enter.prevent="openFirstSearchResult"
 							/>
@@ -2751,7 +3334,7 @@ onBeforeUnmount(() => {
 						</div>
 
 						<div class="search-body">
-							<p v-if="!searchQuery.trim()" class="search-hint">搜索所有对话的标题和消息内容</p>
+							<p v-if="!searchQuery.trim()" class="search-hint">搜索当前工作区所有项目的标题和消息内容</p>
 							<p v-else-if="searchBusy && searchResults.length === 0" class="search-hint">正在搜索…</p>
 							<p v-else-if="searchError" class="search-hint error">{{ searchError }}</p>
 							<p v-else-if="searchResults.length === 0" class="search-hint">没有找到匹配的内容</p>
@@ -2759,6 +3342,7 @@ onBeforeUnmount(() => {
 								<div v-for="group in searchResults" :key="group.path" class="search-group">
 									<button type="button" class="search-session" @click="openSearchResult(group, group.matches[0])">
 										<span class="search-session-title">{{ sessionTitle(group) }}</span>
+										<span v-if="projectTag(group)" class="search-session-project" :title="group.cwd">{{ projectTag(group) }}</span>
 										<span class="search-session-date">{{ when(group.modified) }}</span>
 									</button>
 									<button
@@ -2800,7 +3384,7 @@ onBeforeUnmount(() => {
 							<path d="M10.2 10.2L14 14" />
 						</svg>
 					</button>
-					<button type="button" class="iconbtn" title="New session" @click.stop="newSession">
+					<button type="button" class="iconbtn" :title="isChat ? 'New Chat' : 'New Work'" @click.stop="newSession">
 						<svg viewBox="0 0 16 16" aria-hidden="true">
 							<path d="M13.2 7.8a5.2 5.2 0 0 1-7.6 4.5L3 13l.7-2.6A5.2 5.2 0 1 1 13.2 7.8z" />
 							<path d="M8 5.8v4M6 7.8h4" />
@@ -2830,9 +3414,13 @@ onBeforeUnmount(() => {
 			>
 				<div ref="transcriptBody" class="transcript-body">
 					<div v-if="messages.length === 0 && !live" class="empty">
-						<h1>What should we build?</h1>
+						<h1>{{ isChat ? "What's on your mind?" : "What should we build?" }}</h1>
 						<p class="muted">
-							This page drives the session running in your terminal. Anything you send here shows up in the CLI too.
+							{{
+								isChat
+									? "A quieter space for questions, ideas, and thinking out loud."
+									: "This page drives the session running in your terminal. Anything you send here shows up in the CLI too."
+							}}
 						</p>
 					</div>
 
@@ -2905,6 +3493,7 @@ onBeforeUnmount(() => {
 							:data-row="runStart + index"
 							:busy="editing.busy"
 							:draft="editing.draft"
+							:chat="isChat"
 							@cancel="cancelEdit"
 							@submit="submitEdit"
 							@draft="keepDraft"
@@ -3062,6 +3651,196 @@ onBeforeUnmount(() => {
 							:stroke-dasharray="`${progressPercent} 100`"
 						/>
 					</svg>
+					<!-- New session: where it runs is part of the prompt, not a separate dialog. The chip is
+					     only there while the session is empty; the first message settles the directory. -->
+					<div v-if="freshSession" class="workspace-row">
+						<button
+							type="button"
+							class="workspace-chip"
+							:class="{ open: workspaceMenu }"
+							:aria-expanded="workspaceMenu"
+							aria-haspopup="dialog"
+							:disabled="newBusy"
+							title="选择这个对话所在的项目目录"
+							@click.stop="toggleWorkspacePicker"
+						>
+							<svg viewBox="0 0 16 16" aria-hidden="true">
+								<path d="M2.2 4.9a1.5 1.5 0 0 1 1.5-1.5h2.2l1.3 1.6h4.9a1.5 1.5 0 0 1 1.5 1.5v4.6a1.5 1.5 0 0 1-1.5 1.5H3.7a1.5 1.5 0 0 1-1.5-1.5z" />
+							</svg>
+							<span class="workspace-chip-name">{{ projectName(state.cwd) }}</span>
+							<span class="workspace-chip-path ellipsis">{{ state.cwd }}</span>
+							<svg class="workspace-chip-caret" viewBox="0 0 16 16" aria-hidden="true">
+								<path d="M4.5 6.5L8 10l3.5-3.5" />
+							</svg>
+						</button>
+
+						<div v-if="workspaceMenu" class="menu workspace-menu" role="dialog" aria-label="选择项目目录" @click.stop>
+							<label class="workspace-search">
+								<svg viewBox="0 0 16 16" aria-hidden="true">
+									<circle cx="7" cy="7" r="4.2" />
+									<path d="M10.2 10.2L14 14" />
+								</svg>
+								<input
+									ref="newInput"
+									v-model="newCwd"
+									type="text"
+									autocomplete="off"
+									spellcheck="false"
+									placeholder="搜索项目，或直接输入路径"
+									@keydown.enter.prevent="pickWorkspace(targetPath)"
+									@keydown.esc.prevent.stop="closeWorkspacePicker()"
+								/>
+								<button
+									v-if="newCwd"
+									type="button"
+									class="workspace-clear"
+									title="清除"
+									aria-label="清除"
+									@click="newCwd = ''"
+								>
+									×
+								</button>
+							</label>
+
+							<!-- typing: known projects, then the typed path as its own "create here" row -->
+							<template v-if="newCwd.trim()">
+								<div v-if="filteredProjects.length" class="workspace-list">
+									<button
+										v-for="entry in filteredProjects"
+										:key="entry.path"
+										type="button"
+										class="workspace-option"
+										:class="{ selected: entry.path === state.cwd }"
+										:disabled="newBusy"
+										@click="pickWorkspace(entry.path)"
+									>
+										<svg viewBox="0 0 16 16" aria-hidden="true">
+											<path d="M2.2 4.9a1.5 1.5 0 0 1 1.5-1.5h2.2l1.3 1.6h4.9a1.5 1.5 0 0 1 1.5 1.5v4.6a1.5 1.5 0 0 1-1.5 1.5H3.7a1.5 1.5 0 0 1-1.5-1.5z" />
+										</svg>
+										<span class="workspace-option-copy">
+											<span class="workspace-option-name ellipsis">{{ entry.name }}</span>
+											<span class="workspace-option-path ellipsis">{{ entry.path }}</span>
+										</span>
+										<span v-if="entry.path === state.cwd" class="workspace-option-kind">当前</span>
+										<span v-else class="workspace-option-kind">
+											{{ entry.kind === "default" ? "默认" : entry.kind === "recent" ? "最近" : "项目" }}
+										</span>
+									</button>
+								</div>
+								<button
+									v-if="newPathRow"
+									type="button"
+									class="workspace-option create"
+									:disabled="newBusy"
+									@click="pickWorkspace(newCwd)"
+								>
+									<svg viewBox="0 0 16 16" aria-hidden="true">
+										<path d="M8 3.5v9M3.5 8h9" />
+									</svg>
+									<span class="workspace-option-copy">
+										<span class="workspace-option-name">在此新建对话</span>
+										<span class="workspace-option-path ellipsis">{{ newCwd.trim() }}</span>
+									</span>
+								</button>
+							</template>
+
+							<!-- empty input: browse the filesystem, no path knowledge needed -->
+							<template v-else>
+								<div class="workspace-quick">
+									<p class="workspace-label">常用位置</p>
+									<button
+										v-for="spot in quickSpots"
+										:key="spot.path"
+										type="button"
+										class="workspace-spot"
+										:class="{ selected: spot.path === browseDir }"
+										title="打开这个文件夹"
+										@click="enterDir(spot.path)"
+									>
+										<svg v-if="spot.name === '主目录'" viewBox="0 0 16 16" aria-hidden="true">
+											<path d="M3 7.4L8 3l5 4.4V13H3z" />
+											<path d="M6.4 13V9.5h3.2V13" />
+										</svg>
+										<svg v-else viewBox="0 0 16 16" aria-hidden="true">
+											<path d="M2.2 4.9a1.5 1.5 0 0 1 1.5-1.5h2.2l1.3 1.6h4.9a1.5 1.5 0 0 1 1.5 1.5v4.6a1.5 1.5 0 0 1-1.5 1.5H3.7a1.5 1.5 0 0 1-1.5-1.5z" />
+										</svg>
+										<span class="workspace-spot-name">{{ spot.name }}</span>
+										<span class="workspace-spot-path ellipsis">{{ spot.path }}</span>
+									</button>
+								</div>
+
+								<div class="workspace-browse">
+									<div class="workspace-crumbs">
+										<button
+											type="button"
+											class="workspace-up"
+											:disabled="!browseParent"
+											title="上一级"
+											aria-label="上一级"
+											@click="enterDir(browseParent)"
+										>
+											<svg viewBox="0 0 16 16" aria-hidden="true">
+												<path d="M8 12.5v-9M4.5 8L8 4.5 11.5 8" />
+											</svg>
+										</button>
+										<div class="workspace-crumb-row">
+											<template v-for="(crumb, index) in browseCrumbs" :key="crumb.path">
+												<span v-if="index" class="workspace-crumb-sep" aria-hidden="true">›</span>
+												<button
+													type="button"
+													class="workspace-crumb"
+													:title="crumb.path"
+													@click="enterDir(crumb.path)"
+												>
+													{{ crumb.name }}
+												</button>
+											</template>
+										</div>
+									</div>
+
+									<div class="workspace-list">
+										<p v-if="browseBusy" class="workspace-hint-row">读取文件夹…</p>
+										<p v-else-if="browseError" class="workspace-error">{{ browseError }}</p>
+										<div v-else-if="!browseDirs.length" class="workspace-blank">
+											<span>这个文件夹里没有子文件夹</span>
+											<span class="workspace-blank-hint">可以点上方的「主目录」，或直接输入路径</span>
+										</div>
+										<button
+											v-for="dir in browseDirs"
+											:key="dir.path"
+											type="button"
+											class="workspace-option folder"
+											@click="enterDir(dir.path)"
+										>
+											<svg viewBox="0 0 16 16" aria-hidden="true">
+												<path d="M2.2 4.9a1.5 1.5 0 0 1 1.5-1.5h2.2l1.3 1.6h4.9a1.5 1.5 0 0 1 1.5 1.5v4.6a1.5 1.5 0 0 1-1.5 1.5H3.7a1.5 1.5 0 0 1-1.5-1.5z" />
+											</svg>
+											<span class="workspace-option-name ellipsis">{{ dir.name }}</span>
+											<svg class="workspace-option-chev" viewBox="0 0 16 16" aria-hidden="true">
+												<path d="M6.5 4.5L10 8l-3.5 3.5" />
+											</svg>
+										</button>
+									</div>
+								</div>
+							</template>
+
+							<p v-if="newError" class="workspace-error">{{ newError }}</p>
+
+							<div class="workspace-foot">
+								<span class="workspace-target ellipsis" :title="targetPath">{{ targetPath }}</span>
+								<span v-if="targetIsTemp" class="workspace-temp" title="临时目录里的会话不会被保留">临时</span>
+								<button type="button" class="workspace-cancel" @click="closeWorkspacePicker()">取消</button>
+								<button
+									type="button"
+									class="workspace-go"
+									:disabled="newBusy || !targetPath || targetPath === state.cwd"
+									@click="pickWorkspace(targetPath)"
+								>
+									{{ targetPath && targetPath === state.cwd ? "已是当前目录" : "在此新建对话" }}
+								</button>
+							</div>
+						</div>
+					</div>
 					<div v-if="attachments.length > 0 || files.length > 0" class="attachments">
 						<figure v-for="image in attachments" :key="image.id" class="attachment" :class="{ loading: image.loading }">
 							<img :src="image.url" :alt="image.name" :title="image.loading ? 'preparing…' : image.name" />
@@ -3078,14 +3857,18 @@ onBeforeUnmount(() => {
 							<button type="button" class="attachment-remove" title="Remove file" @click="removeFile(file.id)">
 								×
 							</button>
-							<span v-if="!file.path" class="file-progress" :style="{ width: `${Math.round(file.progress * 100)}%` }"></span>
+							<span
+							v-if="!file.path && typeof file.text !== 'string'"
+							class="file-progress"
+							:style="{ width: `${Math.round(file.progress * 100)}%` }"
+						></span>
 						</div>
 					</div>
 					<textarea
 						ref="inputEl"
 						v-model="text"
 						rows="1"
-						placeholder="Describe a task, or ask a question"
+						:placeholder="isChat ? 'Message Nife Chat' : 'Describe a task, or ask a question'"
 						:disabled="compacting"
 						@input="resize"
 						@paste="onPaste"
@@ -3223,14 +4006,16 @@ onBeforeUnmount(() => {
 
 		<div v-if="deleteQueue.length" class="modal" @click.self="cancelDelete">
 			<div class="modal-card delete-card" role="alertdialog" aria-modal="true">
-				<h2 v-if="deleteQueue.length === 1">删除后，该对话将不可恢复</h2>
+				<h2 v-if="deleteWorkspace">删除工作区“{{ deleteWorkspace.name }}”？</h2>
+				<h2 v-else-if="deleteQueue.length === 1">删除后，该对话将不可恢复</h2>
 				<h2 v-else>删除后，这 {{ deleteQueue.length }} 个对话将不可恢复</h2>
-				<p v-if="deleteQueue.length === 1">该对话的聊天记录将被永久删除。</p>
+				<p v-if="deleteWorkspace">将永久删除其中的 {{ deleteQueue.length }} 个对话；项目目录和文件不会被删除。</p>
+				<p v-else-if="deleteQueue.length === 1">该对话的聊天记录将被永久删除。</p>
 				<p v-else>这些对话的聊天记录将被永久删除。</p>
 				<div class="modal-actions">
 					<button type="button" class="ghost" :disabled="deleting" @click="cancelDelete">取消</button>
 					<button type="button" class="danger" :disabled="deleting" @click="confirmDeleteSessions">
-						{{ deleting ? "删除中…" : deleteQueue.length === 1 ? "删除该对话" : "删除这些对话" }}
+						{{ deleting ? "删除中…" : deleteWorkspace ? "删除工作区" : deleteQueue.length === 1 ? "删除该对话" : "删除这些对话" }}
 					</button>
 				</div>
 			</div>

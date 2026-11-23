@@ -1,8 +1,9 @@
-// Dropped files are sent as *text*: nife's message model has no file block, so the prompt carries
-// one marker line per file for the agent to read. The path is an implementation detail on our
-// side, so both the composer and the transcript render the marker as a file chip instead.
+// nife's message model has no file block. Work files travel as one `[attached] <path>` line for
+// the agent to read; Chat files travel as an `[attached-inline]` block because that workspace has no
+// tool to read a path. Either way both the composer and the transcript render a file chip.
 
 const ATTACHED_LINE = /^\[attached\] (.+)$/;
+const INLINE_LINE = /^\[attached-inline\] (.+)$/;
 const QUOTED = /^"(.*)"$/;
 
 /**
@@ -12,6 +13,16 @@ const QUOTED = /^"(.*)"$/;
  */
 export function attachedLine(file) {
 	return `[attached] ${JSON.stringify({ name: file.name || fileNameOf(file.path), path: file.path })}`;
+}
+
+/**
+ * Chat has no tools, so text files are carried inside the prompt instead of as a path. The random
+ * end token lets the transcript hide the block as a chip even when the file itself contains marker
+ * text, and lets Edit put the file back without asking the server for it.
+ */
+export function inlineAttachedBlock(file) {
+	const end = `NIFE_FILE_END_${Math.random().toString(36).slice(2, 10)}`;
+	return `[attached-inline] ${JSON.stringify({ name: file.name, end })}\n${file.text}\n${end}`;
 }
 
 export function fileNameOf(path) {
@@ -137,17 +148,47 @@ export const FILE_ICONS = {
 export function splitAttachments(text) {
 	const files = [];
 	const kept = [];
-	for (const line of text.split("\n")) {
-		const match = ATTACHED_LINE.exec(line.trim());
+	const lines = text.split("\n");
+	for (let index = 0; index < lines.length; index += 1) {
+		const inline = INLINE_LINE.exec(lines[index].trim());
+		if (inline) {
+			const parsed = parseInlineAttachment(inline[1]);
+			if (parsed) {
+				let end = index + 1;
+				while (end < lines.length && lines[end] !== parsed.end) end += 1;
+				if (end < lines.length) {
+					const body = lines.slice(index + 1, end).join("\n");
+					files.push({ name: parsed.name, text: body, size: body.length, inline: true });
+					index = end;
+					continue;
+				}
+				// A truncated marker is ordinary text, not a reason to eat the rest of the prompt.
+				kept.push(...lines.slice(index));
+				break;
+			}
+		}
+		const match = ATTACHED_LINE.exec(lines[index].trim());
 		if (!match) {
-			kept.push(line);
+			kept.push(lines[index]);
 			continue;
 		}
 		const file = parseAttachment(match[1]);
 		if (file) files.push(file);
-		else kept.push(line);
+		else kept.push(lines[index]);
 	}
 	return { text: kept.join("\n").trim(), files };
+}
+
+function parseInlineAttachment(payload) {
+	try {
+		const parsed = JSON.parse(payload);
+		if (typeof parsed?.name === "string" && parsed.name && typeof parsed.end === "string" && parsed.end) {
+			return { name: parsed.name, end: parsed.end };
+		}
+	} catch {
+		// fall through to text
+	}
+	return null;
 }
 
 function parseAttachment(payload) {
