@@ -4295,6 +4295,15 @@ img {
 	padding: 6px 10px 4px;
 }
 
+/* the word before the id: this line names a provider, not a model */
+.mm-group-label {
+	flex: 0 0 auto;
+	padding-right: 2px;
+	color: var(--dim);
+	font-size: 11px;
+	letter-spacing: 0.01em;
+}
+
 .mm-group-name {
 	flex: 0 0 auto;
 	margin: 0;

@@ -5010,6 +5010,7 @@ onBeforeUnmount(() => {
 						<div class="mm-rows">
 							<div v-for="group in modelGroups" :key="group.provider" class="mm-group">
 								<div class="mm-group-head">
+									<span class="mm-group-label">Provider</span>
 									<p class="mm-group-name ellipsis" :title="group.provider">{{ group.provider }}</p>
 									<p class="mm-group-url ellipsis" :title="group.info?.entry?.baseUrl">
 										{{ group.info?.entry?.baseUrl || "no endpoint" }}
