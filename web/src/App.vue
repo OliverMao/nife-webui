@@ -2874,7 +2874,7 @@ const modelProviderRows = computed(() => {
 	for (const row of modelManager.value?.models ?? []) counts.set(row.provider, (counts.get(row.provider) ?? 0) + 1);
 	return (modelManager.value?.providers ?? [])
 		.map((provider) => ({ ...provider, rows: counts.get(provider.id) ?? 0 }))
-		.sort((left, right) => right.rows - left.rows || left.id.localeCompare(right.id));
+		.sort((left, right) => left.id.localeCompare(right.id));
 });
 
 const selectedProvider = computed(() =>
@@ -4692,9 +4692,8 @@ onBeforeUnmount(() => {
 	<!-- The model manager: providers on the left, the catalog on the right, forms over models.json. -->
 	<div v-if="modelManager" class="modal" @click.self="closeModelManager">
 		<div class="modal-card mm-card" role="dialog" aria-modal="true" aria-labelledby="mm-title">
-			<header class="mm-head">
+			<header class="mm-head" :title="modelManager.path">
 				<h2 id="mm-title">Models</h2>
-				<p class="mm-path ellipsis" :title="modelManager.path">{{ modelManager.path }}</p>
 				<div class="mm-head-actions">
 					<button type="button" class="mm-add" :disabled="modelManagerBusy || Boolean(modelForm)" @click="startCreateModel">
 						<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3.75v8.5M3.75 8h8.5" /></svg>
@@ -4976,15 +4975,12 @@ onBeforeUnmount(() => {
 							type="button"
 							class="mm-rail-row"
 							:class="{ active: modelProviderFilter === provider.id }"
-							:title="provider.defined ? provider.id : `${provider.id} (registered by an extension)`"
+							:title="provider.defined ? provider.id : `${provider.id} - registered by an extension`"
 							@click="modelProviderFilter = modelProviderFilter === provider.id ? '' : provider.id"
 						>
 							<span class="mm-rail-name ellipsis">{{ provider.id }}</span>
-							<span class="mm-rail-meta">
-								<span v-if="provider.hasKey" class="mm-key">key</span>
-								<span v-if="!provider.defined" class="mm-ext">ext</span>
-								<span class="mm-rail-count">{{ provider.rows }}</span>
-							</span>
+							<span v-if="!provider.defined" class="mm-rail-ext">ext</span>
+							<span class="mm-rail-count">{{ provider.rows }}</span>
 						</button>
 					</aside>
 
@@ -5046,7 +5042,9 @@ onBeforeUnmount(() => {
 											</span>
 										</span>
 										<span class="mm-row-line mm-row-sub">
-											<span class="mm-row-mono ellipsis">{{ row.provider }} · {{ row.id }}</span>
+											<span class="mm-row-mono ellipsis">
+												{{ modelProviderFilter ? row.id : `${row.provider} · ${row.id}` }}
+											</span>
 											<span class="mm-row-mono">{{ compact(row.contextWindow) }} ctx · {{ compact(row.maxTokens) }} out</span>
 											<span class="mm-row-mono ellipsis">{{ row.endpoint || "no endpoint" }}</span>
 										</span>

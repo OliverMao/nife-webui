@@ -302,10 +302,10 @@ From the browser:
   input is used in both states
 - model chip in the composer lists available/scoped models with a filter, `setModel` runs in the CLI
   session so the terminal switches too; models without credentials are reported, not switched
-- `Manage models` in the model menu is the editor for `~/.nife/agent/models.json`. A provider rail
-  on the left (row count, `key`/`ext` badges) filters the catalog on the right; a row shows the name,
-  the `current`/`override`/`no key` state, the limits, the endpoint it resolves to, and how many
-  advanced blocks it sets. `Add model` writes a new row (an existing provider, or a brand-new one
+- `Manage models` in the model menu is the editor for `~/.nife/agent/models.json` (the path itself
+  is only a tooltip on the header). A provider rail on the left, alphabetical with row counts,
+  filters the catalog on the right; a row shows the name, the `current`/`override`/`no key` state,
+  the limits, the endpoint it resolves to, and how many advanced blocks it sets. `Add model` writes a new row (an existing provider, or a brand-new one
   with its base URL, API and optional key), the pencil opens the row's form, the bin deletes it
   (also removing an `modelOverrides` entry and the empty scaffolding, since an empty `models: []`
   would fail the whole file).
