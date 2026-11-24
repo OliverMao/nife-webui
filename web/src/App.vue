@@ -4991,12 +4991,10 @@ onBeforeUnmount(() => {
 						</div>
 
 						<div v-if="selectedProvider" class="mm-provider-card">
-							<div class="mm-provider-card-text">
-								<p class="mm-provider-card-name ellipsis">{{ selectedProvider.id }}</p>
-								<p class="mm-provider-card-url ellipsis">
-									{{ selectedProvider.entry?.baseUrl || "no endpoint — every model must carry its own" }}
-								</p>
-							</div>
+							<p class="mm-provider-card-name">{{ selectedProvider.id }}</p>
+							<p class="mm-provider-card-url ellipsis" :title="selectedProvider.entry?.baseUrl">
+								{{ selectedProvider.entry?.baseUrl || "no endpoint — every model must carry its own" }}
+							</p>
 							<button
 								type="button"
 								class="mm-secondary"
@@ -5004,7 +5002,7 @@ onBeforeUnmount(() => {
 								:title="selectedProvider.defined ? 'Edit this provider' : 'Registered by an extension: read-only'"
 								@click="startEditProvider(selectedProvider)"
 							>
-								{{ selectedProvider.defined ? "Edit provider" : "Read-only" }}
+								{{ selectedProvider.defined ? "Edit" : "Read-only" }}
 							</button>
 						</div>
 
