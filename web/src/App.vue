@@ -4693,17 +4693,15 @@ onBeforeUnmount(() => {
 	<div v-if="modelManager" class="modal" @click.self="closeModelManager">
 		<div class="modal-card mm-card" role="dialog" aria-modal="true" aria-labelledby="mm-title">
 			<header class="mm-head">
-				<div class="mm-head-text">
-					<h2 id="mm-title">Models</h2>
-					<p class="mm-path ellipsis" :title="modelManager.path">{{ modelManager.path }}</p>
-				</div>
+				<h2 id="mm-title">Models</h2>
+				<p class="mm-path ellipsis" :title="modelManager.path">{{ modelManager.path }}</p>
 				<div class="mm-head-actions">
 					<button type="button" class="mm-add" :disabled="modelManagerBusy || Boolean(modelForm)" @click="startCreateModel">
-						<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3.5v9M3.5 8h9" /></svg>
-						<span>Add model</span>
+						<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3.75v8.5M3.75 8h8.5" /></svg>
+						<span>Add</span>
 					</button>
 					<button type="button" class="mm-x" title="Close" @click="closeModelManager">
-						<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4.4 4.4l7.2 7.2M11.6 4.4l-7.2 7.2" /></svg>
+						<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4.6 4.6l6.8 6.8M11.4 4.6l-6.8 6.8" /></svg>
 					</button>
 				</div>
 			</header>
@@ -4713,9 +4711,8 @@ onBeforeUnmount(() => {
 			<template v-if="modelForm">
 				<div class="mm-editor">
 					<div class="mm-editor-head">
-						<button type="button" class="mm-back" :disabled="modelManagerBusy" @click="cancelModelForm">
+						<button type="button" class="mm-back" :disabled="modelManagerBusy" title="Back" @click="cancelModelForm">
 							<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M9.8 3.8l-4.2 4.2 4.2 4.2" /></svg>
-							<span>Back</span>
 						</button>
 						<h3 class="mm-editor-title ellipsis">
 							{{
@@ -4726,7 +4723,15 @@ onBeforeUnmount(() => {
 										: modelForm.name || modelForm.id
 							}}
 						</h3>
-						<span class="mm-chip">{{ modelForm.mode === "provider" ? "provider" : modelForm.provider }}</span>
+						<span class="mm-chip ellipsis">
+							{{
+								modelForm.mode === "create"
+									? modelForm.provider || "provider"
+									: modelForm.mode === "provider"
+										? "provider"
+										: `${modelForm.provider} · ${modelForm.id}`
+							}}
+						</span>
 					</div>
 
 					<div class="mm-editor-body">
@@ -4792,63 +4797,47 @@ onBeforeUnmount(() => {
 						<!-- model: identity, endpoint, capabilities, pricing, then the long tail -->
 						<template v-else>
 							<section class="mm-section">
-								<div class="mm-section-head"><h4>Identity</h4></div>
 								<div class="mm-grid">
-									<label class="mm-field">
-										<span>Provider</span>
-										<input
-											v-model.trim="modelForm.provider"
-											list="mm-providers"
-											spellcheck="false"
-											:disabled="modelForm.mode === 'edit'"
-											placeholder="provider id"
-										/>
-									</label>
-									<label class="mm-field">
-										<span>Model id</span>
-										<input
-											v-model.trim="modelForm.id"
-											maxlength="200"
-											spellcheck="false"
-											:disabled="modelForm.mode === 'edit'"
-											placeholder="id sent to the API"
-										/>
-									</label>
+									<template v-if="modelForm.mode === 'create'">
+										<label class="mm-field">
+											<span>Provider</span>
+											<input v-model.trim="modelForm.provider" list="mm-providers" spellcheck="false" placeholder="provider id" />
+										</label>
+										<label class="mm-field">
+											<span>Model id</span>
+											<input v-model.trim="modelForm.id" maxlength="200" spellcheck="false" placeholder="id sent to the API" />
+										</label>
+									</template>
 									<label class="mm-field mm-span-2">
 										<span>Name</span>
 										<input v-model="modelForm.name" maxlength="200" :placeholder="modelForm.id || 'display name'" />
 									</label>
+									<template v-if="modelFormEndpoint">
+										<label class="mm-field mm-span-2">
+											<span>Base URL <em>empty inherits the provider</em></span>
+											<input
+												v-model.trim="modelForm.baseUrl"
+												spellcheck="false"
+												:placeholder="modelForm.inheritedEndpoint || 'https://host/v1'"
+											/>
+										</label>
+										<label class="mm-field">
+											<span>API</span>
+											<input v-model.trim="modelForm.api" list="mm-apis" spellcheck="false" placeholder="inherit" />
+										</label>
+										<label v-if="modelFormNeedsEndpoint" class="mm-field">
+											<span>API key <em>stored on the new provider</em></span>
+											<input v-model="modelForm.apiKey" spellcheck="false" placeholder="sk-… or $ENV_VAR" />
+										</label>
+									</template>
 								</div>
+								<p v-if="!modelFormEndpoint && modelForm.mode === 'edit'" class="mm-note">
+									A <code>modelOverrides</code> row has no endpoint of its own — it uses the one from its provider.
+									<button type="button" class="mm-link" @click="startEditProvider(modelForm.provider)">
+										Edit {{ modelForm.provider }}
+									</button>
+								</p>
 							</section>
-
-							<section v-if="modelFormEndpoint" class="mm-section">
-								<div class="mm-section-head"><h4>Endpoint</h4><span class="mm-hint">empty inherits the provider</span></div>
-								<div class="mm-grid">
-									<label class="mm-field mm-span-2">
-										<span>Base URL</span>
-										<input
-											v-model.trim="modelForm.baseUrl"
-											spellcheck="false"
-											:placeholder="modelForm.inheritedEndpoint || 'https://host/v1'"
-										/>
-									</label>
-									<label class="mm-field">
-										<span>API</span>
-										<input v-model.trim="modelForm.api" list="mm-apis" spellcheck="false" placeholder="inherit" />
-									</label>
-									<label v-if="modelFormNeedsEndpoint" class="mm-field">
-										<span>API key <em>stored on the new provider</em></span>
-										<input v-model="modelForm.apiKey" spellcheck="false" placeholder="sk-… or $ENV_VAR" />
-									</label>
-								</div>
-							</section>
-							<p v-else-if="modelForm.mode === 'edit'" class="mm-note">
-								A <code>modelOverrides</code> row has no endpoint of its own — it uses the one from its provider.
-								<button type="button" class="mm-link" @click="startEditProvider(modelForm.provider)">
-									Edit {{ modelForm.provider }}
-								</button>
-							</p>
-
 							<section class="mm-section">
 								<div class="mm-section-head"><h4>Capabilities</h4></div>
 								<div class="mm-grid">
