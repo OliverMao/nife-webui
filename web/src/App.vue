@@ -2877,9 +2877,24 @@ const modelProviderRows = computed(() => {
 		.sort((left, right) => left.id.localeCompare(right.id));
 });
 
-const selectedProvider = computed(() =>
-	modelProviderFilter.value ? (modelProviderRows.value.find((row) => row.id === modelProviderFilter.value) ?? null) : null,
-);
+/**
+ * The list is grouped by provider: one borderless header per provider carries its endpoint and the
+ * way into the provider form, so a long catalog visibly splits into blocks instead of one grey list.
+ */
+const modelGroups = computed(() => {
+	const groups = new Map();
+	for (const row of visibleModels.value) {
+		if (!groups.has(row.provider)) groups.set(row.provider, []);
+		groups.get(row.provider).push(row);
+	}
+	return [...groups.entries()]
+		.sort(([left], [right]) => left.localeCompare(right))
+		.map(([provider, rows]) => ({
+			provider,
+			rows: rows.sort((left, right) => String(left.name ?? left.id).localeCompare(String(right.name ?? right.id))),
+			info: modelProviderRows.value.find((entry) => entry.id === provider) ?? null,
+		}));
+});
 
 /** A new row on a provider nife does not have yet must carry its endpoint. */
 const modelFormNeedsEndpoint = computed(() => {
@@ -4990,27 +5005,27 @@ onBeforeUnmount(() => {
 							<span class="mm-toolbar-count">{{ visibleModels.length }} / {{ modelManager.models.length }}</span>
 						</div>
 
-						<div v-if="selectedProvider" class="mm-provider-card">
-							<p class="mm-provider-card-name">{{ selectedProvider.id }}</p>
-							<p class="mm-provider-card-url ellipsis" :title="selectedProvider.entry?.baseUrl">
-								{{ selectedProvider.entry?.baseUrl || "no endpoint — every model must carry its own" }}
-							</p>
-							<button
-								type="button"
-								class="mm-secondary"
-								:disabled="!selectedProvider.defined"
-								:title="selectedProvider.defined ? 'Edit this provider' : 'Registered by an extension: read-only'"
-								@click="startEditProvider(selectedProvider)"
-							>
-								{{ selectedProvider.defined ? "Edit" : "Read-only" }}
-							</button>
-						</div>
-
 						<p v-if="modelManagerError" class="mm-error" role="alert">{{ modelManagerError }}</p>
 
 						<div class="mm-rows">
+							<div v-for="group in modelGroups" :key="group.provider" class="mm-group">
+								<div class="mm-group-head">
+									<p class="mm-group-name ellipsis" :title="group.provider">{{ group.provider }}</p>
+									<p class="mm-group-url ellipsis" :title="group.info?.entry?.baseUrl">
+										{{ group.info?.entry?.baseUrl || "no endpoint" }}
+									</p>
+									<button
+										v-if="group.info?.defined"
+										type="button"
+										class="mm-group-edit"
+										@click="startEditProvider(group.info)"
+									>
+										Edit
+									</button>
+									<span v-else class="mm-group-ext">extension</span>
+								</div>
 							<div
-								v-for="row in visibleModels"
+								v-for="row in group.rows"
 								:key="`${row.provider}/${row.id}`"
 								class="mm-row"
 								:class="{ current: row.current }"
@@ -5040,9 +5055,7 @@ onBeforeUnmount(() => {
 											</span>
 										</span>
 										<span class="mm-row-line mm-row-sub">
-											<span class="mm-row-mono ellipsis">
-												{{ modelProviderFilter ? row.id : `${row.provider} · ${row.id}` }}
-											</span>
+											<span class="mm-row-mono ellipsis">{{ row.id }}</span>
 											<span class="mm-row-mono">{{ compact(row.contextWindow) }} ctx · {{ compact(row.maxTokens) }} out</span>
 											<span class="mm-row-mono ellipsis">{{ row.endpoint || "no endpoint" }}</span>
 										</span>
@@ -5067,6 +5080,7 @@ onBeforeUnmount(() => {
 										</button>
 									</div>
 								</template>
+							</div>
 							</div>
 							<p v-if="visibleModels.length === 0" class="mm-empty">No models</p>
 						</div>
