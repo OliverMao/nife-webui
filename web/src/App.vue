@@ -2866,6 +2866,18 @@ const modelFormNeedsEndpoint = computed(() => {
 	return !(modelManager.value?.providers ?? []).some((provider) => provider.id === form.provider && provider.defined);
 });
 
+/** Base URL and API can be typed whenever the row lands in a models entry - a new provider's own
+ *  entry, or an existing provider. modelOverrides has no endpoint field, so it is shown read-only. */
+const modelFormEndpoint = computed(() => {
+	const form = modelForm.value;
+	if (!form) return false;
+	if (form.mode === "create") return form.endpoint !== false;
+	return Boolean(form.canEditEndpoint);
+});
+
+/** Providers whose entry lives in models.json - those are the endpoints this page can rewrite. */
+const modelProviders = computed(() => modelManager.value?.providers ?? []);
+
 async function openModelManager() {
 	menu.value = null;
 	modelManagerError.value = "";
@@ -2922,6 +2934,8 @@ function startCreateModel() {
 		baseUrl: "",
 		api: "openai-completions",
 		apiKey: "",
+		endpointSource: "inherited",
+		inheritedEndpoint: "",
 	};
 }
 
@@ -2938,6 +2952,36 @@ function startEditModel(row) {
 		contextWindow: row.contextWindow,
 		maxTokens: row.maxTokens,
 		cost: { ...row.cost },
+		baseUrl: row.baseUrl ?? "",
+		api: row.api ?? "",
+		canEditEndpoint: row.source === "models",
+		endpointSource: row.endpointSource ?? "inherited",
+		inheritedEndpoint: row.endpoint ?? "",
+	};
+}
+
+/** The provider endpoint form: shared by every model of that provider, so it is edited once. */
+function startEditProvider(provider) {
+	const row =
+		typeof provider === "string"
+			? (modelProviders.value.find((entry) => entry.id === provider) ?? {
+					id: provider,
+					defined: true,
+					baseUrl: "",
+					api: null,
+					hasKey: false,
+				})
+			: provider;
+	modelDelete.value = null;
+	modelFormError.value = "";
+	modelForm.value = {
+		mode: "provider",
+		provider: row.id,
+		baseUrl: row.baseUrl ?? "",
+		api: row.api ?? "",
+		apiKey: "",
+		hasKey: Boolean(row.hasKey),
+		clearKey: false,
 	};
 }
 
@@ -2952,6 +2996,7 @@ async function saveModelForm() {
 	if (!form || modelManagerBusy.value) return;
 	modelManagerBusy.value = true;
 	modelFormError.value = "";
+	const endpoint = modelFormEndpoint.value ? { baseUrl: form.baseUrl, api: form.api } : {};
 	const fields = {
 		name: form.name,
 		reasoning: form.reasoning,
@@ -2959,16 +3004,25 @@ async function saveModelForm() {
 		contextWindow: form.contextWindow,
 		maxTokens: form.maxTokens,
 		cost: form.cost,
+		...endpoint,
 	};
 	const result =
-		form.mode === "create"
-			? await postDetailed("models", {
+		form.mode === "provider"
+			? await postDetailed("models/provider", {
 					provider: form.provider,
-					id: form.id,
-					...fields,
-					...(modelFormNeedsEndpoint.value ? { baseUrl: form.baseUrl, api: form.api, apiKey: form.apiKey } : {}),
+					baseUrl: form.baseUrl,
+					api: form.api,
+					...(form.apiKey.trim() ? { apiKey: form.apiKey } : {}),
+					...(form.clearKey ? { clearApiKey: true } : {}),
 				})
-			: await postDetailed("models/update", { provider: form.provider, id: form.id, ...fields });
+			: form.mode === "create"
+				? await postDetailed("models", {
+						provider: form.provider,
+						id: form.id,
+						...fields,
+						...(modelFormNeedsEndpoint.value ? { apiKey: form.apiKey } : {}),
+					})
+				: await postDetailed("models/update", { provider: form.provider, id: form.id, ...fields });
 	modelManagerBusy.value = false;
 	if (!result.ok) {
 		modelFormError.value = result.message || "could not save the model";
@@ -2977,7 +3031,7 @@ async function saveModelForm() {
 	modelForm.value = null;
 	await loadModelManager();
 	await loadState();
-	showNotice(form.mode === "create" ? "Model added" : "Model saved");
+	showNotice(form.mode === "provider" ? "Endpoint saved" : form.mode === "create" ? "Model added" : "Model saved");
 }
 
 function askDeleteModel(row) {
@@ -4376,8 +4430,52 @@ onBeforeUnmount(() => {
 			</div>
 			<p class="model-manager-path">{{ modelManager.path }}</p>
 
-			<!-- create/edit: one row's fields, and the endpoint when the provider is new -->
-			<template v-if="modelForm">
+			<!-- provider endpoint: one baseUrl/api/key for every model of that provider -->
+			<template v-if="modelForm && modelForm.mode === 'provider'">
+				<div class="model-form">
+					<div class="model-edit-grid">
+						<p class="model-edit-identity">{{ modelForm.provider }} · provider endpoint</p>
+						<label class="model-edit-field model-edit-span">
+							<span>Base URL <span class="muted">used by every model without its own</span></span>
+							<input v-model.trim="modelForm.baseUrl" type="text" spellcheck="false" placeholder="https://host/v1" />
+						</label>
+						<label class="model-edit-field">
+							<span>API</span>
+							<select v-model="modelForm.api">
+								<option value="">inherit</option>
+								<option value="openai-completions">openai-completions</option>
+								<option value="openai-responses">openai-responses</option>
+								<option value="anthropic-messages">anthropic-messages</option>
+								<option value="google-generative-ai">google-generative-ai</option>
+							</select>
+						</label>
+						<label class="model-edit-field model-edit-span">
+							<span>API key <span class="muted">optional — literal, $ENV_VAR or !command</span></span>
+							<input
+								v-model="modelForm.apiKey"
+								type="password"
+								autocomplete="off"
+								spellcheck="false"
+								:placeholder="modelForm.hasKey ? 'keep the stored key' : 'sk-…'"
+							/>
+						</label>
+						<label v-if="modelForm.hasKey" class="model-edit-check model-edit-span">
+							<input type="checkbox" v-model="modelForm.clearKey" />
+							<span>Remove the stored key</span>
+						</label>
+					</div>
+				</div>
+				<p v-if="modelFormError" class="model-edit-error" role="alert">{{ modelFormError }}</p>
+				<div class="modal-actions">
+					<button type="button" class="ghost" :disabled="modelManagerBusy" @click="cancelModelForm">Cancel</button>
+					<button type="button" class="primary" :disabled="modelManagerBusy || !modelManager.writable" @click="saveModelForm">
+						{{ modelManagerBusy ? "Saving…" : "Save endpoint" }}
+					</button>
+				</div>
+			</template>
+
+			<!-- create/edit: one row's fields, and the endpoint when the row can carry one -->
+			<template v-else-if="modelForm">
 				<div class="model-form">
 				<div class="model-edit-grid">
 					<template v-if="modelForm.mode === 'create'">
@@ -4425,6 +4523,37 @@ onBeforeUnmount(() => {
 						<span>Max output tokens</span>
 						<input v-model.number="modelForm.maxTokens" type="number" min="1" step="1" />
 					</label>
+					<template v-if="modelFormEndpoint">
+						<label class="model-edit-field model-edit-span">
+							<span>
+								Base URL
+								<span class="muted">· empty inherits the provider</span>
+							</span>
+							<input
+								v-model.trim="modelForm.baseUrl"
+								type="text"
+								spellcheck="false"
+								:placeholder="modelForm.inheritedEndpoint || 'https://host/v1'"
+							/>
+						</label>
+						<label class="model-edit-field">
+							<span>API</span>
+							<select v-model="modelForm.api">
+								<option value="">inherit</option>
+								<option value="openai-completions">openai-completions</option>
+								<option value="openai-responses">openai-responses</option>
+								<option value="anthropic-messages">anthropic-messages</option>
+								<option value="google-generative-ai">google-generative-ai</option>
+							</select>
+						</label>
+					</template>
+					<p v-else-if="modelForm.mode === 'edit'" class="muted model-edit-note model-edit-span">
+						Its endpoint comes from provider
+						<button type="button" class="linkbtn" @click="startEditProvider(modelForm.provider)">
+							{{ modelForm.provider }}
+						</button>
+						— edit the provider endpoint instead.
+					</p>
 					<div class="model-edit-cost">
 						<p class="muted model-edit-label">Cost per 1M tokens</p>
 						<div class="model-edit-cost-grid">
@@ -4434,25 +4563,10 @@ onBeforeUnmount(() => {
 							<label class="model-edit-field"><span>Cache write</span><input v-model.number="modelForm.cost.cacheWrite" type="number" min="0" step="any" /></label>
 						</div>
 					</div>
-					<template v-if="modelFormNeedsEndpoint">
-						<label class="model-edit-field model-edit-span">
-							<span>Base URL</span>
-							<input v-model.trim="modelForm.baseUrl" type="text" spellcheck="false" placeholder="https://host/v1" />
-						</label>
-						<label class="model-edit-field">
-							<span>API</span>
-							<select v-model="modelForm.api">
-								<option value="openai-completions">openai-completions</option>
-								<option value="openai-responses">openai-responses</option>
-								<option value="anthropic-messages">anthropic-messages</option>
-								<option value="google-generative-ai">google-generative-ai</option>
-							</select>
-						</label>
-						<label class="model-edit-field model-edit-span">
-							<span>API key <span class="muted">optional — literal, $ENV_VAR or !command</span></span>
-							<input v-model="modelForm.apiKey" type="text" spellcheck="false" placeholder="sk-…" />
-						</label>
-					</template>
+					<label v-if="modelFormNeedsEndpoint" class="model-edit-field model-edit-span">
+						<span>API key <span class="muted">optional — literal, $ENV_VAR or !command</span></span>
+						<input v-model="modelForm.apiKey" type="text" spellcheck="false" placeholder="sk-…" />
+					</label>
 				</div>
 				</div>
 				<p v-if="modelFormError" class="model-edit-error" role="alert">{{ modelFormError }}</p>
@@ -4521,6 +4635,29 @@ onBeforeUnmount(() => {
 						</template>
 					</div>
 					<p v-if="modelRows.length === 0" class="muted pad">No models</p>
+				</div>
+				<div class="model-endpoints">
+					<p class="muted model-edit-label">Provider endpoints</p>
+					<div v-for="provider in modelProviders" :key="provider.id" class="model-endpoint">
+						<span class="model-endpoint-id ellipsis">{{ provider.id }}</span>
+						<span class="model-endpoint-url ellipsis" :class="{ muted: !provider.baseUrl }">
+							{{ provider.baseUrl || (provider.defined ? "inherit" : "registered outside models.json") }}
+						</span>
+						<span v-if="provider.hasKey" class="model-row-tag" title="an apiKey is stored for this provider">key</span>
+						<button
+							v-if="provider.defined"
+							type="button"
+							class="iconbtn"
+							title="Edit this provider endpoint"
+							@click="startEditProvider(provider)"
+						>
+							<svg viewBox="0 0 16 16" aria-hidden="true">
+								<path d="M11.2 2.3l2.5 2.5-8 8-3.4.9.9-3.4 8-8z" />
+								<path d="M9.6 4l2.4 2.4" />
+							</svg>
+						</button>
+					</div>
+					<p v-if="modelProviders.length === 0" class="muted pad">No providers defined here</p>
 				</div>
 				<div class="modal-actions">
 					<button type="button" class="ghost" :disabled="modelManagerBusy" @click="closeModelManager">Close</button>

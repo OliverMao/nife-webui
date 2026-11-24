@@ -1540,6 +1540,9 @@ type ModelPatch = {
 	contextWindow?: number;
 	maxTokens?: number;
 	cost?: Partial<{ input: number; output: number; cacheRead: number; cacheWrite: number }>;
+	// endpoint of one models entry; null means "inherit from the provider"
+	baseUrl?: string | null;
+	api?: string | null;
 };
 
 /**
@@ -1670,6 +1673,14 @@ function applyModelPatch(root: ModelsRoot, provider: string, id: string, patch: 
 				entry.cost && typeof entry.cost === "object" ? entry.cost : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 			entry.cost = { ...existing, ...patch.cost };
 		}
+		if (patch.baseUrl !== undefined) {
+			if (patch.baseUrl) entry.baseUrl = patch.baseUrl;
+			else delete entry.baseUrl;
+		}
+		if (patch.api !== undefined) {
+			if (patch.api) entry.api = patch.api;
+			else delete entry.api;
+		}
 		return "models";
 	}
 	const providerEntry = source.providerEntry ?? (providers[provider] = {});
@@ -1741,6 +1752,9 @@ function costOf(model: AnyModel): Record<string, number> {
 
 /** One row of the manager: the composed model plus where (and whether) it is stored. */
 function modelRow(root: ModelsRoot | null, b: Bridge, model: AnyModel, current: AnyModel | undefined): Record<string, unknown> {
+	const stored = root ? findModelEntry(root, model.provider, model.id) : { kind: "none" as const };
+	const entry = stored.kind === "models" ? stored.entry : undefined;
+	const providerEntry = root?.providers?.[model.provider] as Record<string, any> | undefined;
 	return {
 		provider: model.provider,
 		id: model.id,
@@ -1750,7 +1764,19 @@ function modelRow(root: ModelsRoot | null, b: Bridge, model: AnyModel, current: 
 		contextWindow: Number(model.contextWindow) || 0,
 		maxTokens: Number(model.maxTokens) || 0,
 		cost: costOf(model),
-		source: root ? findModelEntry(root, model.provider, model.id).kind : "none",
+		source: stored.kind,
+		// what the entry itself declares (empty = inherited), and the endpoint the composer resolved
+		baseUrl: typeof entry?.baseUrl === "string" ? entry.baseUrl : "",
+		api: typeof entry?.api === "string" ? entry.api : "",
+		endpoint: typeof (model as any).baseUrl === "string" ? (model as any).baseUrl : "",
+		// where the resolved endpoint comes from: a models entry's own baseUrl wins over its provider's
+		// (modelFromJson), while an inherited model always takes the provider's (applyModelsJson)
+		endpointSource:
+			stored.kind === "models" && typeof entry?.baseUrl === "string" && entry.baseUrl
+				? "model"
+				: typeof providerEntry?.baseUrl === "string" && providerEntry.baseUrl
+					? "provider"
+					: "inherited",
 		available: b.ctx.modelRegistry.hasConfiguredAuth(model),
 		current: current?.provider === model.provider && current?.id === model.id,
 	};
@@ -1772,15 +1798,24 @@ async function modelsPayload(b: Bridge, target: Target | null): Promise<Record<s
 				String(left.provider).localeCompare(String(right.provider)) ||
 				String(left.name ?? left.id).localeCompare(String(right.name ?? right.id)),
 		);
-	const providers = new Map<string, { id: string; defined: boolean; api: string | null }>();
+	const providers = new Map<
+		string,
+		{ id: string; defined: boolean; api: string | null; baseUrl: string; hasKey: boolean }
+	>();
 	for (const [id, entry] of Object.entries(root?.providers ?? {})) {
 		if (!entry || typeof entry !== "object") continue;
-		providers.set(id, { id, defined: true, api: typeof entry.api === "string" ? entry.api : null });
+		providers.set(id, {
+			id,
+			defined: true,
+			api: typeof entry.api === "string" ? entry.api : null,
+			baseUrl: typeof entry.baseUrl === "string" ? entry.baseUrl : "",
+			hasKey: typeof entry.apiKey === "string" && entry.apiKey.length > 0,
+		});
 	}
 	for (const model of models) {
 		const id = String(model.provider);
 		if (providers.has(id)) continue;
-		providers.set(id, { id, defined: false, api: null });
+		providers.set(id, { id, defined: false, api: null, baseUrl: "", hasKey: false });
 	}
 	return {
 		models,
@@ -1840,6 +1875,16 @@ function readModelPatch(body: Record<string, unknown>): { patch: ModelPatch; err
 		if (value === undefined) return { patch, error: "max tokens must be a number, at least 1" };
 		patch.maxTokens = value;
 	}
+	if (body.baseUrl !== undefined) {
+		const baseUrl = readBaseUrl(body.baseUrl);
+		if (baseUrl.error) return { patch, error: baseUrl.error };
+		patch.baseUrl = baseUrl.value;
+	}
+	if (body.api !== undefined) {
+		const api = readApi(body.api);
+		if (api.error) return { patch, error: api.error };
+		patch.api = api.value;
+	}
 	if (body.cost !== undefined) {
 		if (typeof body.cost !== "object" || body.cost === null || Array.isArray(body.cost)) return { patch, error: "cost must be an object" };
 		const cost: ModelPatch["cost"] = {};
@@ -1855,6 +1900,31 @@ function readModelPatch(body: Record<string, unknown>): { patch: ModelPatch; err
 		if (Object.keys(cost).length > 0) patch.cost = cost;
 	}
 	return { patch };
+}
+
+/**
+ * An endpoint URL from the form: empty means "inherit", and anything else must be http(s) - nife
+ * would otherwise build a client for a URL that cannot work. Returned as null so the caller can
+ * delete the key instead of writing "".
+ */
+function readBaseUrl(raw: unknown): { value: string | null; error?: string } {
+	if (raw === null) return { value: null };
+	if (typeof raw !== "string") return { value: null, error: "base URL must be a string" };
+	const baseUrl = raw.trim();
+	if (!baseUrl) return { value: null };
+	if (!/^https?:\/\//i.test(baseUrl)) return { value: null, error: "base URL must start with http:// or https://" };
+	if (/\s/.test(baseUrl)) return { value: null, error: "base URL cannot contain spaces" };
+	return { value: baseUrl };
+}
+
+/** The API an entry may declare; empty means "inherit from the provider". */
+function readApi(raw: unknown): { value: string | null; error?: string } {
+	if (raw === null) return { value: null };
+	if (typeof raw !== "string") return { value: null, error: "api must be a string" };
+	const api = raw.trim();
+	if (!api) return { value: null };
+	if (!MODEL_APIS.includes(api)) return { value: null, error: `api must be one of ${MODEL_APIS.join(", ")}` };
+	return { value: api };
 }
 
 /** A token count from a number or a numeric string; undefined when it is not a positive integer. */
@@ -1874,6 +1944,8 @@ function modelEntryFromForm(id: string, patch: ModelPatch): Record<string, any> 
 		contextWindow: patch.contextWindow ?? 128000,
 		maxTokens: patch.maxTokens ?? 16384,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, ...(patch.cost ?? {}) },
+		...(patch.baseUrl ? { baseUrl: patch.baseUrl } : {}),
+		...(patch.api ? { api: patch.api } : {}),
 	};
 }
 
@@ -2797,7 +2869,8 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		}
 		const providers = (fileRoot.providers ??= {});
 		let providerEntry = providers[providerId.id];
-		if (!providerEntry || typeof providerEntry !== "object") {
+		const isNewProvider = !providerEntry || typeof providerEntry !== "object";
+		if (isNewProvider) {
 			// A provider nife does not know yet needs its endpoint, exactly like a hand-written entry.
 			const baseUrl = typeof body.baseUrl === "string" ? body.baseUrl.trim() : "";
 			const api = typeof body.api === "string" ? body.api.trim() : "";
@@ -2808,7 +2881,10 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 			if (apiKey) providerEntry.apiKey = apiKey;
 		}
 		if (!Array.isArray(providerEntry.models)) providerEntry.models = [];
-		providerEntry.models.push(modelEntryFromForm(modelId.id, patch));
+		// a new provider already carries the endpoint, so its first model inherits instead of repeating it
+		const entryPatch: ModelPatch =
+			isNewProvider ? { ...patch, baseUrl: undefined, api: undefined } : patch;
+		providerEntry.models.push(modelEntryFromForm(modelId.id, entryPatch));
 		let failure: string | null;
 		try {
 			failure = await saveCatalog(b, fileRoot, content, providerId.id);
@@ -2838,10 +2914,82 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		const { root, content, error: loadError } = await readModelsJson();
 		if (loadError) return send(res, 409, loadError);
 		const fileRoot = root ?? { providers: {} };
+		const stored = findModelEntry(fileRoot, providerId.id, modelId.id).kind;
+		if (stored !== "models" && (patch.baseUrl !== undefined || patch.api !== undefined)) {
+			return send(
+				res,
+				400,
+				`${providerId.id}/${modelId.id} is not defined in models.json - it takes its endpoint from the provider, so change the provider endpoint instead`,
+			);
+		}
 		applyModelPatch(fileRoot, providerId.id, modelId.id, patch);
 		let failure: string | null;
 		try {
 			failure = await saveCatalog(b, fileRoot, content, providerId.id);
+		} catch (saveError) {
+			return send(res, 409, saveError instanceof Error ? saveError.message : String(saveError));
+		}
+		if (failure) return send(res, 409, failure);
+		broadcast(b, { type: "state_changed", sid: requestTarget(b, url.searchParams.get("sid"))?.sid ?? "host" });
+		return send(res, 200, "ok");
+	}
+
+	// The provider endpoint: baseUrl, api and key are shared by every model of that provider, so they
+	// are edited on the provider entry - a models entry can only add its own baseUrl/api on top, and
+	// even that loses to a provider-level baseUrl (provider-composer: config.baseUrl ?? model.baseUrl).
+	if (req.method === "POST" && path === "/api/models/provider") {
+		let body: Record<string, unknown>;
+		try {
+			body = await readJson(req);
+		} catch {
+			return send(res, 400, "bad JSON");
+		}
+		const providerId = readProviderId(body.provider);
+		if (providerId.error) return send(res, 400, providerId.error);
+		const { root, content, error: loadError } = await readModelsJson();
+		if (loadError) return send(res, 409, loadError);
+		const providerEntry = root?.providers?.[providerId.id];
+		if (!root || !providerEntry || typeof providerEntry !== "object") {
+			return send(
+				res,
+				400,
+				`${providerId.id} is registered outside models.json, so its endpoint cannot be edited here`,
+			);
+		}
+		let changed = false;
+		if (body.baseUrl !== undefined) {
+			const baseUrl = readBaseUrl(body.baseUrl);
+			if (baseUrl.error) return send(res, 400, baseUrl.error);
+			if (baseUrl.value) {
+				providerEntry.baseUrl = baseUrl.value;
+			} else {
+				delete providerEntry.baseUrl;
+			}
+			changed = true;
+		}
+		if (body.api !== undefined) {
+			const api = readApi(body.api);
+			if (api.error) return send(res, 400, api.error);
+			if (api.value) {
+				providerEntry.api = api.value;
+			} else {
+				delete providerEntry.api;
+			}
+			changed = true;
+		}
+		if (body.clearApiKey === true) {
+			delete providerEntry.apiKey;
+			changed = true;
+		}
+		if (typeof body.apiKey === "string" && body.apiKey.trim()) {
+			// the key is written verbatim, exactly like a hand-written models.json entry
+			providerEntry.apiKey = body.apiKey.trim();
+			changed = true;
+		}
+		if (!changed) return send(res, 400, "nothing to save");
+		let failure: string | null;
+		try {
+			failure = await saveCatalog(b, root, content, providerId.id);
 		} catch (saveError) {
 			return send(res, 409, saveError instanceof Error ? saveError.message : String(saveError));
 		}

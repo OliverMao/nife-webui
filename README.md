@@ -309,11 +309,16 @@ From the browser:
   in place or a `modelOverrides` entry for anything else, delete removes both and prunes the
   scaffolding it leaves empty (an empty `models: []` would fail the whole file). Fields are name,
   reasoning, input (text/image), context window, max output tokens and the four cost rates - pricing
-  tiers are always kept. `GET/POST /api/models` plus `/api/models/update` and `/api/models/delete`
-  write `~/.nife/agent/models.json` atomically, refresh the catalog, and roll the write back with
-  the compose error when the new entry would not load (a pre-existing broken provider in the same
-  file never blocks another row); a models.json that does not parse is read-only (409) and is left
-  untouched
+  tiers are always kept. Two more fields carry the endpoint: `Base URL` and `API` on the model form
+  (written to that `models` entry, empty = inherit - a `modelOverrides` row has no endpoint of its
+  own, so the form points at the provider instead), and the `Provider endpoints` list under the rows
+  edits the shared `baseUrl`/`api`/`apiKey` of any provider defined in models.json (the key is left
+  alone unless typed, `Remove the stored key` clears it; a provider registered by an extension stays
+  read-only). `GET/POST /api/models` plus `/api/models/update`, `/api/models/provider` and
+  `/api/models/delete` write `~/.nife/agent/models.json` atomically, refresh the catalog, and roll
+  the write back with the compose error when the new entry would not load (a pre-existing broken
+  provider in the same file never blocks another row); a models.json that does not parse is
+  read-only (409) and is left untouched
 - `Compact context` sits in its own divided `Tools` section at the bottom of the model menu (below
   the Reasoning slider, with the current context percentage) and summarizes the context: `POST /api/compact` calls `ctx.compact()` and waits for the
   summarization call to finish, so the row shows `Compacting…` and reports the failure text when

@@ -4152,6 +4152,65 @@ img {
 	border-radius: 8px;
 	padding: 0 4px 0 0;
 }
+/* provider endpoints: what a model inherits when it has no baseUrl of its own */
+.model-endpoints {
+	flex: 0 0 auto;
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	max-height: 28vh;
+	overflow-y: auto;
+	margin: 0 -6px;
+	padding: 8px 6px 2px;
+	border-top: 1px solid var(--line);
+}
+
+.model-endpoint {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 4px 4px 4px 2px;
+	border-radius: 8px;
+	font-size: 12px;
+}
+
+.model-endpoint:hover {
+	background: var(--hover);
+}
+
+.model-endpoint-id {
+	flex: 0 0 auto;
+	max-width: 38%;
+	font-weight: 500;
+	color: var(--text);
+}
+
+.model-endpoint-url {
+	flex: 1 1 auto;
+	min-width: 0;
+	color: var(--dim);
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	font-size: 11px;
+}
+
+.model-edit-note {
+	margin: 0;
+	font-size: 12px;
+	line-height: 1.5;
+}
+
+.linkbtn {
+	border: 0;
+	padding: 0;
+	background: none;
+	color: var(--accent);
+	font: inherit;
+	font-size: inherit;
+	cursor: pointer;
+	text-decoration: underline;
+	text-underline-offset: 2px;
+}
+
 
 .model-row:hover {
 	background: var(--hover);
