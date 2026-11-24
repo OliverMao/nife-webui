@@ -1533,17 +1533,40 @@ const modelsJsonPath = (): string => join(getAgentDir(), "models.json");
 const MODEL_APIS = ["openai-completions", "openai-responses", "anthropic-messages", "google-generative-ai"];
 
 type ModelsRoot = Record<string, any> & { providers?: Record<string, any> };
+type ModelCostRates = { input: number; output: number; cacheRead: number; cacheWrite: number };
+type ModelCostTier = ModelCostRates & { inputTokensAbove: number };
 type ModelPatch = {
 	name?: string;
 	reasoning?: boolean;
 	input?: ("text" | "image")[];
 	contextWindow?: number;
 	maxTokens?: number;
-	cost?: Partial<{ input: number; output: number; cacheRead: number; cacheWrite: number }>;
+	cost?: Partial<ModelCostRates> & { tiers?: ModelCostTier[] };
 	// endpoint of one models entry; null means "inherit from the provider"
 	baseUrl?: string | null;
 	api?: string | null;
+	// the object-valued fields; null (or {}) deletes the key
+	thinkingLevelMap?: Record<string, string | null> | null;
+	inputLimits?: Record<string, any> | null;
+	promptCache?: Record<string, any> | null;
+	samplingParams?: Record<string, unknown> | null;
+	samplingParamsByThinkingLevel?: Record<string, any> | null;
+	headers?: Record<string, string> | null;
+	compat?: Record<string, any> | null;
 };
+
+/** The keys models.json accepts under a model, as objects written whole. */
+const MODEL_OBJECT_FIELDS = [
+	"thinkingLevelMap",
+	"inputLimits",
+	"promptCache",
+	"samplingParams",
+	"samplingParamsByThinkingLevel",
+	"headers",
+	"compat",
+] as const;
+
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
 /**
  * Read models.json. A missing file is not an error (the manager creates it); an unparseable one is,
@@ -1658,21 +1681,30 @@ function findModelEntry(
  * entry); anything else lands in modelOverrides, which nife applies on top of the provider's
  * catalog (built-in or extension-registered alike).
  */
-function applyModelPatch(root: ModelsRoot, provider: string, id: string, patch: ModelPatch): "models" | "overrides" {
-	const providers = (root.providers ??= {});
-	const source = findModelEntry(root, provider, id);
-	if (source.kind === "models" && source.entry) {
-		const entry = source.entry;
-		if (patch.name !== undefined) entry.name = patch.name;
-		if (patch.reasoning !== undefined) entry.reasoning = patch.reasoning;
-		if (patch.input !== undefined) entry.input = patch.input;
-		if (patch.contextWindow !== undefined) entry.contextWindow = patch.contextWindow;
-		if (patch.maxTokens !== undefined) entry.maxTokens = patch.maxTokens;
-		if (patch.cost !== undefined) {
-			const existing =
-				entry.cost && typeof entry.cost === "object" ? entry.cost : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-			entry.cost = { ...existing, ...patch.cost };
+function writeModelFields(entry: Record<string, any>, patch: ModelPatch, withEndpoint: boolean): void {
+	if (patch.name !== undefined) entry.name = patch.name;
+	if (patch.reasoning !== undefined) entry.reasoning = patch.reasoning;
+	if (patch.input !== undefined) entry.input = patch.input;
+	if (patch.contextWindow !== undefined) entry.contextWindow = patch.contextWindow;
+	if (patch.maxTokens !== undefined) entry.maxTokens = patch.maxTokens;
+	for (const key of MODEL_OBJECT_FIELDS) {
+		const value = patch[key];
+		if (value === undefined) continue;
+		if (value && Object.keys(value).length > 0) entry[key] = value;
+		else delete entry[key];
+	}
+	if (patch.cost !== undefined) {
+		const existing = entry.cost && typeof entry.cost === "object" ? entry.cost : {};
+		const { tiers, ...rates } = patch.cost;
+		// the four base rates are merged so a form that only knows them cannot drop a tier list
+		const cost: Record<string, any> = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, ...existing, ...rates };
+		if (tiers !== undefined) {
+			if (tiers.length > 0) cost.tiers = tiers;
+			else delete cost.tiers;
 		}
+		entry.cost = cost;
+	}
+	if (withEndpoint) {
 		if (patch.baseUrl !== undefined) {
 			if (patch.baseUrl) entry.baseUrl = patch.baseUrl;
 			else delete entry.baseUrl;
@@ -1681,18 +1713,22 @@ function applyModelPatch(root: ModelsRoot, provider: string, id: string, patch: 
 			if (patch.api) entry.api = patch.api;
 			else delete entry.api;
 		}
+	}
+}
+
+function applyModelPatch(root: ModelsRoot, provider: string, id: string, patch: ModelPatch): "models" | "overrides" {
+	const providers = (root.providers ??= {});
+	const source = findModelEntry(root, provider, id);
+	if (source.kind === "models" && source.entry) {
+		writeModelFields(source.entry, patch, true);
 		return "models";
 	}
 	const providerEntry = source.providerEntry ?? (providers[provider] = {});
 	const overrides = (providerEntry.modelOverrides ??= {});
 	const existing = overrides[id] && typeof overrides[id] === "object" ? overrides[id] : undefined;
 	const merged: Record<string, any> = { ...(existing ?? {}) };
-	if (patch.name !== undefined) merged.name = patch.name;
-	if (patch.reasoning !== undefined) merged.reasoning = patch.reasoning;
-	if (patch.input !== undefined) merged.input = patch.input;
-	if (patch.contextWindow !== undefined) merged.contextWindow = patch.contextWindow;
-	if (patch.maxTokens !== undefined) merged.maxTokens = patch.maxTokens;
-	if (patch.cost !== undefined) merged.cost = { ...(existing?.cost ?? {}), ...patch.cost };
+	// a modelOverrides entry has no baseUrl/api of its own - the provider owns those
+	writeModelFields(merged, patch, false);
 	overrides[id] = merged;
 	return "overrides";
 }
@@ -1779,6 +1815,12 @@ function modelRow(root: ModelsRoot | null, b: Bridge, model: AnyModel, current: 
 					: "inherited",
 		available: b.ctx.modelRegistry.hasConfiguredAuth(model),
 		current: current?.provider === model.provider && current?.id === model.id,
+		// the raw entries this row was built from: the form edits these, not its own idea of them
+		entry: entry ? structuredClone(entry) : null,
+		override:
+			stored.kind === "overrides" && stored.entry ? structuredClone(stored.entry) : null,
+		// which optional blocks the entry carries, so a row can say what it configures
+		blocks: entry ? MODEL_OBJECT_FIELDS.filter((key) => entry[key] !== undefined) : [],
 	};
 }
 
@@ -1798,31 +1840,53 @@ async function modelsPayload(b: Bridge, target: Target | null): Promise<Record<s
 				String(left.provider).localeCompare(String(right.provider)) ||
 				String(left.name ?? left.id).localeCompare(String(right.name ?? right.id)),
 		);
-	const providers = new Map<
-		string,
-		{ id: string; defined: boolean; api: string | null; baseUrl: string; hasKey: boolean }
-	>();
+	const providers = new Map<string, Record<string, unknown>>();
 	for (const [id, entry] of Object.entries(root?.providers ?? {})) {
 		if (!entry || typeof entry !== "object") continue;
-		providers.set(id, {
-			id,
-			defined: true,
-			api: typeof entry.api === "string" ? entry.api : null,
-			baseUrl: typeof entry.baseUrl === "string" ? entry.baseUrl : "",
-			hasKey: typeof entry.apiKey === "string" && entry.apiKey.length > 0,
-		});
+		providers.set(id, providerPayload(id, entry as Record<string, any>, models));
 	}
 	for (const model of models) {
 		const id = String(model.provider);
 		if (providers.has(id)) continue;
-		providers.set(id, { id, defined: false, api: null, baseUrl: "", hasKey: false });
+		providers.set(id, {
+			id,
+			defined: false,
+			api: null,
+			baseUrl: "",
+			hasKey: false,
+			models: 0,
+			overrides: 0,
+			entry: null,
+		});
 	}
 	return {
 		models,
-		providers: [...providers.values()].sort((left, right) => left.id.localeCompare(right.id)),
+		providers: [...providers.values()].sort((left, right) =>
+			String(left.id).localeCompare(String(right.id)),
+		),
 		path: modelsJsonPath(),
 		writable: !error,
 		warning: error,
+	};
+}
+
+/** One provider in the manager: the entry itself (without its key), and what hangs off it. */
+function providerPayload(id: string, entry: Record<string, any>, models: Record<string, any>[]): Record<string, unknown> {
+	const { apiKey, models: modelList, modelOverrides, ...rest } = entry;
+	return {
+		id,
+		defined: true,
+		api: typeof entry.api === "string" ? entry.api : null,
+		baseUrl: typeof entry.baseUrl === "string" ? entry.baseUrl : "",
+		hasKey: typeof apiKey === "string" && apiKey.length > 0,
+		models: Array.isArray(modelList) ? modelList.length : 0,
+		overrides:
+			modelOverrides && typeof modelOverrides === "object" && !Array.isArray(modelOverrides)
+				? Object.keys(modelOverrides).length
+				: 0,
+		// the composable fields, so the provider form starts from the file instead of from guesses
+		entry: structuredClone(rest),
+		rows: models.filter((model) => model.provider === id).length,
 	};
 }
 
@@ -1897,9 +1961,106 @@ function readModelPatch(body: Record<string, unknown>): { patch: ModelPatch; err
 			}
 			cost[key] = value;
 		}
+		const rawTiers = (body.cost as Record<string, unknown>).tiers;
+		if (rawTiers !== undefined) {
+			if (!Array.isArray(rawTiers)) return { patch, error: "cost.tiers must be an array" };
+			const tiers: ModelCostTier[] = [];
+			for (const [index, rawTier] of rawTiers.entries()) {
+				if (!rawTier || typeof rawTier !== "object" || Array.isArray(rawTier)) {
+					return { patch, error: `cost.tiers[${index}] must be an object` };
+				}
+				const tier = rawTier as Record<string, unknown>;
+				const above = readTokenCount(tier.inputTokensAbove);
+				if (above === undefined) return { patch, error: `cost.tiers[${index}].inputTokensAbove must be a number, at least 1` };
+				const rates: ModelCostTier = { inputTokensAbove: above, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+				for (const key of ["input", "output", "cacheRead", "cacheWrite"] as const) {
+					const value = typeof tier[key] === "string" && String(tier[key]).trim() ? Number(tier[key]) : (tier[key] ?? 0);
+					if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+						return { patch, error: `cost.tiers[${index}].${key} must be a number, at least 0` };
+					}
+					rates[key] = value;
+				}
+				tiers.push(rates);
+			}
+			cost.tiers = tiers;
+		}
 		if (Object.keys(cost).length > 0) patch.cost = cost;
 	}
+	// thinkingLevelMap is a fixed set of levels, each a string or null (null hides the level)
+	if (body.thinkingLevelMap !== undefined) {
+		const raw = body.thinkingLevelMap;
+		if (raw === null) {
+			patch.thinkingLevelMap = null;
+		} else {
+			if (typeof raw !== "object" || Array.isArray(raw)) return { patch, error: "thinking levels must be an object" };
+			const map: Record<string, string | null> = {};
+			for (const [level, value] of Object.entries(raw as Record<string, unknown>)) {
+				if (!(THINKING_LEVELS as readonly string[]).includes(level)) {
+					return { patch, error: `unknown thinking level "${level}"` };
+				}
+				if (value === null || value === "") {
+					map[level] = null;
+					continue;
+				}
+				if (typeof value !== "string") return { patch, error: `thinking level ${level} must be a string or null` };
+				map[level] = value.trim();
+			}
+			patch.thinkingLevelMap = map;
+		}
+	}
+	if (body.inputLimits !== undefined) {
+		const limits = readObject(body.inputLimits, "input limits");
+		if (limits.error) return { patch, error: limits.error };
+		patch.inputLimits = limits.value;
+	}
+	if (body.promptCache !== undefined) {
+		const cache = readObject(body.promptCache, "prompt cache");
+		if (cache.error) return { patch, error: cache.error };
+		for (const [key, value] of Object.entries(cache.value ?? {})) {
+			if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+				return { patch, error: `prompt cache ${key} must be a positive number` };
+			}
+		}
+		patch.promptCache = cache.value;
+	}
+	if (body.samplingParams !== undefined) {
+		const sampling = readObject(body.samplingParams, "sampling params");
+		if (sampling.error) return { patch, error: sampling.error };
+		patch.samplingParams = sampling.value;
+	}
+	if (body.samplingParamsByThinkingLevel !== undefined) {
+		const sampling = readObject(body.samplingParamsByThinkingLevel, "sampling params per thinking level");
+		if (sampling.error) return { patch, error: sampling.error };
+		for (const level of Object.keys(sampling.value ?? {})) {
+			if (!(THINKING_LEVELS as readonly string[]).includes(level)) {
+				return { patch, error: `unknown thinking level "${level}"` };
+			}
+		}
+		patch.samplingParamsByThinkingLevel = sampling.value;
+	}
+	if (body.headers !== undefined) {
+		const headers = readObject(body.headers, "headers");
+		if (headers.error) return { patch, error: headers.error };
+		for (const [key, value] of Object.entries(headers.value ?? {})) {
+			if (typeof value !== "string") return { patch, error: `header ${key} must be a string` };
+		}
+		patch.headers = headers.value as Record<string, string> | null;
+	}
+	if (body.compat !== undefined) {
+		const compat = readObject(body.compat, "compat");
+		if (compat.error) return { patch, error: compat.error };
+		patch.compat = compat.value;
+	}
 	return { patch };
+}
+
+/** A JSON object sent by the form; null or {} both mean "this key goes away". */
+function readObject(raw: unknown, label: string): { value: Record<string, any> | null; error?: string } {
+	if (raw === null) return { value: null };
+	if (typeof raw !== "object" || Array.isArray(raw)) return { value: null, error: `${label} must be an object` };
+	const entries = Object.entries(raw as Record<string, unknown>).filter(([, value]) => value !== undefined);
+	if (entries.length === 0) return { value: null };
+	return { value: Object.fromEntries(entries) };
 }
 
 /**
@@ -1923,7 +2084,9 @@ function readApi(raw: unknown): { value: string | null; error?: string } {
 	if (typeof raw !== "string") return { value: null, error: "api must be a string" };
 	const api = raw.trim();
 	if (!api) return { value: null };
-	if (!MODEL_APIS.includes(api)) return { value: null, error: `api must be one of ${MODEL_APIS.join(", ")}` };
+	// the four common APIs are offered by the form, but models.json accepts any name
+	if (!/^[\w.-]+$/.test(api)) return { value: null, error: "api must be a name like openai-completions" };
+	if (api.length > 60) return { value: null, error: "api is too long (60 characters max)" };
 	return { value: api };
 }
 
@@ -2872,12 +3035,18 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		const isNewProvider = !providerEntry || typeof providerEntry !== "object";
 		if (isNewProvider) {
 			// A provider nife does not know yet needs its endpoint, exactly like a hand-written entry.
-			const baseUrl = typeof body.baseUrl === "string" ? body.baseUrl.trim() : "";
-			const api = typeof body.api === "string" ? body.api.trim() : "";
-			if (!/^https?:\/\//i.test(baseUrl)) return send(res, 400, "base URL must start with http:// or https://");
-			if (!MODEL_APIS.includes(api)) return send(res, 400, `api must be one of ${MODEL_APIS.join(", ")}`);
+			const parsedUrl = readBaseUrl(body.baseUrl);
+			if (parsedUrl.error) return send(res, 400, parsedUrl.error);
+			if (!parsedUrl.value) return send(res, 400, "base URL is required for a new provider");
+			const parsedApi = readApi(body.api);
+			if (parsedApi.error) return send(res, 400, parsedApi.error);
+			if (!parsedApi.value) return send(res, 400, "api is required for a new provider");
 			const apiKey = typeof body.apiKey === "string" ? body.apiKey.trim() : "";
-			providerEntry = providers[providerId.id] = { name: providerId.id, baseUrl, api };
+			providerEntry = providers[providerId.id] = {
+				name: providerId.id,
+				baseUrl: parsedUrl.value,
+				api: parsedApi.value,
+			};
 			if (apiKey) providerEntry.apiKey = apiKey;
 		}
 		if (!Array.isArray(providerEntry.models)) providerEntry.models = [];
@@ -2934,9 +3103,10 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		return send(res, 200, "ok");
 	}
 
-	// The provider endpoint: baseUrl, api and key are shared by every model of that provider, so they
-	// are edited on the provider entry - a models entry can only add its own baseUrl/api on top, and
-	// even that loses to a provider-level baseUrl (provider-composer: config.baseUrl ?? model.baseUrl).
+	// The provider entry: name, baseUrl, api, key, auth header, oauth, headers and compat are shared by
+	// every model of that provider, so they are edited here - a models entry can only add its own
+	// baseUrl/api on top. Writes are validated by composing the file, so a change that would break the
+	// provider (for example an empty entry) is rolled back with the compose error.
 	if (req.method === "POST" && path === "/api/models/provider") {
 		let body: Record<string, unknown>;
 		try {
@@ -2957,6 +3127,14 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 			);
 		}
 		let changed = false;
+		if (body.name !== undefined) {
+			if (typeof body.name !== "string") return send(res, 400, "name must be a string");
+			const name = body.name.trim();
+			if (name.length > 200) return send(res, 400, "name is too long (200 characters max)");
+			if (name) providerEntry.name = name;
+			else delete providerEntry.name;
+			changed = true;
+		}
 		if (body.baseUrl !== undefined) {
 			const baseUrl = readBaseUrl(body.baseUrl);
 			if (baseUrl.error) return send(res, 400, baseUrl.error);
@@ -2975,6 +3153,36 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 			} else {
 				delete providerEntry.api;
 			}
+			changed = true;
+		}
+		if (body.authHeader !== undefined) {
+			if (typeof body.authHeader !== "boolean") return send(res, 400, "authHeader must be a boolean");
+			if (body.authHeader) providerEntry.authHeader = true;
+			else delete providerEntry.authHeader;
+			changed = true;
+		}
+		if (body.oauth !== undefined) {
+			const oauth = typeof body.oauth === "string" ? body.oauth.trim() : "";
+			if (oauth && oauth !== "radius") return send(res, 400, 'oauth must be "radius" or empty');
+			if (oauth) providerEntry.oauth = oauth;
+			else delete providerEntry.oauth;
+			changed = true;
+		}
+		if (body.headers !== undefined) {
+			const headers = readObject(body.headers, "headers");
+			if (headers.error) return send(res, 400, headers.error);
+			for (const [key, value] of Object.entries(headers.value ?? {})) {
+				if (typeof value !== "string") return send(res, 400, `header ${key} must be a string`);
+			}
+			if (headers.value) providerEntry.headers = headers.value;
+			else delete providerEntry.headers;
+			changed = true;
+		}
+		if (body.compat !== undefined) {
+			const compat = readObject(body.compat, "compat");
+			if (compat.error) return send(res, 400, compat.error);
+			if (compat.value) providerEntry.compat = compat.value;
+			else delete providerEntry.compat;
 			changed = true;
 		}
 		if (body.clearApiKey === true) {

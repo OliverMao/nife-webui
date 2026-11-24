@@ -302,23 +302,27 @@ From the browser:
   input is used in both states
 - model chip in the composer lists available/scoped models with a filter, `setModel` runs in the CLI
   session so the terminal switches too; models without credentials are reported, not switched
-- `Manage models` in the model menu opens the catalog as rows: every composed model - including the
-  ones whose provider has no credentials yet, tagged `no key` - with the current model highlighted,
-  a filter, and per-row edit/delete. `Add model` writes a new row (provider id from the known list,
-  or a brand-new provider with its base URL, API and optional key), edit rewrites a `models` entry
-  in place or a `modelOverrides` entry for anything else, delete removes both and prunes the
-  scaffolding it leaves empty (an empty `models: []` would fail the whole file). Fields are name,
-  reasoning, input (text/image), context window, max output tokens and the four cost rates - pricing
-  tiers are always kept. Two more fields carry the endpoint: `Base URL` and `API` on the model form
-  (written to that `models` entry, empty = inherit - a `modelOverrides` row has no endpoint of its
-  own, so the form points at the provider instead), and the `Provider endpoints` list under the rows
-  edits the shared `baseUrl`/`api`/`apiKey` of any provider defined in models.json (the key is left
-  alone unless typed, `Remove the stored key` clears it; a provider registered by an extension stays
-  read-only). `GET/POST /api/models` plus `/api/models/update`, `/api/models/provider` and
-  `/api/models/delete` write `~/.nife/agent/models.json` atomically, refresh the catalog, and roll
-  the write back with the compose error when the new entry would not load (a pre-existing broken
-  provider in the same file never blocks another row); a models.json that does not parse is
-  read-only (409) and is left untouched
+- `Manage models` in the model menu is the editor for `~/.nife/agent/models.json`. A provider rail
+  on the left (row count, `key`/`ext` badges) filters the catalog on the right; a row shows the name,
+  the `current`/`override`/`no key` state, the limits, the endpoint it resolves to, and how many
+  advanced blocks it sets. `Add model` writes a new row (an existing provider, or a brand-new one
+  with its base URL, API and optional key), the pencil opens the row's form, the bin deletes it
+  (also removing an `modelOverrides` entry and the empty scaffolding, since an empty `models: []`
+  would fail the whole file).
+- Every field models.json accepts is editable: identity and endpoint, capabilities (reasoning,
+  text/image input, context window, max output), pricing (four rates plus the `tiers` table), and an
+  `Advanced` block with `thinkingLevelMap`, image/request limits, `promptCache`, `headers`,
+  `compat`, `samplingParams` and `samplingParamsByThinkingLevel` (the last three as JSON, checked
+  before saving). Editing a provider opens the shared entry: name, `baseUrl`, `api`, `oauth`,
+  `authHeader`, `headers`, `compat` and the key (shown as `stored`, replaced only when typed,
+  `Remove the stored key` clears it). A provider registered by an extension has no entry to edit and
+  stays read-only; a `modelOverrides` row has no endpoint of its own, so its form points at the
+  provider.
+- Writes go through `GET/POST /api/models`, `/api/models/update`, `/api/models/provider` and
+  `/api/models/delete`, which write the file atomically, re-compose the catalog, and roll back with
+  the compose error when the change would not load (a pre-existing broken provider in the same file
+  never blocks another row); a models.json that does not parse is read-only (409) and left untouched.
+  Keys and the fields the form does not touch are preserved.
 - `Compact context` sits in its own divided `Tools` section at the bottom of the model menu (below
   the Reasoning slider, with the current context percentage) and summarizes the context: `POST /api/compact` calls `ctx.compact()` and waits for the
   summarization call to finish, so the row shows `Compacting…` and reports the failure text when

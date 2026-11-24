@@ -316,6 +316,7 @@ const modelManager = ref(null); // { models, providers, path, writable, warning 
 const modelManagerBusy = ref(false);
 const modelManagerError = ref("");
 const modelFilter = ref("");
+const modelProviderFilter = ref(""); // provider selected in the manager's rail
 const modelForm = ref(null); // create/edit view over one row
 const modelFormError = ref("");
 const modelDelete = ref(null); // row waiting for the inline delete confirmation
@@ -2842,22 +2843,43 @@ async function pickModel(model) {
 }
 
 /**
- * The model manager. Rows are the composed catalog (not only the credentialed models), so a row
- * with no key yet stays visible and can be finished or removed. Create/edit/delete write
- * models.json - the shared catalog - and the state reload shows the result in the chip and the
- * menu as well.
+ * The model manager. A row is one composed model (not only the credentialed ones: a row with no
+ * key yet must stay visible so it can be finished or removed). The forms edit the raw models.json
+ * entry behind a row - every field the file accepts is reachable, the rarely used blocks as JSON -
+ * and saving re-composes the catalog, so a write that would break the file is rolled back.
  */
-const modelRows = computed(() => {
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+// the APIs the composer builds chat clients for; models.json takes any name, hence a datalist
+const COMMON_APIS = ["openai-completions", "openai-responses", "anthropic-messages", "google-generative-ai"];
+const COST_RATES = ["input", "output", "cacheRead", "cacheWrite"];
+
+/** Rows after the provider rail and the filter box. */
+const visibleModels = computed(() => {
 	const query = modelFilter.value.trim().toLowerCase();
-	const rows = modelManager.value?.models ?? [];
-	if (!query) return rows;
-	return rows.filter(
-		(row) =>
+	const provider = modelProviderFilter.value;
+	return (modelManager.value?.models ?? []).filter((row) => {
+		if (provider && row.provider !== provider) return false;
+		if (!query) return true;
+		return (
 			row.id.toLowerCase().includes(query) ||
 			String(row.name ?? "").toLowerCase().includes(query) ||
-			row.provider.toLowerCase().includes(query),
-	);
+			row.provider.toLowerCase().includes(query)
+		);
+	});
 });
+
+/** The rail: every provider with the number of rows it owns, busiest first. */
+const modelProviderRows = computed(() => {
+	const counts = new Map();
+	for (const row of modelManager.value?.models ?? []) counts.set(row.provider, (counts.get(row.provider) ?? 0) + 1);
+	return (modelManager.value?.providers ?? [])
+		.map((provider) => ({ ...provider, rows: counts.get(provider.id) ?? 0 }))
+		.sort((left, right) => right.rows - left.rows || left.id.localeCompare(right.id));
+});
+
+const selectedProvider = computed(() =>
+	modelProviderFilter.value ? (modelProviderRows.value.find((row) => row.id === modelProviderFilter.value) ?? null) : null,
+);
 
 /** A new row on a provider nife does not have yet must carry its endpoint. */
 const modelFormNeedsEndpoint = computed(() => {
@@ -2871,17 +2893,404 @@ const modelFormNeedsEndpoint = computed(() => {
 const modelFormEndpoint = computed(() => {
 	const form = modelForm.value;
 	if (!form) return false;
-	if (form.mode === "create") return form.endpoint !== false;
-	return Boolean(form.canEditEndpoint);
+	if (form.mode === "create") return true;
+	return form.mode === "edit" && Boolean(form.canEditEndpoint);
 });
 
-/** Providers whose entry lives in models.json - those are the endpoints this page can rewrite. */
-const modelProviders = computed(() => modelManager.value?.providers ?? []);
+const modelFormBlockCount = computed(() => {
+	const form = modelForm.value;
+	if (!form || form.mode === "provider") return 0;
+	return [
+		form.compatText,
+		form.samplingText,
+		form.samplingLevelText,
+		Object.values(form.levels ?? {}).some(Boolean),
+		Object.values(form.limits ?? {}).some((value) => value !== "" && value !== undefined && value !== null),
+		form.promptCache?.short !== "" || form.promptCache?.long !== "",
+		(form.headers ?? []).length,
+	].filter(Boolean).length;
+});
+
+/** Pretty JSON for a textarea; empty text means "not configured". */
+function jsonText(value) {
+	return value === undefined || value === null ? "" : JSON.stringify(value, null, 2);
+}
+
+function parseJsonObject(text, label) {
+	const trimmed = (text ?? "").trim();
+	if (!trimmed) return { value: null };
+	let value;
+	try {
+		value = JSON.parse(trimmed);
+	} catch (error) {
+		return { error: `${label} is not valid JSON: ${error.message}` };
+	}
+	if (!value || typeof value !== "object" || Array.isArray(value)) return { error: `${label} must be a JSON object` };
+	return { value };
+}
+
+/** A number from a form field; empty means "leave the key out". */
+function readNumber(raw) {
+	const text = typeof raw === "string" ? raw.trim() : raw;
+	if (text === "" || text === undefined || text === null) return undefined;
+	const value = Number(text);
+	return Number.isFinite(value) ? value : undefined;
+}
+
+function headersToRows(headers) {
+	return Object.entries(headers ?? {}).map(([key, value]) => ({ key, value: String(value) }));
+}
+
+function rowsToHeaders(rows) {
+	const headers = {};
+	for (const row of rows ?? []) {
+		const key = String(row.key ?? "").trim();
+		if (!key) continue;
+		headers[key] = String(row.value ?? "");
+	}
+	return headers;
+}
+
+/** The form starts empty and is filled from the raw entry, so nothing the file holds is lost. */
+function emptyModelForm(mode) {
+	return {
+		mode,
+		provider: "",
+		id: "",
+		name: "",
+		reasoning: false,
+		input: ["text"],
+		contextWindow: 128000,
+		maxTokens: 16384,
+		baseUrl: "",
+		api: "",
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		tiers: [],
+		levels: Object.fromEntries(THINKING_LEVELS.map((level) => [level, ""])),
+		limits: {
+			maxRequestBytes: "",
+			maxPerMessage: "",
+			maxPerRequest: "",
+			maxWidth: "",
+			maxHeight: "",
+			maxBytes: "",
+			jpegQuality: "",
+		},
+		promptCache: { short: "", long: "" },
+		headers: [],
+		compatText: "",
+		samplingText: "",
+		samplingLevelText: "",
+		canEditEndpoint: true,
+		endpointSource: "inherited",
+		inheritedEndpoint: "",
+		// provider-only fields
+		apiKey: "",
+		hasKey: false,
+		clearKey: false,
+		oauth: "",
+		authHeader: false,
+	};
+}
+
+function startCreateModel() {
+	const providers = modelManager.value?.providers ?? [];
+	modelDelete.value = null;
+	modelFormError.value = "";
+	const form = emptyModelForm("create");
+	form.provider = (providers.find((provider) => provider.defined) ?? providers[0])?.id ?? "";
+	if (modelProviderFilter.value) form.provider = modelProviderFilter.value;
+	modelForm.value = form;
+}
+
+function startEditModel(row) {
+	modelDelete.value = null;
+	modelFormError.value = "";
+	const entry = (row.source === "models" ? row.entry : row.override) ?? {};
+	const form = emptyModelForm("edit");
+	form.provider = row.provider;
+	form.id = row.id;
+	form.name = entry.name ?? row.name ?? row.id;
+	form.reasoning = entry.reasoning ?? Boolean(row.reasoning);
+	form.input = Array.isArray(entry.input) && entry.input.length ? [...entry.input] : ["text"];
+	form.contextWindow = entry.contextWindow ?? row.contextWindow;
+	form.maxTokens = entry.maxTokens ?? row.maxTokens;
+	form.baseUrl = entry.baseUrl ?? "";
+	form.api = entry.api ?? "";
+	form.cost = { ...row.cost };
+	form.tiers = Array.isArray(entry.cost?.tiers) ? entry.cost.tiers.map((tier) => ({ ...tier })) : [];
+	form.levels = Object.fromEntries(
+		THINKING_LEVELS.map((level) => {
+			const value = entry.thinkingLevelMap?.[level];
+			return [level, value === undefined ? "" : value === null ? "null" : String(value)];
+		}),
+	);
+	const images = entry.inputLimits?.images ?? {};
+	form.limits = {
+		maxRequestBytes: entry.inputLimits?.maxRequestBytes ?? "",
+		maxPerMessage: images.maxPerMessage ?? "",
+		maxPerRequest: images.maxPerRequest ?? "",
+		maxWidth: images.resize?.maxWidth ?? "",
+		maxHeight: images.resize?.maxHeight ?? "",
+		maxBytes: images.resize?.maxBytes ?? "",
+		jpegQuality: images.resize?.jpegQuality ?? "",
+	};
+	form.promptCache = { short: entry.promptCache?.short ?? "", long: entry.promptCache?.long ?? "" };
+	form.headers = headersToRows(entry.headers);
+	form.compatText = jsonText(entry.compat);
+	form.samplingText = jsonText(entry.samplingParams);
+	form.samplingLevelText = jsonText(entry.samplingParamsByThinkingLevel);
+	form.canEditEndpoint = row.source === "models";
+	form.endpointSource = row.endpointSource ?? "inherited";
+	form.inheritedEndpoint = row.endpoint ?? "";
+	modelForm.value = form;
+}
+
+/** The provider form: everything the entry holds except its models and its key's value. */
+function startEditProvider(provider) {
+	const row =
+		typeof provider === "string"
+			? (modelProviderRows.value.find((entry) => entry.id === provider) ?? {
+					id: provider,
+					defined: true,
+					hasKey: false,
+					entry: {},
+				})
+			: provider;
+	const entry = row.entry ?? {};
+	modelDelete.value = null;
+	modelFormError.value = "";
+	const form = emptyModelForm("provider");
+	form.provider = row.id;
+	form.name = entry.name ?? "";
+	form.baseUrl = entry.baseUrl ?? "";
+	form.api = entry.api ?? "";
+	form.oauth = entry.oauth === "radius" ? "radius" : "";
+	form.authHeader = Boolean(entry.authHeader);
+	form.headers = headersToRows(entry.headers);
+	form.compatText = jsonText(entry.compat);
+	form.hasKey = Boolean(row.hasKey);
+	form.defined = row.defined !== false;
+	modelForm.value = form;
+}
+
+function cancelModelForm() {
+	if (modelManagerBusy.value) return;
+	modelForm.value = null;
+	modelFormError.value = "";
+}
+
+/** Token counts and rates from the form, or the error text that stops the save. */
+function readCost(form) {
+	const cost = {};
+	for (const key of COST_RATES) {
+		const value = readNumber(form.cost?.[key]);
+		if (value === undefined) {
+			cost[key] = 0;
+			continue;
+		}
+		if (value < 0) return { error: `Cost ${key} must be a number, at least 0` };
+		cost[key] = value;
+	}
+	const tiers = [];
+	for (const [index, tier] of (form.tiers ?? []).entries()) {
+		const above = readNumber(tier.inputTokensAbove);
+		if (above === undefined || above < 1) {
+			return { error: `Tier ${index + 1}: tokens above must be a number, at least 1` };
+		}
+		const rates = { inputTokensAbove: Math.round(above) };
+		for (const key of COST_RATES) {
+			const value = readNumber(tier[key]) ?? 0;
+			if (value < 0) return { error: `Tier ${index + 1}: ${key} must be a number, at least 0` };
+			rates[key] = value;
+		}
+		tiers.push(rates);
+	}
+	cost.tiers = tiers;
+	return { cost };
+}
+
+/** thinkingLevelMap, input limits and the prompt cache: short numeric objects, empty = not set. */
+function readModelBlocks(form) {
+	const levels = {};
+	for (const level of THINKING_LEVELS) {
+		const raw = String(form.levels?.[level] ?? "").trim();
+		if (!raw) continue;
+		levels[level] = raw === "null" ? null : raw;
+	}
+	const limits = {};
+	const maxRequestBytes = readNumber(form.limits?.maxRequestBytes);
+	if (maxRequestBytes !== undefined) limits.maxRequestBytes = Math.round(maxRequestBytes);
+	const images = {};
+	const maxPerMessage = readNumber(form.limits?.maxPerMessage);
+	if (maxPerMessage !== undefined) images.maxPerMessage = Math.round(maxPerMessage);
+	const maxPerRequest = readNumber(form.limits?.maxPerRequest);
+	if (maxPerRequest !== undefined) images.maxPerRequest = Math.round(maxPerRequest);
+	const resize = {};
+	const maxWidth = readNumber(form.limits?.maxWidth);
+	if (maxWidth !== undefined) resize.maxWidth = Math.round(maxWidth);
+	const maxHeight = readNumber(form.limits?.maxHeight);
+	if (maxHeight !== undefined) resize.maxHeight = Math.round(maxHeight);
+	const maxBytes = readNumber(form.limits?.maxBytes);
+	if (maxBytes !== undefined) resize.maxBytes = Math.round(maxBytes);
+	const jpegQuality = readNumber(form.limits?.jpegQuality);
+	if (jpegQuality !== undefined) resize.jpegQuality = Math.round(jpegQuality);
+	if (Object.keys(resize).length > 0) images.resize = resize;
+	if (Object.keys(images).length > 0) limits.images = images;
+	const promptCache = {};
+	const short = readNumber(form.promptCache?.short);
+	if (short !== undefined) promptCache.short = short;
+	const long = readNumber(form.promptCache?.long);
+	if (long !== undefined) promptCache.long = long;
+	return { levels, limits, promptCache };
+}
+
+async function saveModelForm() {
+	const form = modelForm.value;
+	if (!form || modelManagerBusy.value) return;
+	modelFormError.value = "";
+	if (form.mode === "provider") return saveProviderForm(form);
+	if (form.mode === "create") {
+		if (!String(form.provider ?? "").trim()) {
+			modelFormError.value = "Provider is required";
+			return;
+		}
+		if (!String(form.id ?? "").trim()) {
+			modelFormError.value = "Model id is required";
+			return;
+		}
+	}
+	const contextWindow = readNumber(form.contextWindow);
+	if (contextWindow === undefined || contextWindow < 1) {
+		modelFormError.value = "Context window must be a number, at least 1";
+		return;
+	}
+	const maxTokens = readNumber(form.maxTokens);
+	if (maxTokens === undefined || maxTokens < 1) {
+		modelFormError.value = "Max output tokens must be a number, at least 1";
+		return;
+	}
+	const { cost, error: costError } = readCost(form);
+	if (costError) {
+		modelFormError.value = costError;
+		return;
+	}
+	const compat = parseJsonObject(form.compatText, "Compat");
+	if (compat.error) {
+		modelFormError.value = compat.error;
+		return;
+	}
+	const sampling = parseJsonObject(form.samplingText, "Sampling params");
+	if (sampling.error) {
+		modelFormError.value = sampling.error;
+		return;
+	}
+	const samplingLevel = parseJsonObject(form.samplingLevelText, "Sampling per thinking level");
+	if (samplingLevel.error) {
+		modelFormError.value = samplingLevel.error;
+		return;
+	}
+	for (const level of Object.keys(samplingLevel.value ?? {})) {
+		if (!THINKING_LEVELS.includes(level)) {
+			modelFormError.value = `Unknown thinking level "${level}" in sampling per thinking level`;
+			return;
+		}
+	}
+	const fixed = readModelBlocks(form);
+	modelManagerBusy.value = true;
+	const fields = {
+		name: form.name,
+		reasoning: form.reasoning,
+		input: form.input,
+		contextWindow: Math.round(contextWindow),
+		maxTokens: Math.round(maxTokens),
+		cost,
+		thinkingLevelMap: fixed.levels,
+		inputLimits: fixed.limits,
+		promptCache: fixed.promptCache,
+		headers: rowsToHeaders(form.headers),
+		compat: compat.value,
+		samplingParams: sampling.value,
+		samplingParamsByThinkingLevel: samplingLevel.value,
+		...(modelFormEndpoint.value ? { baseUrl: form.baseUrl, api: form.api } : {}),
+	};
+	const result =
+		form.mode === "create"
+			? await postDetailed("models", {
+					provider: form.provider,
+					id: form.id,
+					...fields,
+					...(modelFormNeedsEndpoint.value ? { apiKey: form.apiKey } : {}),
+				})
+			: await postDetailed("models/update", { provider: form.provider, id: form.id, ...fields });
+	modelManagerBusy.value = false;
+	if (!result.ok) {
+		modelFormError.value = result.message || "could not save the model";
+		return;
+	}
+	modelForm.value = null;
+	await loadModelManager();
+	await loadState();
+	showNotice(form.mode === "create" ? "Model added" : "Model saved");
+}
+
+async function saveProviderForm(form) {
+	const compat = parseJsonObject(form.compatText, "Compat");
+	if (compat.error) {
+		modelFormError.value = compat.error;
+		return;
+	}
+	modelManagerBusy.value = true;
+	const result = await postDetailed("models/provider", {
+		provider: form.provider,
+		name: form.name,
+		baseUrl: form.baseUrl,
+		api: form.api,
+		oauth: form.oauth,
+		authHeader: form.authHeader,
+		headers: rowsToHeaders(form.headers),
+		compat: compat.value,
+		...(form.apiKey.trim() ? { apiKey: form.apiKey } : {}),
+		...(form.clearKey ? { clearApiKey: true } : {}),
+	});
+	modelManagerBusy.value = false;
+	if (!result.ok) {
+		modelFormError.value = result.message || "could not save the provider";
+		return;
+	}
+	modelForm.value = null;
+	await loadModelManager();
+	await loadState();
+	showNotice("Provider saved");
+}
+
+function askDeleteModel(row) {
+	modelForm.value = null;
+	modelManagerError.value = "";
+	modelDelete.value = { provider: row.provider, id: row.id, name: row.name ?? row.id };
+}
+
+async function confirmDeleteModel() {
+	const row = modelDelete.value;
+	if (!row || modelManagerBusy.value) return;
+	modelManagerBusy.value = true;
+	const result = await postDetailed("models/delete", { provider: row.provider, id: row.id });
+	modelManagerBusy.value = false;
+	modelDelete.value = null;
+	if (!result.ok) {
+		modelManagerError.value = result.message || "could not delete the model";
+		return;
+	}
+	await loadModelManager();
+	await loadState();
+	showNotice("Model deleted");
+}
 
 async function openModelManager() {
 	menu.value = null;
 	modelManagerError.value = "";
 	modelFilter.value = "";
+	modelProviderFilter.value = "";
 	const response = await fetch(api("models"));
 	if (!response.ok) {
 		showNotice((await response.text()).slice(0, 200) || "could not load models");
@@ -2913,147 +3322,9 @@ function closeModelManager() {
 	modelForm.value = null;
 	modelDelete.value = null;
 	modelFilter.value = "";
+	modelProviderFilter.value = "";
 	modelManagerError.value = "";
 	modelFormError.value = "";
-}
-
-function startCreateModel() {
-	const providers = modelManager.value?.providers ?? [];
-	modelDelete.value = null;
-	modelFormError.value = "";
-	modelForm.value = {
-		mode: "create",
-		provider: (providers.find((provider) => provider.defined) ?? providers[0])?.id ?? "",
-		id: "",
-		name: "",
-		reasoning: false,
-		input: ["text"],
-		contextWindow: 128000,
-		maxTokens: 16384,
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		baseUrl: "",
-		api: "openai-completions",
-		apiKey: "",
-		endpointSource: "inherited",
-		inheritedEndpoint: "",
-	};
-}
-
-function startEditModel(row) {
-	modelDelete.value = null;
-	modelFormError.value = "";
-	modelForm.value = {
-		mode: "edit",
-		provider: row.provider,
-		id: row.id,
-		name: row.name ?? row.id,
-		reasoning: Boolean(row.reasoning),
-		input: [...(row.input ?? ["text"])],
-		contextWindow: row.contextWindow,
-		maxTokens: row.maxTokens,
-		cost: { ...row.cost },
-		baseUrl: row.baseUrl ?? "",
-		api: row.api ?? "",
-		canEditEndpoint: row.source === "models",
-		endpointSource: row.endpointSource ?? "inherited",
-		inheritedEndpoint: row.endpoint ?? "",
-	};
-}
-
-/** The provider endpoint form: shared by every model of that provider, so it is edited once. */
-function startEditProvider(provider) {
-	const row =
-		typeof provider === "string"
-			? (modelProviders.value.find((entry) => entry.id === provider) ?? {
-					id: provider,
-					defined: true,
-					baseUrl: "",
-					api: null,
-					hasKey: false,
-				})
-			: provider;
-	modelDelete.value = null;
-	modelFormError.value = "";
-	modelForm.value = {
-		mode: "provider",
-		provider: row.id,
-		baseUrl: row.baseUrl ?? "",
-		api: row.api ?? "",
-		apiKey: "",
-		hasKey: Boolean(row.hasKey),
-		clearKey: false,
-	};
-}
-
-function cancelModelForm() {
-	if (modelManagerBusy.value) return;
-	modelForm.value = null;
-	modelFormError.value = "";
-}
-
-async function saveModelForm() {
-	const form = modelForm.value;
-	if (!form || modelManagerBusy.value) return;
-	modelManagerBusy.value = true;
-	modelFormError.value = "";
-	const endpoint = modelFormEndpoint.value ? { baseUrl: form.baseUrl, api: form.api } : {};
-	const fields = {
-		name: form.name,
-		reasoning: form.reasoning,
-		input: form.input,
-		contextWindow: form.contextWindow,
-		maxTokens: form.maxTokens,
-		cost: form.cost,
-		...endpoint,
-	};
-	const result =
-		form.mode === "provider"
-			? await postDetailed("models/provider", {
-					provider: form.provider,
-					baseUrl: form.baseUrl,
-					api: form.api,
-					...(form.apiKey.trim() ? { apiKey: form.apiKey } : {}),
-					...(form.clearKey ? { clearApiKey: true } : {}),
-				})
-			: form.mode === "create"
-				? await postDetailed("models", {
-						provider: form.provider,
-						id: form.id,
-						...fields,
-						...(modelFormNeedsEndpoint.value ? { apiKey: form.apiKey } : {}),
-					})
-				: await postDetailed("models/update", { provider: form.provider, id: form.id, ...fields });
-	modelManagerBusy.value = false;
-	if (!result.ok) {
-		modelFormError.value = result.message || "could not save the model";
-		return;
-	}
-	modelForm.value = null;
-	await loadModelManager();
-	await loadState();
-	showNotice(form.mode === "provider" ? "Endpoint saved" : form.mode === "create" ? "Model added" : "Model saved");
-}
-
-function askDeleteModel(row) {
-	modelForm.value = null;
-	modelManagerError.value = "";
-	modelDelete.value = { provider: row.provider, id: row.id, name: row.name ?? row.id };
-}
-
-async function confirmDeleteModel() {
-	const row = modelDelete.value;
-	if (!row || modelManagerBusy.value) return;
-	modelManagerBusy.value = true;
-	const result = await postDetailed("models/delete", { provider: row.provider, id: row.id });
-	modelManagerBusy.value = false;
-	modelDelete.value = null;
-	if (!result.ok) {
-		modelManagerError.value = result.message || "could not delete the model";
-		return;
-	}
-	await loadModelManager();
-	await loadState();
-	showNotice("Model deleted");
 }
 
 async function onThinkingChange(index) {
@@ -4418,250 +4689,410 @@ onBeforeUnmount(() => {
 			</div>
 		</div>
 
-	<!-- The model manager: rows are the catalog; create, edit and delete write models.json. -->
+	<!-- The model manager: providers on the left, the catalog on the right, forms over models.json. -->
 	<div v-if="modelManager" class="modal" @click.self="closeModelManager">
-		<div class="modal-card model-manager-card" role="dialog" aria-modal="true" aria-labelledby="model-manager-title">
-			<div class="model-manager-head">
-				<h2 id="model-manager-title">Models</h2>
-				<button v-if="!modelForm" type="button" class="model-manager-add" :disabled="modelManagerBusy" @click="startCreateModel">
-					<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3.5v9M3.5 8h9" /></svg>
-					<span>Add model</span>
-				</button>
-			</div>
-			<p class="model-manager-path">{{ modelManager.path }}</p>
-
-			<!-- provider endpoint: one baseUrl/api/key for every model of that provider -->
-			<template v-if="modelForm && modelForm.mode === 'provider'">
-				<div class="model-form">
-					<div class="model-edit-grid">
-						<p class="model-edit-identity">{{ modelForm.provider }} · provider endpoint</p>
-						<label class="model-edit-field model-edit-span">
-							<span>Base URL <span class="muted">used by every model without its own</span></span>
-							<input v-model.trim="modelForm.baseUrl" type="text" spellcheck="false" placeholder="https://host/v1" />
-						</label>
-						<label class="model-edit-field">
-							<span>API</span>
-							<select v-model="modelForm.api">
-								<option value="">inherit</option>
-								<option value="openai-completions">openai-completions</option>
-								<option value="openai-responses">openai-responses</option>
-								<option value="anthropic-messages">anthropic-messages</option>
-								<option value="google-generative-ai">google-generative-ai</option>
-							</select>
-						</label>
-						<label class="model-edit-field model-edit-span">
-							<span>API key <span class="muted">optional — literal, $ENV_VAR or !command</span></span>
-							<input
-								v-model="modelForm.apiKey"
-								type="password"
-								autocomplete="off"
-								spellcheck="false"
-								:placeholder="modelForm.hasKey ? 'keep the stored key' : 'sk-…'"
-							/>
-						</label>
-						<label v-if="modelForm.hasKey" class="model-edit-check model-edit-span">
-							<input type="checkbox" v-model="modelForm.clearKey" />
-							<span>Remove the stored key</span>
-						</label>
-					</div>
+		<div class="modal-card mm-card" role="dialog" aria-modal="true" aria-labelledby="mm-title">
+			<header class="mm-head">
+				<div class="mm-head-text">
+					<h2 id="mm-title">Models</h2>
+					<p class="mm-path ellipsis" :title="modelManager.path">{{ modelManager.path }}</p>
 				</div>
-				<p v-if="modelFormError" class="model-edit-error" role="alert">{{ modelFormError }}</p>
-				<div class="modal-actions">
-					<button type="button" class="ghost" :disabled="modelManagerBusy" @click="cancelModelForm">Cancel</button>
-					<button type="button" class="primary" :disabled="modelManagerBusy || !modelManager.writable" @click="saveModelForm">
-						{{ modelManagerBusy ? "Saving…" : "Save endpoint" }}
+				<div class="mm-head-actions">
+					<button type="button" class="mm-add" :disabled="modelManagerBusy || Boolean(modelForm)" @click="startCreateModel">
+						<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3.5v9M3.5 8h9" /></svg>
+						<span>Add model</span>
+					</button>
+					<button type="button" class="mm-x" title="Close" @click="closeModelManager">
+						<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4.4 4.4l7.2 7.2M11.6 4.4l-7.2 7.2" /></svg>
 					</button>
 				</div>
-			</template>
+			</header>
+			<p v-if="modelManager.warning" class="mm-error" role="alert">{{ modelManager.warning }}</p>
 
-			<!-- create/edit: one row's fields, and the endpoint when the row can carry one -->
-			<template v-else-if="modelForm">
-				<div class="model-form">
-				<div class="model-edit-grid">
-					<template v-if="modelForm.mode === 'create'">
-						<label class="model-edit-field">
-							<span>Provider</span>
-							<input v-model.trim="modelForm.provider" type="text" list="model-provider-ids" spellcheck="false" placeholder="provider id" />
-							<datalist id="model-provider-ids">
-								<option v-for="provider in modelManager.providers" :key="provider.id" :value="provider.id" />
-							</datalist>
-						</label>
-						<label class="model-edit-field">
-							<span>Model id</span>
-							<input v-model.trim="modelForm.id" type="text" maxlength="200" spellcheck="false" placeholder="id sent to the API" />
-						</label>
-					</template>
-					<template v-else>
-						<p class="model-edit-identity">{{ modelForm.provider }} · {{ modelForm.id }}</p>
-					</template>
-					<label class="model-edit-field model-edit-span">
-						<span>Name</span>
-						<input v-model="modelForm.name" type="text" maxlength="200" spellcheck="false" :placeholder="modelForm.id || 'display name'" />
-					</label>
-					<div class="model-edit-row">
-						<label class="model-edit-check">
-							<input type="checkbox" v-model="modelForm.reasoning" />
-							<span>Reasoning</span>
-						</label>
-						<div class="model-edit-inputs">
-							<span class="muted model-edit-label">Input</span>
-							<label class="model-edit-check" title="Text input is required">
-								<input type="checkbox" :value="'text'" v-model="modelForm.input" disabled />
-								<span>text</span>
-							</label>
-							<label class="model-edit-check">
-								<input type="checkbox" :value="'image'" v-model="modelForm.input" />
-								<span>image</span>
-							</label>
-						</div>
-					</div>
-					<label class="model-edit-field">
-						<span>Context window</span>
-						<input v-model.number="modelForm.contextWindow" type="number" min="1" step="1" />
-					</label>
-					<label class="model-edit-field">
-						<span>Max output tokens</span>
-						<input v-model.number="modelForm.maxTokens" type="number" min="1" step="1" />
-					</label>
-					<template v-if="modelFormEndpoint">
-						<label class="model-edit-field model-edit-span">
-							<span>
-								Base URL
-								<span class="muted">· empty inherits the provider</span>
-							</span>
-							<input
-								v-model.trim="modelForm.baseUrl"
-								type="text"
-								spellcheck="false"
-								:placeholder="modelForm.inheritedEndpoint || 'https://host/v1'"
-							/>
-						</label>
-						<label class="model-edit-field">
-							<span>API</span>
-							<select v-model="modelForm.api">
-								<option value="">inherit</option>
-								<option value="openai-completions">openai-completions</option>
-								<option value="openai-responses">openai-responses</option>
-								<option value="anthropic-messages">anthropic-messages</option>
-								<option value="google-generative-ai">google-generative-ai</option>
-							</select>
-						</label>
-					</template>
-					<p v-else-if="modelForm.mode === 'edit'" class="muted model-edit-note model-edit-span">
-						Its endpoint comes from provider
-						<button type="button" class="linkbtn" @click="startEditProvider(modelForm.provider)">
-							{{ modelForm.provider }}
+			<!-- one form at a time: a model, a new model, or a provider -->
+			<template v-if="modelForm">
+				<div class="mm-editor">
+					<div class="mm-editor-head">
+						<button type="button" class="mm-back" :disabled="modelManagerBusy" @click="cancelModelForm">
+							<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M9.8 3.8l-4.2 4.2 4.2 4.2" /></svg>
+							<span>Back</span>
 						</button>
-						— edit the provider endpoint instead.
-					</p>
-					<div class="model-edit-cost">
-						<p class="muted model-edit-label">Cost per 1M tokens</p>
-						<div class="model-edit-cost-grid">
-							<label class="model-edit-field"><span>Input</span><input v-model.number="modelForm.cost.input" type="number" min="0" step="any" /></label>
-							<label class="model-edit-field"><span>Output</span><input v-model.number="modelForm.cost.output" type="number" min="0" step="any" /></label>
-							<label class="model-edit-field"><span>Cache read</span><input v-model.number="modelForm.cost.cacheRead" type="number" min="0" step="any" /></label>
-							<label class="model-edit-field"><span>Cache write</span><input v-model.number="modelForm.cost.cacheWrite" type="number" min="0" step="any" /></label>
-						</div>
+						<h3 class="mm-editor-title ellipsis">
+							{{
+								modelForm.mode === "create"
+									? "New model"
+									: modelForm.mode === "provider"
+										? modelForm.provider
+										: modelForm.name || modelForm.id
+							}}
+						</h3>
+						<span class="mm-chip">{{ modelForm.mode === "provider" ? "provider" : modelForm.provider }}</span>
 					</div>
-					<label v-if="modelFormNeedsEndpoint" class="model-edit-field model-edit-span">
-						<span>API key <span class="muted">optional — literal, $ENV_VAR or !command</span></span>
-						<input v-model="modelForm.apiKey" type="text" spellcheck="false" placeholder="sk-…" />
-					</label>
-				</div>
-				</div>
-				<p v-if="modelFormError" class="model-edit-error" role="alert">{{ modelFormError }}</p>
-				<div class="modal-actions">
-					<button type="button" class="ghost" :disabled="modelManagerBusy" @click="cancelModelForm">Cancel</button>
-					<button type="button" class="primary" :disabled="modelManagerBusy || !modelManager.writable" @click="saveModelForm">
-						{{ modelManagerBusy ? "Saving…" : modelForm.mode === "create" ? "Add model" : "Save" }}
-					</button>
-				</div>
-			</template>
 
-			<!-- the rows: this is the manager -->
-			<template v-else>
-				<input
-					v-if="modelManager.models.length > 8"
-					v-model="modelFilter"
-					class="menu-search model-manager-filter"
-					placeholder="Filter models"
-				/>
-				<p v-if="modelManagerError" class="model-edit-error" role="alert">{{ modelManagerError }}</p>
-				<p v-else-if="modelManager.warning" class="model-edit-error" role="alert">{{ modelManager.warning }}</p>
-				<div class="model-rows">
-					<div
-						v-for="row in modelRows"
-						:key="`${row.provider}/${row.id}`"
-						class="model-row"
-						:class="{ current: row.current, confirming: modelDelete && modelDelete.provider === row.provider && modelDelete.id === row.id }"
-					>
-						<template v-if="modelDelete && modelDelete.provider === row.provider && modelDelete.id === row.id">
-							<span class="model-row-name ellipsis">Delete “{{ modelDelete.name }}”?</span>
-							<span class="model-row-actions">
-								<button type="button" class="ghost" :disabled="modelManagerBusy" @click="modelDelete = null">Cancel</button>
-								<button type="button" class="danger" :disabled="modelManagerBusy" @click="confirmDeleteModel">
-									{{ modelManagerBusy ? "Deleting…" : "Delete" }}
-								</button>
-							</span>
+					<div class="mm-editor-body">
+						<!-- provider: everything the entry holds except its models and the key's value -->
+						<template v-if="modelForm.mode === 'provider'">
+							<section class="mm-section">
+								<div class="mm-section-head"><h4>Endpoint</h4></div>
+								<div class="mm-grid">
+									<label class="mm-field">
+										<span>Id</span>
+										<input :value="modelForm.provider" disabled />
+									</label>
+									<label class="mm-field">
+										<span>Name</span>
+										<input v-model="modelForm.name" maxlength="200" placeholder="display name" />
+									</label>
+									<label class="mm-field mm-span-2">
+										<span>Base URL <em>shared by every model without its own</em></span>
+										<input v-model.trim="modelForm.baseUrl" spellcheck="false" placeholder="https://host/v1" />
+									</label>
+									<label class="mm-field">
+										<span>API</span>
+										<input v-model.trim="modelForm.api" list="mm-apis" spellcheck="false" placeholder="openai-completions" />
+									</label>
+									<label class="mm-field">
+										<span>Auth header <em>send the key as Authorization</em></span>
+										<span class="mm-switch"><input type="checkbox" v-model="modelForm.authHeader" /></span>
+									</label>
+									<label class="mm-field mm-span-2">
+										<span>API key <em>literal, $ENV_VAR or !command</em></span>
+										<input
+											v-model="modelForm.apiKey"
+											type="password"
+											autocomplete="off"
+											spellcheck="false"
+											:placeholder="modelForm.hasKey ? 'stored — type to replace' : 'none stored'"
+										/>
+									</label>
+									<label v-if="modelForm.hasKey" class="mm-check mm-span-2">
+										<input type="checkbox" v-model="modelForm.clearKey" />
+										<span>Remove the stored key</span>
+									</label>
+								</div>
+							</section>
+							<section class="mm-section">
+								<div class="mm-section-head"><h4>Advanced</h4></div>
+								<p class="mm-label">Headers</p>
+								<div class="mm-kv">
+									<div v-for="(header, index) in modelForm.headers" :key="index" class="mm-kv-row">
+										<input v-model="header.key" placeholder="x-header" spellcheck="false" />
+										<input v-model="header.value" placeholder="value" spellcheck="false" />
+										<button type="button" class="mm-kv-remove" title="Remove" @click="modelForm.headers.splice(index, 1)">×</button>
+									</div>
+									<button type="button" class="mm-add-row" @click="modelForm.headers.push({ key: '', value: '' })">+ header</button>
+								</div>
+								<label class="mm-field mm-span-2 mm-textarea">
+									<span>Compat <em>JSON</em></span>
+									<textarea v-model="modelForm.compatText" rows="5" spellcheck="false" placeholder="{ &quot;supportsStore&quot;: true }"></textarea>
+								</label>
+							</section>
 						</template>
+
+						<!-- model: identity, endpoint, capabilities, pricing, then the long tail -->
 						<template v-else>
-							<button type="button" class="model-row-main" @click="startEditModel(row)">
-								<span class="model-row-name ellipsis">{{ row.name || row.id }}</span>
-								<span class="model-row-meta">{{ row.provider }}</span>
-								<span class="model-row-meta model-row-limits">{{ compact(row.contextWindow) }} ctx · {{ compact(row.maxTokens) }} out</span>
-								<span v-if="row.source === 'overrides'" class="model-row-tag" title="Stored as a modelOverrides entry">override</span>
-								<span v-if="!row.available" class="model-row-tag muted-tag" title="No credentials for this provider yet">no key</span>
-								<span v-if="row.current" class="model-row-tag current-tag">current</span>
-							</button>
-							<span class="model-row-actions">
-								<button type="button" class="iconbtn" title="Edit this model" @click="startEditModel(row)">
-									<svg viewBox="0 0 16 16" aria-hidden="true">
-										<path d="M11.2 2.3l2.5 2.5-8 8-3.4.9.9-3.4 8-8z" />
-										<path d="M9.6 4l2.4 2.4" />
-									</svg>
+							<section class="mm-section">
+								<div class="mm-section-head"><h4>Identity</h4></div>
+								<div class="mm-grid">
+									<label class="mm-field">
+										<span>Provider</span>
+										<input
+											v-model.trim="modelForm.provider"
+											list="mm-providers"
+											spellcheck="false"
+											:disabled="modelForm.mode === 'edit'"
+											placeholder="provider id"
+										/>
+									</label>
+									<label class="mm-field">
+										<span>Model id</span>
+										<input
+											v-model.trim="modelForm.id"
+											maxlength="200"
+											spellcheck="false"
+											:disabled="modelForm.mode === 'edit'"
+											placeholder="id sent to the API"
+										/>
+									</label>
+									<label class="mm-field mm-span-2">
+										<span>Name</span>
+										<input v-model="modelForm.name" maxlength="200" :placeholder="modelForm.id || 'display name'" />
+									</label>
+								</div>
+							</section>
+
+							<section v-if="modelFormEndpoint" class="mm-section">
+								<div class="mm-section-head"><h4>Endpoint</h4><span class="mm-hint">empty inherits the provider</span></div>
+								<div class="mm-grid">
+									<label class="mm-field mm-span-2">
+										<span>Base URL</span>
+										<input
+											v-model.trim="modelForm.baseUrl"
+											spellcheck="false"
+											:placeholder="modelForm.inheritedEndpoint || 'https://host/v1'"
+										/>
+									</label>
+									<label class="mm-field">
+										<span>API</span>
+										<input v-model.trim="modelForm.api" list="mm-apis" spellcheck="false" placeholder="inherit" />
+									</label>
+									<label v-if="modelFormNeedsEndpoint" class="mm-field">
+										<span>API key <em>stored on the new provider</em></span>
+										<input v-model="modelForm.apiKey" spellcheck="false" placeholder="sk-… or $ENV_VAR" />
+									</label>
+								</div>
+							</section>
+							<p v-else-if="modelForm.mode === 'edit'" class="mm-note">
+								A <code>modelOverrides</code> row has no endpoint of its own — it uses the one from its provider.
+								<button type="button" class="mm-link" @click="startEditProvider(modelForm.provider)">
+									Edit {{ modelForm.provider }}
 								</button>
+							</p>
+
+							<section class="mm-section">
+								<div class="mm-section-head"><h4>Capabilities</h4></div>
+								<div class="mm-grid">
+									<label class="mm-field">
+										<span>Context window</span>
+										<input v-model="modelForm.contextWindow" type="number" min="1" step="1" />
+									</label>
+									<label class="mm-field">
+										<span>Max output tokens</span>
+										<input v-model="modelForm.maxTokens" type="number" min="1" step="1" />
+									</label>
+									<label class="mm-check">
+										<input type="checkbox" v-model="modelForm.reasoning" />
+										<span>Reasoning model</span>
+									</label>
+									<div class="mm-checks">
+										<span class="mm-label">Input</span>
+										<label class="mm-check"><input type="checkbox" checked disabled /><span>text</span></label>
+										<label class="mm-check"><input type="checkbox" value="image" v-model="modelForm.input" /><span>image</span></label>
+									</div>
+								</div>
+							</section>
+
+							<section class="mm-section">
+								<div class="mm-section-head"><h4>Pricing</h4><span class="mm-hint">per 1M tokens</span></div>
+								<div class="mm-grid mm-grid-4">
+									<label class="mm-field"><span>Input</span><input v-model="modelForm.cost.input" type="number" min="0" step="any" /></label>
+									<label class="mm-field"><span>Output</span><input v-model="modelForm.cost.output" type="number" min="0" step="any" /></label>
+									<label class="mm-field"><span>Cache read</span><input v-model="modelForm.cost.cacheRead" type="number" min="0" step="any" /></label>
+									<label class="mm-field"><span>Cache write</span><input v-model="modelForm.cost.cacheWrite" type="number" min="0" step="any" /></label>
+								</div>
+								<div v-if="modelForm.tiers.length > 0" class="mm-tiers">
+									<div class="mm-tier mm-tier-head">
+										<span>Above tokens</span><span>Input</span><span>Output</span><span>Cache read</span><span>Cache write</span><span></span>
+									</div>
+									<div v-for="(tier, index) in modelForm.tiers" :key="index" class="mm-tier">
+										<input v-model="tier.inputTokensAbove" type="number" min="1" step="1" />
+										<input v-model="tier.input" type="number" min="0" step="any" />
+										<input v-model="tier.output" type="number" min="0" step="any" />
+										<input v-model="tier.cacheRead" type="number" min="0" step="any" />
+										<input v-model="tier.cacheWrite" type="number" min="0" step="any" />
+										<button type="button" class="mm-kv-remove" title="Remove tier" @click="modelForm.tiers.splice(index, 1)">×</button>
+									</div>
+								</div>
 								<button
 									type="button"
-									class="iconbtn"
-									:disabled="row.source === 'none'"
-									:title="row.source === 'none' ? 'Nothing in models.json to delete' : 'Delete this model'"
-									@click="askDeleteModel(row)"
+									class="mm-add-row"
+									@click="modelForm.tiers.push({ inputTokensAbove: 200000, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 })"
 								>
-									<svg viewBox="0 0 16 16" aria-hidden="true">
-										<path d="M3.5 4.5h9M6.5 4.5V3h3v1.5M5 4.5l.5 8h5l.5-8" />
-									</svg>
+									+ pricing tier
 								</button>
-							</span>
+							</section>
+
+							<section class="mm-section">
+								<details class="mm-advanced" :open="modelFormBlockCount > 0">
+									<summary>
+										<h4>Advanced</h4>
+										<span class="mm-hint">{{ modelFormBlockCount }} configured</span>
+									</summary>
+									<div class="mm-adv-body">
+										<p class="mm-label">Thinking levels <em>a value to advertise, <code>null</code> to hide</em></p>
+										<div class="mm-grid mm-grid-7">
+											<label v-for="level in THINKING_LEVELS" :key="level" class="mm-field mm-field-tiny">
+												<span>{{ level }}</span>
+												<input v-model="modelForm.levels[level]" spellcheck="false" placeholder="—" />
+											</label>
+										</div>
+										<p class="mm-label">Input limits</p>
+										<div class="mm-grid mm-grid-4">
+											<label class="mm-field"><span>Request bytes</span><input v-model="modelForm.limits.maxRequestBytes" type="number" min="1" step="1" /></label>
+											<label class="mm-field"><span>Images / message</span><input v-model="modelForm.limits.maxPerMessage" type="number" min="1" step="1" /></label>
+											<label class="mm-field"><span>Images / request</span><input v-model="modelForm.limits.maxPerRequest" type="number" min="1" step="1" /></label>
+											<label class="mm-field"><span>Resize width</span><input v-model="modelForm.limits.maxWidth" type="number" min="1" step="1" /></label>
+											<label class="mm-field"><span>Resize height</span><input v-model="modelForm.limits.maxHeight" type="number" min="1" step="1" /></label>
+											<label class="mm-field"><span>Resize bytes</span><input v-model="modelForm.limits.maxBytes" type="number" min="1" step="1" /></label>
+											<label class="mm-field"><span>JPEG quality</span><input v-model="modelForm.limits.jpegQuality" type="number" min="1" max="100" step="1" /></label>
+										</div>
+										<p class="mm-label">Prompt cache</p>
+										<div class="mm-grid mm-grid-4">
+											<label class="mm-field"><span>Short (minutes)</span><input v-model="modelForm.promptCache.short" type="number" min="1" step="any" /></label>
+											<label class="mm-field"><span>Long (minutes)</span><input v-model="modelForm.promptCache.long" type="number" min="1" step="any" /></label>
+										</div>
+										<p class="mm-label">Headers</p>
+										<div class="mm-kv">
+											<div v-for="(header, index) in modelForm.headers" :key="index" class="mm-kv-row">
+												<input v-model="header.key" placeholder="x-header" spellcheck="false" />
+												<input v-model="header.value" placeholder="value" spellcheck="false" />
+												<button type="button" class="mm-kv-remove" title="Remove" @click="modelForm.headers.splice(index, 1)">×</button>
+											</div>
+											<button type="button" class="mm-add-row" @click="modelForm.headers.push({ key: '', value: '' })">+ header</button>
+										</div>
+										<label class="mm-field mm-textarea">
+											<span>Compat <em>JSON</em></span>
+											<textarea v-model="modelForm.compatText" rows="5" spellcheck="false" placeholder="{ &quot;supportsStore&quot;: true }"></textarea>
+										</label>
+										<label class="mm-field mm-textarea">
+											<span>Sampling params <em>JSON</em></span>
+											<textarea v-model="modelForm.samplingText" rows="4" spellcheck="false" placeholder="{ &quot;temperature&quot;: 0.7 }"></textarea>
+										</label>
+										<label class="mm-field mm-textarea">
+											<span>Sampling per thinking level <em>JSON, keyed by level</em></span>
+											<textarea v-model="modelForm.samplingLevelText" rows="4" spellcheck="false" placeholder="{ &quot;high&quot;: { &quot;temperature&quot;: 1 } }"></textarea>
+										</label>
+									</div>
+								</details>
+							</section>
 						</template>
 					</div>
-					<p v-if="modelRows.length === 0" class="muted pad">No models</p>
-				</div>
-				<div class="model-endpoints">
-					<p class="muted model-edit-label">Provider endpoints</p>
-					<div v-for="provider in modelProviders" :key="provider.id" class="model-endpoint">
-						<span class="model-endpoint-id ellipsis">{{ provider.id }}</span>
-						<span class="model-endpoint-url ellipsis" :class="{ muted: !provider.baseUrl }">
-							{{ provider.baseUrl || (provider.defined ? "inherit" : "registered outside models.json") }}
-						</span>
-						<span v-if="provider.hasKey" class="model-row-tag" title="an apiKey is stored for this provider">key</span>
-						<button
-							v-if="provider.defined"
-							type="button"
-							class="iconbtn"
-							title="Edit this provider endpoint"
-							@click="startEditProvider(provider)"
-						>
-							<svg viewBox="0 0 16 16" aria-hidden="true">
-								<path d="M11.2 2.3l2.5 2.5-8 8-3.4.9.9-3.4 8-8z" />
-								<path d="M9.6 4l2.4 2.4" />
-							</svg>
+
+					<p v-if="modelFormError" class="mm-error" role="alert">{{ modelFormError }}</p>
+					<footer class="mm-actions">
+						<button type="button" class="mm-secondary" :disabled="modelManagerBusy" @click="cancelModelForm">Cancel</button>
+						<button type="button" class="mm-primary" :disabled="modelManagerBusy || !modelManager.writable" @click="saveModelForm">
+							{{ modelManagerBusy ? "Saving…" : modelForm.mode === "create" ? "Add model" : "Save" }}
 						</button>
-					</div>
-					<p v-if="modelProviders.length === 0" class="muted pad">No providers defined here</p>
+					</footer>
 				</div>
-				<div class="modal-actions">
-					<button type="button" class="ghost" :disabled="modelManagerBusy" @click="closeModelManager">Close</button>
+			</template>
+
+			<!-- the catalog: a provider rail on the left, the rows of the selected providers on the right -->
+			<template v-else>
+				<div class="mm-body">
+					<aside class="mm-rail">
+						<button
+							type="button"
+							class="mm-rail-row"
+							:class="{ active: !modelProviderFilter }"
+							@click="modelProviderFilter = ''"
+						>
+							<span class="mm-rail-name">All models</span>
+							<span class="mm-rail-count">{{ modelManager.models.length }}</span>
+						</button>
+						<button
+							v-for="provider in modelProviderRows"
+							:key="provider.id"
+							type="button"
+							class="mm-rail-row"
+							:class="{ active: modelProviderFilter === provider.id }"
+							:title="provider.defined ? provider.id : `${provider.id} (registered by an extension)`"
+							@click="modelProviderFilter = modelProviderFilter === provider.id ? '' : provider.id"
+						>
+							<span class="mm-rail-name ellipsis">{{ provider.id }}</span>
+							<span class="mm-rail-meta">
+								<span v-if="provider.hasKey" class="mm-key">key</span>
+								<span v-if="!provider.defined" class="mm-ext">ext</span>
+								<span class="mm-rail-count">{{ provider.rows }}</span>
+							</span>
+						</button>
+					</aside>
+
+					<section class="mm-main">
+						<div class="mm-toolbar">
+							<input v-model="modelFilter" class="mm-filter" placeholder="Filter models" />
+							<span class="mm-toolbar-count">{{ visibleModels.length }} / {{ modelManager.models.length }}</span>
+						</div>
+
+						<div v-if="selectedProvider" class="mm-provider-card">
+							<div class="mm-provider-card-text">
+								<p class="mm-provider-card-name ellipsis">{{ selectedProvider.id }}</p>
+								<p class="mm-provider-card-url ellipsis">
+									{{ selectedProvider.entry?.baseUrl || "no endpoint — every model must carry its own" }}
+								</p>
+							</div>
+							<button
+								type="button"
+								class="mm-secondary"
+								:disabled="!selectedProvider.defined"
+								:title="selectedProvider.defined ? 'Edit this provider' : 'Registered by an extension: read-only'"
+								@click="startEditProvider(selectedProvider)"
+							>
+								{{ selectedProvider.defined ? "Edit provider" : "Read-only" }}
+							</button>
+						</div>
+
+						<p v-if="modelManagerError" class="mm-error" role="alert">{{ modelManagerError }}</p>
+
+						<div class="mm-rows">
+							<div
+								v-for="row in visibleModels"
+								:key="`${row.provider}/${row.id}`"
+								class="mm-row"
+								:class="{ current: row.current }"
+							>
+								<template v-if="modelDelete && modelDelete.provider === row.provider && modelDelete.id === row.id">
+									<p class="mm-row-confirm">Delete “{{ modelDelete.name }}”?</p>
+									<div class="mm-row-actions">
+										<button type="button" class="mm-secondary" :disabled="modelManagerBusy" @click="modelDelete = null">Cancel</button>
+										<button type="button" class="mm-danger" :disabled="modelManagerBusy" @click="confirmDeleteModel">
+											{{ modelManagerBusy ? "Deleting…" : "Delete" }}
+										</button>
+									</div>
+								</template>
+								<template v-else>
+									<button type="button" class="mm-row-main" @click="startEditModel(row)">
+										<span class="mm-row-line">
+											<span class="mm-row-name ellipsis">{{ row.name || row.id }}</span>
+											<span v-if="row.current" class="mm-tag current">current</span>
+											<span v-if="row.source === 'overrides'" class="mm-tag" title="Stored as a modelOverrides entry">override</span>
+											<span v-if="!row.available" class="mm-tag warn" title="No credentials for this provider yet">no key</span>
+											<span
+												v-if="row.blocks.length > 0"
+												class="mm-tag"
+												:title="`also sets ${row.blocks.join(', ')}`"
+											>
+												{{ row.blocks.length }} advanced
+											</span>
+										</span>
+										<span class="mm-row-line mm-row-sub">
+											<span class="mm-row-mono ellipsis">{{ row.provider }} · {{ row.id }}</span>
+											<span class="mm-row-mono">{{ compact(row.contextWindow) }} ctx · {{ compact(row.maxTokens) }} out</span>
+											<span class="mm-row-mono ellipsis">{{ row.endpoint || "no endpoint" }}</span>
+										</span>
+									</button>
+									<div class="mm-row-actions">
+										<button type="button" class="mm-icon" title="Edit this model" @click="startEditModel(row)">
+											<svg viewBox="0 0 16 16" aria-hidden="true">
+												<path d="M11.2 2.3l2.5 2.5-8 8-3.4.9.9-3.4 8-8z" />
+												<path d="M9.6 4l2.4 2.4" />
+											</svg>
+										</button>
+										<button
+											type="button"
+											class="mm-icon"
+											:disabled="row.source === 'none'"
+											:title="row.source === 'none' ? 'Nothing in models.json to delete' : 'Delete this model'"
+											@click="askDeleteModel(row)"
+										>
+											<svg viewBox="0 0 16 16" aria-hidden="true">
+												<path d="M3.5 4.5h9M6.5 4.5V3h3v1.5M5 4.5l.5 8h5l.5-8" />
+											</svg>
+										</button>
+									</div>
+								</template>
+							</div>
+							<p v-if="visibleModels.length === 0" class="mm-empty">No models</p>
+						</div>
+					</section>
 				</div>
+				<datalist id="mm-apis">
+					<option v-for="name in COMMON_APIS" :key="name" :value="name" />
+				</datalist>
+				<datalist id="mm-providers">
+					<option v-for="provider in modelProviderRows" :key="provider.id" :value="provider.id" />
+				</datalist>
 			</template>
 		</div>
 	</div>
