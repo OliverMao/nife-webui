@@ -71,7 +71,9 @@ In the CLI session:
 /webui auto               print the current setting
 ```
 
-On launch the bridge starts by itself and the URL is opened once per process; the tab survives
+The tab is titled `Nife - <hostname of the machine running it>`, so several windows opened against
+different machines are distinguishable at a glance. On launch the bridge starts by itself and the
+URL is opened once per process; the tab survives
 `/reload`, `/new`, `/resume` and `/fork`, since the bridge keeps its port, token and session
 binding. Autostart is skipped for headless runs (`nife --print`, subagents) and can be turned off
 three ways: `/webui auto off` (persisted in `~/.nife/agent/webui.json`, honors

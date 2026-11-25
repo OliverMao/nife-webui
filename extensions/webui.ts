@@ -16,7 +16,7 @@ import { readdirSync, readFileSync, readlinkSync } from "node:fs";
 import { mkdir, open, readdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import { homedir, tmpdir } from "node:os";
+import { homedir, hostname, tmpdir } from "node:os";
 import { basename, dirname, extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getAgentDir, SessionManager, sessionEntryToContextMessages, type SessionInfo } from "nife-coding-agent";
@@ -2158,12 +2158,30 @@ function snapshot(b: Bridge, target: Target, metaOnly = false): unknown {
 	};
 }
 
+/**
+ * The browser tab says which machine is behind it: several nife-webui windows are usually open at
+ * once, and "nife" alone does not tell them apart. Computed once - the hostname of a process that
+ * long-running does not change under it.
+ */
+const PAGE_TITLE = `Nife - ${((): string => {
+	try {
+		return hostname() || "nife";
+	} catch {
+		return "nife";
+	}
+})()}`;
+
 async function serveStatic(pathname: string, res: ServerResponse): Promise<void> {
 	const relative = pathname === "/" ? "index.html" : decodeURIComponent(pathname).replace(/^\/+/, "");
 	const file = resolve(DIST_DIR, relative);
 	if (!file.startsWith(DIST_DIR + sep)) return send(res, 404, `not found: ${pathname}`);
 	try {
 		const body = await readFile(file);
+		// only the shell carries a title; leaving it as "nife" made every window look the same
+		if (relative === "index.html") {
+			const html = body.toString("utf8").replace(/<title>[^<]*<\/title>/, () => `<title>${PAGE_TITLE.replace(/[<&]/g, (c) => (c === "<" ? "&lt;" : "&amp;"))}</title>`);
+			return send(res, 200, html, "text/html; charset=utf-8");
+		}
 		send(res, 200, body, CONTENT_TYPES[extname(file)] ?? "application/octet-stream");
 	} catch {
 		send(res, 404, `not found: ${pathname}`);
