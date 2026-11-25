@@ -3639,6 +3639,286 @@ img {
 }
 
 /* search field: a project filter and a path field at once */
+/* where it runs: a two-way choice, the first thing the picker says */
+.workspace-tabs {
+	display: flex;
+	gap: 4px;
+	padding: 8px 10px 0;
+}
+
+.workspace-tab {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	flex: 1 1 0;
+	justify-content: center;
+	padding: 6px 10px;
+	border: 1px solid transparent;
+	border-radius: 8px;
+	background: #1f1f1f;
+	color: var(--muted);
+	font: inherit;
+	font-size: 12px;
+	cursor: pointer;
+}
+
+.workspace-tab svg {
+	width: 13px;
+	height: 13px;
+	fill: none;
+	stroke: currentColor;
+	stroke-width: 1.3;
+	stroke-linecap: round;
+	stroke-linejoin: round;
+}
+
+.workspace-tab:hover {
+	color: var(--text);
+	background: #242424;
+}
+
+.workspace-tab.on {
+	border-color: #35507a;
+	background: #23304a;
+	color: #dfe8ff;
+}
+
+.workspace-devices {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	padding: 8px 8px 4px;
+}
+
+.workspace-device {
+	display: flex;
+	align-items: center;
+	border-radius: 8px;
+}
+
+.workspace-device:hover {
+	background: #262626;
+}
+
+.workspace-device-main {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	flex: 1 1 auto;
+	min-width: 0;
+	padding: 7px 8px;
+	border: 0;
+	background: none;
+	color: inherit;
+	font: inherit;
+	text-align: left;
+	cursor: pointer;
+}
+
+.workspace-device-copy {
+	display: flex;
+	flex-direction: column;
+	gap: 1px;
+	min-width: 0;
+	flex: 1 1 auto;
+}
+
+.workspace-device-name {
+	color: var(--text);
+	font-size: 12.5px;
+}
+
+.workspace-device-target {
+	color: var(--dim);
+	font-family: var(--mono);
+	font-size: 11px;
+}
+
+.workspace-device-state {
+	flex: 0 0 auto;
+	max-width: 40%;
+	color: var(--dim);
+	font-size: 11px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.workspace-device-edit {
+	flex: 0 0 auto;
+	display: inline-flex;
+	padding: 4px 6px;
+	border: 0;
+	border-radius: 6px;
+	background: none;
+	color: var(--dim);
+	cursor: pointer;
+	opacity: 0;
+}
+
+.workspace-device:hover .workspace-device-edit {
+	opacity: 1;
+}
+
+.workspace-device-edit:hover {
+	color: var(--text);
+	background: #2c2c2c;
+}
+
+.workspace-device-edit svg {
+	width: 13px;
+	height: 13px;
+	fill: none;
+	stroke: currentColor;
+	stroke-width: 1.3;
+	stroke-linecap: round;
+	stroke-linejoin: round;
+}
+
+.workspace-device-add {
+	display: inline-flex;
+	align-items: center;
+	gap: 7px;
+	padding: 7px 8px;
+	border: 0;
+	border-radius: 8px;
+	background: none;
+	color: var(--muted);
+	font: inherit;
+	font-size: 12px;
+	text-align: left;
+	cursor: pointer;
+}
+
+.workspace-device-add:hover {
+	background: #262626;
+	color: var(--text);
+}
+
+.workspace-device-add svg {
+	width: 13px;
+	height: 13px;
+	fill: none;
+	stroke: currentColor;
+	stroke-width: 1.4;
+	stroke-linecap: round;
+}
+
+.workspace-empty {
+	margin: 0;
+	padding: 10px 10px 4px;
+	color: var(--dim);
+	font-size: 11.5px;
+	line-height: 1.5;
+}
+
+.workspace-device-form {
+	display: flex;
+	flex-direction: column;
+	gap: 7px;
+	padding: 8px 12px 4px;
+}
+
+.workspace-device-form .workspace-label {
+	padding: 0;
+}
+
+.workspace-field {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+}
+
+.workspace-field > span {
+	flex: 0 0 42px;
+	color: var(--dim);
+	font-size: 11.5px;
+}
+
+.workspace-field input {
+	flex: 1 1 auto;
+	min-width: 0;
+	padding: 5px 8px;
+	border: 1px solid #2f2f2f;
+	border-radius: 7px;
+	background: #1b1b1b;
+	color: var(--text);
+	font: inherit;
+	font-size: 12px;
+}
+
+.workspace-field input:focus {
+	border-color: #3f5c8a;
+	outline: none;
+}
+
+.workspace-field-row {
+	display: flex;
+	gap: 8px;
+}
+
+.workspace-field-row .workspace-field {
+	flex: 1 1 auto;
+}
+
+.workspace-field-row .workspace-field.narrow {
+	flex: 0 0 96px;
+}
+
+.workspace-device-status {
+	margin: 0;
+	padding: 6px 8px;
+	border-radius: 7px;
+	background: #1f1f1f;
+	color: var(--muted);
+	font-size: 11.5px;
+	line-height: 1.5;
+	word-break: break-word;
+}
+
+.workspace-device-actions {
+	display: flex;
+	justify-content: flex-end;
+	gap: 6px;
+	padding: 2px 0 4px;
+}
+
+.workspace-cancel.danger {
+	color: #d98b8b;
+}
+
+.workspace-cancel.danger:hover {
+	color: #ff9c9c;
+}
+
+/* back to the device list from a device's folders */
+.workspace-back {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 8px 12px 0;
+}
+
+.workspace-back button {
+	padding: 0;
+	border: 0;
+	background: none;
+	color: var(--muted);
+	font: inherit;
+	font-size: 11.5px;
+	cursor: pointer;
+}
+
+.workspace-back button:hover {
+	color: var(--text);
+}
+
+.workspace-back-name {
+	color: var(--dim);
+	font-family: var(--mono);
+	font-size: 11px;
+}
+
 .workspace-search {
 	display: flex;
 	align-items: center;

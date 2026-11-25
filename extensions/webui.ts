@@ -34,6 +34,20 @@ import {
 	type ExtensionContext,
 	type ExtensionUIContext,
 } from "nife-coding-agent";
+import {
+	deleteHost,
+	findHost,
+	hostsFile,
+	readHosts,
+	remoteLabel,
+	sshArgs,
+	sshTarget,
+	upsertHost,
+	VALID_ALIAS,
+	type HostEntry,
+} from "./ssh/hosts.ts";
+import { RemoteHost, type HostProfile } from "./ssh/transport.ts";
+import { remotePrompt, remoteToolDefinitions, remoteToolNames, shellQuote } from "./ssh/tools.ts";
 
 /** Whatever ctx.model is; the package does not export the model type itself. */
 type AnyModel = NonNullable<ExtensionContext["model"]>;
@@ -150,6 +164,8 @@ type Workspace = "work" | "chat";
 interface SessionRef {
 	path: string;
 	cwd: string;
+	/** The ssh device this session ran on, when it is not this machine. */
+	device?: string;
 	modified: Date;
 	/** A header-only New Work / New Chat placeholder is not a Recents row. */
 	hasMessage: boolean;
@@ -157,6 +173,7 @@ interface SessionRef {
 
 interface ProjectGroupInfo {
 	cwd: string;
+	device?: string;
 	name: string;
 	count: number;
 	modified: Date;
@@ -313,6 +330,14 @@ interface Bridge {
 	hostDone?: boolean;
 	/** Shared auth/model catalogue for workers; created on the first background run. */
 	modelRuntime?: Promise<ModelRuntime>;
+	/**
+	 * One ssh connection per device, shared by every conversation that runs on it: the helper is
+	 * streamed per connection, so opening a second one for a second conversation would pay for the
+	 * same handshake twice and leave two shells idling on the device.
+	 */
+	remotes: Map<string, RemoteHost>;
+	/** What each device turned out to be, asked once per process (OpenWrt is not Debian). */
+	remoteProfiles: Map<string, HostProfile>;
 }
 
 interface SwitchOutcome {
@@ -349,7 +374,13 @@ const pathKey = (value: string): string => {
 	return process.platform === "win32" ? clean.toLowerCase() : clean;
 };
 const samePath = (left: string, right: string): boolean => pathKey(left) === pathKey(right);
-const workspaceKey = (workspace: Workspace, cwd: string): string => `${workspace}\n${pathKey(cwd)}`;
+/**
+ * A project is a path *and* the machine it is on: `/etc` on two routers is two projects, and merging
+ * them would put another device's conversations under this one's label.
+ */
+const projectKey = (device: string | undefined, cwd: string): string => `${device ?? ""}\n${pathKey(cwd)}`;
+const workspaceKey = (workspace: Workspace, cwd: string, device?: string): string =>
+	`${workspace}\n${projectKey(device, cwd)}`;
 
 /** The project session directory behind a session dir, also when an old Chat dir is passed in. */
 function legacyWorkDirOf(sessionDir: string): string {
@@ -377,12 +408,21 @@ function rememberCurrent(b: Bridge): void {
 }
 
 /** A header-only session file: enough for switchSession, invisible in Recents until it has a message. */
-async function writeSessionHeader(path: string, cwd: string): Promise<void> {
+async function writeSessionHeader(path: string, cwd: string, device?: string): Promise<void> {
 	// nife names files `<timestamp>_<session-id>.jsonl`; keep the header id in step with it.
 	const name = basename(path);
 	const at = name.lastIndexOf("_");
 	const id = (at >= 0 ? name.slice(at + 1, -".jsonl".length) : "") || randomUUID();
-	const header = { type: "session", version: SESSION_VERSION, id, timestamp: new Date().toISOString(), cwd };
+	// `webui.device` is the only record of "this conversation runs on that machine": the cwd stays the
+	// real remote path, so every tool, every path in the transcript and every project label is honest.
+	const header = {
+		type: "session",
+		version: SESSION_VERSION,
+		id,
+		timestamp: new Date().toISOString(),
+		cwd,
+		...(device ? { webui: { device } } : {}),
+	};
 	await mkdir(dirname(path), { recursive: true });
 	try {
 		await writeFile(path, `${JSON.stringify(header)}\n`, { encoding: "utf8", flag: "wx" });
@@ -392,16 +432,16 @@ async function writeSessionHeader(path: string, cwd: string): Promise<void> {
 	}
 }
 
-async function createSessionFile(dir: string, cwd: string): Promise<string> {
+async function createSessionFile(dir: string, cwd: string, device?: string): Promise<string> {
 	const timestamp = new Date().toISOString();
 	const path = join(dir, `${timestamp.replace(/[:.]/g, "-")}_${randomUUID()}.jsonl`);
-	await writeSessionHeader(path, cwd);
+	await writeSessionHeader(path, cwd, device);
 	return path;
 }
 
 /** The session the selector should land on for this project: last active, recent, or a fresh one. */
-async function workspaceSessionPath(b: Bridge, workspace: Workspace, cwd: string): Promise<string> {
-	const remembered = b.workspaceFiles[workspaceKey(workspace, cwd)];
+async function workspaceSessionPath(b: Bridge, workspace: Workspace, cwd: string, device?: string): Promise<string> {
+	const remembered = b.workspaceFiles[workspaceKey(workspace, cwd, device)];
 	if (remembered) {
 		if (existsSync(remembered)) return remembered;
 		// nife only writes a new session on its first message. We already left that manager behind, so
@@ -409,7 +449,7 @@ async function workspaceSessionPath(b: Bridge, workspace: Workspace, cwd: string
 		await writeSessionHeader(remembered, cwd);
 		return remembered;
 	}
-	const sessions = await projectSessionsForCwd(b, workspace, cwd);
+	const sessions = await projectSessionsForCwd(b, workspace, cwd, device);
 	const recent = sessions.find((session) => session.messageCount > 0);
 	return recent?.path ?? createSessionFile(workspaceDir(b, workspace), cwd);
 }
@@ -419,16 +459,17 @@ async function createAndSwitch(
 	b: Bridge,
 	workspace: Workspace,
 	cwd: string,
+	device?: string,
 ): Promise<SwitchOutcome & { path?: string }> {
 	if (!b.ctx.isIdle()) return { ok: false, message: "stop the current turn first" };
 	rememberCurrent(b);
-	const path = await createSessionFile(workspaceDir(b, workspace), cwd);
+	const path = await createSessionFile(workspaceDir(b, workspace), cwd, device);
 	const outcome = await requestSwitch(b, `resume ${path}`);
 	if (!outcome.ok) {
 		await rm(path, { force: true }).catch(() => {});
 		return outcome;
 	}
-	b.workspaceFiles[workspaceKey(workspace, cwd)] = path;
+	b.workspaceFiles[workspaceKey(workspace, cwd, device)] = path;
 	broadcast(b, { type: "session_switch" });
 	return { ...outcome, path };
 }
@@ -983,6 +1024,8 @@ const WEBUI_MODULE = fileURLToPath(import.meta.url);
 interface Worker {
 	sid: string;
 	cwd: string;
+	/** ssh device alias, when this conversation runs on another machine. */
+	device?: string;
 	workspace: Workspace;
 	manager: SessionManager;
 	/** Session file. A worker is always created from a real file (a new one gets its header first). */
@@ -1207,9 +1250,15 @@ function attachSession(b: Bridge, rawPath: string): AttachOutcome {
 	} catch (error) {
 		return { ok: false, message: error instanceof Error ? error.message : "could not open session" };
 	}
+	// The header is read raw on purpose: `SessionManager.getCwd()` resolves the path against this
+	// process, which turns `ssh://router/etc` into `.../ssh:/router/etc` and loses the device.
+	const header = manager.getHeader() as { cwd?: unknown; webui?: { device?: unknown } } | undefined;
+	const recorded = typeof header?.cwd === "string" && header.cwd ? header.cwd : manager.getCwd();
+	const device = typeof header?.webui?.device === "string" ? header.webui.device : undefined;
 	const worker: Worker = {
 		sid: randomUUID(),
-		cwd: manager.getCwd(),
+		cwd: recorded,
+		...(device ? { device } : {}),
 		workspace: workspaceOfFile(path),
 		manager,
 		path,
@@ -1244,12 +1293,56 @@ async function createAttachedSession(
 	b: Bridge,
 	workspace: Workspace,
 	cwd: string,
+	device?: string,
 ): Promise<AttachOutcome & { path?: string; cwd?: string; workspace?: Workspace }> {
-	const path = await createSessionFile(workspaceDir(b, workspace), cwd);
+	const path = await createSessionFile(workspaceDir(b, workspace), cwd, device);
 	const outcome = attachSession(b, path);
 	if (!outcome.ok) return outcome;
-	b.workspaceFiles[workspaceKey(workspace, cwd)] = path;
+	b.workspaceFiles[workspaceKey(workspace, cwd, device)] = path;
 	return { ...outcome, path, cwd, workspace };
+}
+
+/**
+ * The connection for one device, opened on first use and shared by every conversation on it.
+ * An alias that is not in the device list is a session from another machine or an edited config:
+ * it fails loudly here, once, rather than as a confusing "connection closed" inside a turn.
+ */
+function remoteConnection(b: Bridge, alias: string): RemoteHost {
+	const known = b.remotes.get(alias);
+	if (known) return known;
+	const entry = findHost(alias);
+	if (!entry) throw new Error(`unknown device: ${alias} (not in ${hostsFile()} or ~/.ssh/config)`);
+	const host = new RemoteHost(entry.alias, sshArgs(entry));
+	b.remotes.set(alias, host);
+	return host;
+}
+
+/**
+ * The prompt block that tells the model where it is. Appended, never replacing: skills, personas and
+ * the project's own AGENTS.md still apply - only the tools behind them changed.
+ */
+function remoteExtensionFor(alias: string, path: string, profile?: HostProfile) {
+	return {
+		name: "webui-remote",
+		factory: (api: ExtensionAPI) => {
+			api.on("before_agent_start", (event) => ({
+				systemPrompt: `${event.systemPrompt}\n\n${remotePrompt(alias, path, profile)}`,
+			}));
+		},
+	};
+}
+
+/** Ask once per process what a device is; a probe failure must not break the session. */
+async function deviceProfile(b: Bridge, host: RemoteHost): Promise<HostProfile | undefined> {
+	const cached = b.remoteProfiles.get(host.alias);
+	if (cached) return cached;
+	try {
+		const profile = await host.probe();
+		b.remoteProfiles.set(host.alias, profile);
+		return profile;
+	} catch {
+		return undefined;
+	}
 }
 
 function workerModelRuntime(b: Bridge): Promise<ModelRuntime> {
@@ -1317,6 +1410,13 @@ function openWorkerSession(
 	worker.opening ??= (async () => {
 		try {
 			const agentDir = getAgentDir();
+			// A remote conversation records `ssh://router/etc` as its cwd: that is what makes the
+			// transcript self-describing (a re-attach knows it is remote) and what gives the sidebar
+			// one project per device path. The device's own path is what the tools work in.
+			const remote = worker.device ? { alias: worker.device, path: worker.cwd } : null;
+			const remoteHost = remote ? remoteConnection(b, remote.alias) : undefined;
+			const profile = remoteHost ? await deviceProfile(b, remoteHost) : undefined;
+			const remoteExtension = remote && remoteHost ? remoteExtensionFor(remoteHost.alias, remote.path, profile) : undefined;
 			const settingsManager = SettingsManager.create(worker.cwd, agentDir);
 			const loader = new DefaultResourceLoader({
 				cwd: worker.cwd,
@@ -1327,7 +1427,8 @@ function openWorkerSession(
 					...base,
 					extensions: base.extensions.filter((extension) => resolve(extension.resolvedPath) !== WEBUI_MODULE),
 				}),
-				extensionFactories: worker.workspace === "chat" ? [CHAT_EXTENSION] : undefined,
+				extensionFactories:
+					worker.workspace === "chat" ? [CHAT_EXTENSION] : remoteExtension ? [remoteExtension] : undefined,
 			});
 			await loader.reload();
 			const modelRuntime = await workerModelRuntime(b);
@@ -1339,6 +1440,10 @@ function openWorkerSession(
 				sessionManager: worker.manager,
 				resourceLoader: loader,
 				noTools: worker.workspace === "chat" ? "all" : undefined,
+				// On a device, nife's tools are the device's tools: same definitions, ssh operations.
+				// Everything else (grep, find, subagent) would quietly run on this machine instead.
+				customTools: remote && remoteHost ? remoteToolDefinitions(remoteHost, remote.path) : undefined,
+				tools: remote ? [...remoteToolNames] : undefined,
 			});
 			await session.bindExtensions({
 				uiContext: workerUI(b, worker),
@@ -2126,6 +2231,9 @@ function snapshot(b: Bridge, target: Target, metaOnly = false): unknown {
 		sessionFile: manager.getSessionFile(),
 		name: target.kind === "host" ? b.api.getSessionName() : workerName(target.worker),
 		cwd: targetCwd(b, target),
+		// The page shows the device chip and the tab names the machine the conversation runs on; the
+		// cwd itself stays the real remote path, so nothing in the transcript has to be translated.
+		remote: target.kind === "worker" && target.worker.device ? { alias: target.worker.device, path: targetCwd(b, target) } : null,
 		model: model ? { id: model.id, name: model.name, provider: model.provider } : null,
 		thinkingLevel: targetThinking(b, target),
 		thinkingLevels: supportedLevels(model),
@@ -2136,6 +2244,9 @@ function snapshot(b: Bridge, target: Target, metaOnly = false): unknown {
 			name: model.name,
 		})),
 		streaming: targetRunning(b, target),
+		// What a background conversation can actually do. A device session has fewer tools than a local
+		// one, and saying so is cheaper than letting the model discover it by failing.
+		tools: target.kind === "worker" ? (target.worker.session?.getActiveToolNames() ?? []) : null,
 		// what the assistant has streamed so far, so switching back mid-turn is not a blank bubble
 		live: target.kind === "host" ? b.hostLive : target.worker.live,
 		usage: targetUsage(b, target),
@@ -2276,8 +2387,9 @@ async function readSessionRef(path: string): Promise<SessionRef | null> {
 			const chunk = buffer.subarray(0, bytesRead);
 			const newline = chunk.indexOf(0x0a);
 			const first = chunk.toString("utf8", 0, newline < 0 ? bytesRead : newline);
-			const header = JSON.parse(first) as { type?: string; cwd?: unknown };
+			const header = JSON.parse(first) as { type?: string; cwd?: unknown; webui?: { device?: unknown } };
 			if (header.type !== "session") return null;
+			const device = typeof header.webui?.device === "string" ? header.webui.device : undefined;
 			let hasMessage = false;
 			for (const line of chunk.toString("utf8").split("\n")) {
 				if (!line.trim()) continue;
@@ -2295,6 +2407,7 @@ async function readSessionRef(path: string): Promise<SessionRef | null> {
 			return {
 				path,
 				cwd: typeof header.cwd === "string" ? header.cwd : "",
+				...(device ? { device } : {}),
 				modified: info.mtime,
 				hasMessage,
 			};
@@ -2401,24 +2514,42 @@ function isTempPath(value: string): boolean {
 	return probe.split(/[\\/]+/).some((segment) => TEMP_SEGMENTS.has(segment));
 }
 
-function projectGroups(b: Bridge, refs: SessionRef[], currentCwd = b.ctx.cwd): ProjectGroupInfo[] {
+function projectGroups(
+	b: Bridge,
+	refs: SessionRef[],
+	current: { cwd: string; device?: string } = { cwd: b.ctx.cwd },
+): ProjectGroupInfo[] {
 	const groups = new Map<string, ProjectGroupInfo>();
 	for (const ref of refs) {
 		if (!ref.hasMessage) continue;
 		// group by the comparable path, but keep the spelling the session recorded: the page passes
 		// that `cwd` back when it asks for one project's rows
-		const key = ref.cwd ? pathKey(ref.cwd) : "";
+		const key = ref.cwd ? projectKey(ref.device, ref.cwd) : "";
 		let group = groups.get(key);
 		if (!group) {
-			group = { cwd: ref.cwd || "", name: ref.cwd ? basename(ref.cwd) || ref.cwd : "Unknown project", count: 0, modified: ref.modified, current: Boolean(ref.cwd) && samePath(ref.cwd, currentCwd) };
+			// A device path groups as `router:/etc`: `basename` alone would list three projects called
+			// `etc` for three devices, which is exactly the ambiguity this feature is about.
+			group = {
+				cwd: ref.cwd || "",
+				device: ref.device,
+				name: ref.device
+					? `${ref.device}:${ref.cwd}`
+					: ref.cwd
+						? basename(ref.cwd) || ref.cwd
+						: "Unknown project",
+				count: 0,
+				modified: ref.modified,
+				current:
+					Boolean(ref.cwd) && (ref.device ?? "") === (current.device ?? "") && samePath(ref.cwd, current.cwd),
+			};
 			groups.set(key, group);
 		}
 		group.count += 1;
 		if (ref.modified.getTime() > group.modified.getTime()) group.modified = ref.modified;
 	}
 	const list = [...groups.values()];
-	const current = list.findIndex((group) => group.current);
-	if (current > 0) list.unshift(list.splice(current, 1)[0]);
+	const index = list.findIndex((group) => group.current);
+	if (index > 0) list.unshift(list.splice(index, 1)[0]);
 	return list.sort((left, right) => (right.current ? 1 : 0) - (left.current ? 1 : 0) || right.modified.getTime() - left.modified.getTime());
 }
 
@@ -2462,12 +2593,15 @@ async function sessionInfoFromPath(path: string): Promise<SessionInfo | null> {
 	}
 }
 
-async function projectSessionsForCwd(b: Bridge, workspace: Workspace, cwd: string): Promise<SessionInfo[]> {
-	const key = `${workspace}\n${cwd}`;
+async function projectSessionsForCwd(b: Bridge, workspace: Workspace, cwd: string, device?: string): Promise<SessionInfo[]> {
+	const key = `${workspace}\n${projectKey(device, cwd)}`;
 	const cached = b.projectSessionCache[key];
 	if (cached && Date.now() - cached.at < SESSION_CACHE_MS) return cached.sessions;
 	const refs = (await workspaceRefs(b, workspace)).filter(
-		(ref) => ref.hasMessage && (cwd ? samePath(ref.cwd, cwd) : ref.cwd === ""),
+		(ref) =>
+			ref.hasMessage &&
+			(ref.device ?? "") === (device ?? "") &&
+			(cwd ? samePath(ref.cwd, cwd) : ref.cwd === ""),
 	);
 	const infos = await mapLimit(refs, 8, (ref) => sessionInfoFromPath(ref.path));
 	const sessions = infos
@@ -2490,6 +2624,33 @@ function projectPath(b: Bridge, value: string): string {
 	if (input === "~") return homedir();
 	if (input.startsWith("~/") || input.startsWith("~\\")) return resolve(homedir(), input.slice(2));
 	return resolve(b.ctx.cwd || PROJECTS_ROOT, input);
+}
+
+/** The device list as the page sees it: what this extension saved, plus what was probed. */
+function hostRows(b: Bridge): (HostEntry & { target: string; profile?: HostProfile })[] {
+	return readHosts().map((entry) => ({
+		...entry,
+		target: sshTarget(entry),
+		profile: b.remoteProfiles.get(entry.alias),
+	}));
+}
+
+/**
+ * `cd <somewhere> && pwd` on the device. A quoted `~` would be a literal directory name, so the
+ * home form is written as `$HOME` - still quoted, so a path with spaces stays one argument.
+ */
+const remoteCd = (asked: string): string => {
+	if (asked === "~" || asked === "") return `cd "$HOME" && pwd`;
+	if (asked.startsWith("~/")) return `cd "$HOME/${asked.slice(2)}" && pwd`;
+	return `cd ${shellQuote(asked)} && pwd`;
+};
+
+/** Resolve a device directory (symlinks, `~`, `..`): a path that cannot be entered is an error. */
+async function resolveRemoteDir(host: RemoteHost, asked: string): Promise<string> {
+	const result = await host.run(remoteCd(asked), "/", 20);
+	const path = result.text.trim().split("\n").pop()?.trim() ?? "";
+	if (result.code !== 0 || !path) throw new Error(`不是文件夹：${asked}`);
+	return path;
 }
 
 /** The new-session picker: the default root, its child projects, and projects with history. */
@@ -2530,7 +2691,7 @@ async function listProjects(b: Bridge) {
 async function listGroups(b: Bridge): Promise<unknown> {
 	const viewed = viewedTarget(b);
 	const refs = await workspaceRefs(b, targetWorkspace(b, viewed));
-	const groups = projectGroups(b, refs, targetCwd(b, viewed));
+	const groups = projectGroups(b, refs, { cwd: targetCwd(b, viewed), device: viewed.kind === "worker" ? viewed.worker.device : undefined });
 	// Only projects with a saved conversation are listed. The current project is not injected as an
 	// empty group: a New Work / New Chat still has no row, and deleting a workspace has to remove it
 	// from the sidebar right away instead of leaving its name behind with "No sessions". The group
@@ -2539,15 +2700,15 @@ async function listGroups(b: Bridge): Promise<unknown> {
 		current: targetCwd(b, viewed),
 		currentFile: targetManager(b, viewed).getSessionFile(),
 		mode: targetWorkspace(b, viewed),
-		groups,
+		groups: groups.map((group) => ({ ...group, key: projectKey(group.device, group.cwd) })),
 	};
 }
 
-async function listSessions(b: Bridge, cwd: string): Promise<unknown> {
+async function listSessions(b: Bridge, cwd: string, device?: string): Promise<unknown> {
 	const viewed = viewedTarget(b);
 	// Header-only sessions are the empty target of a workspace switch; they join Recents with their
 	// first message, not before.
-	const sessions = await projectSessionsForCwd(b, targetWorkspace(b, viewed), cwd);
+	const sessions = await projectSessionsForCwd(b, targetWorkspace(b, viewed), cwd, device);
 	return {
 		current: targetManager(b, viewed).getSessionFile(),
 		cwd,
@@ -2830,6 +2991,46 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 	 * picker works without typing a path. Hidden entries are skipped, symlinks only when they point
 	 * at a directory, and an unreadable path answers 400 with the text the picker shows.
 	 */
+	if (req.method === "GET" && path === "/api/dirs" && url.searchParams.get("host")) {
+		const alias = url.searchParams.get("host") ?? "";
+		let host: RemoteHost;
+		try {
+			host = remoteConnection(b, alias);
+		} catch (error) {
+			return send(res, 404, error instanceof Error ? error.message : `unknown device: ${alias}`);
+		}
+		let target: string;
+		try {
+			target = await resolveRemoteDir(host, url.searchParams.get("path") ?? "~");
+		} catch (error) {
+			return send(res, 400, error instanceof Error ? error.message : `无法打开：${alias}`);
+		}
+		// Directories only, and no `find`: a busybox `find` without `-maxdepth` walks the whole tree.
+		const listing = await host.run(
+			`cd ${shellQuote(target)} && for entry in * .[!.]*; do [ -d "$entry" ] && printf '%s\\n' "$entry"; done`,
+			"/",
+			30,
+		);
+		const names = listing.text
+			.split("\n")
+			.map((name) => name.trim())
+			.filter((name) => name.length > 0 && name !== "." && name !== "..")
+			.slice(0, BROWSE_DIR_MAX);
+		const dirs = names
+			.map((name) => ({ name, path: target === "/" ? `/${name}` : `${target}/${name}` }))
+			.sort((left, right) => left.name.localeCompare(right.name, "zh"));
+		const parent = target === "/" ? null : target.replace(/\/+$/, "").replace(/\/[^/]+$/, "") || "/";
+		const home = (
+			await host.run(`printf %s "$HOME"`, "/", 10).catch(() => ({ text: "" }))
+		).text.trim();
+		return send(
+			res,
+			200,
+			JSON.stringify({ host: alias, path: target, parent, home: home || "/", dirs }),
+			"application/json",
+		);
+	}
+
 	if (req.method === "GET" && path === "/api/dirs") {
 		const target = projectPath(b, url.searchParams.get("path") ?? "~");
 		try {
@@ -2862,13 +3063,93 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		);
 	}
 
+	// The device list. Probing is a separate call: a page load must not wait for five dead hosts.
+	if (req.method === "GET" && path === "/api/hosts") {
+		return send(
+			res,
+			200,
+			JSON.stringify({ hosts: hostRows(b), file: hostsFile() }),
+			"application/json",
+		);
+	}
+
+	if (req.method === "POST" && path === "/api/hosts/test") {
+		const body = await readJson(req, 4 * 1024).catch(() => ({}) as Record<string, unknown>);
+		const alias = typeof body.alias === "string" ? body.alias : "";
+		let host: RemoteHost;
+		try {
+			host = remoteConnection(b, alias);
+		} catch (error) {
+			return send(res, 404, error instanceof Error ? error.message : `unknown device: ${alias}`);
+		}
+		try {
+			const started = Date.now();
+			const profile = await host.probe();
+			b.remoteProfiles.set(host.alias, profile);
+			return send(res, 200, JSON.stringify({ ok: true, profile, ms: Date.now() - started }), "application/json");
+		} catch (error) {
+			// a failed probe leaves the cached connection unusable: the next attempt must reconnect
+			host.close();
+			b.remotes.delete(host.alias);
+			return send(
+				res,
+				200,
+				JSON.stringify({ ok: false, error: error instanceof Error ? error.message : "connection failed" }),
+				"application/json",
+			);
+		}
+	}
+
+	if (req.method === "POST" && (path === "/api/hosts/save" || path === "/api/hosts/remove")) {
+		const body = await readJson(req, 8 * 1024).catch(() => ({}) as Record<string, unknown>);
+		const alias = typeof body.alias === "string" ? body.alias.trim() : "";
+		if (!VALID_ALIAS.test(alias)) return send(res, 400, "名称只能用字母、数字、点、下划线、减号（最长 32 位）");
+		const previous = readHosts().find((entry) => entry.alias.toLowerCase() === alias.toLowerCase());
+		if (path === "/api/hosts/save") {
+			const host = typeof body.host === "string" ? body.host.trim() : "";
+			if (!host) return send(res, 400, "缺少主机地址");
+			const port = Number(body.port);
+			const text = (value: unknown): string => (typeof value === "string" ? value.trim() : "");
+			upsertHost({
+				alias,
+				host,
+				...(text(body.user) ? { user: text(body.user) } : {}),
+				...(Number.isFinite(port) && port > 0 && port < 65536 ? { port } : {}),
+				...(text(body.identity) ? { identity: text(body.identity) } : {}),
+				...(text(body.proxyJump) ? { proxyJump: text(body.proxyJump) } : {}),
+				...(text(body.label) ? { label: text(body.label) } : {}),
+				...(Array.isArray(body.options)
+					? { options: body.options.filter((option): option is string => typeof option === "string" && option.length > 0) }
+					: previous?.options?.length
+						? { options: previous.options }
+						: {}),
+			});
+		} else {
+			deleteHost(alias);
+		}
+		// Edited or removed settings must not be served by a connection opened with the old ones.
+		const live = b.remotes.get(alias);
+		if (live) {
+			live.close();
+			b.remotes.delete(alias);
+		}
+		b.remoteProfiles.delete(alias);
+		return send(res, 200, JSON.stringify({ ok: true, hosts: hostRows(b) }), "application/json");
+	}
+
 	if (req.method === "GET" && path === "/api/groups") {
 		return send(res, 200, JSON.stringify(await listGroups(b)), "application/json");
 	}
 
 	if (req.method === "GET" && path === "/api/sessions") {
 		const cwd = url.searchParams.get("cwd");
-		return send(res, 200, JSON.stringify(await listSessions(b, cwd ?? targetCwd(b, viewedTarget(b)))), "application/json");
+		const device = url.searchParams.get("device") || undefined;
+		return send(
+			res,
+			200,
+			JSON.stringify(await listSessions(b, cwd ?? targetCwd(b, viewedTarget(b)), device)),
+			"application/json",
+		);
 	}
 
 	// Full-text search across this project's conversations. `SessionManager.list` already read every
@@ -3459,20 +3740,41 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		const body = await readJson(req, 16 * 1024);
 		const viewed = viewedTarget(b);
 		const mode: Workspace = body.mode === "chat" ? "chat" : body.mode === "work" ? "work" : targetWorkspace(b, viewed);
-		const cwd = projectPath(b, typeof body.cwd === "string" ? body.cwd : "");
-		try {
-			await mkdir(cwd, { recursive: true });
-			if (!(await stat(cwd)).isDirectory()) return send(res, 400, "working directory is not a directory");
-		} catch (error) {
-			return send(res, 400, `could not use ${cwd}: ${error instanceof Error ? error.message : "not a directory"}`);
+		const device = typeof body.host === "string" ? body.host.trim() : "";
+		let cwd: string;
+		let remoteDevice: string | undefined;
+		if (device && mode === "work") {
+			// On a device: the directory is checked there, not here, and the recorded cwd is the URL
+			// that keeps the session remote when it is opened again.
+			let host: RemoteHost;
+			try {
+				host = remoteConnection(b, device);
+			} catch (error) {
+				return send(res, 404, error instanceof Error ? error.message : `unknown device: ${device}`);
+			}
+			const asked = typeof body.path === "string" && body.path.trim() ? body.path.trim() : "~";
+			try {
+				cwd = await resolveRemoteDir(host, asked);
+				remoteDevice = device;
+			} catch (error) {
+				return send(res, 400, error instanceof Error ? error.message : `could not use ${asked}`);
+			}
+		} else {
+			cwd = projectPath(b, typeof body.cwd === "string" ? body.cwd : "");
+			try {
+				await mkdir(cwd, { recursive: true });
+				if (!(await stat(cwd)).isDirectory()) return send(res, 400, "working directory is not a directory");
+			} catch (error) {
+				return send(res, 400, `could not use ${cwd}: ${error instanceof Error ? error.message : "not a directory"}`);
+			}
 		}
 		// A new conversation runs in the page as its own runtime: the terminal keeps whatever it has.
-		const outcome = await createAttachedSession(b, mode, cwd);
+		const outcome = await createAttachedSession(b, mode, cwd, remoteDevice);
 		if (!outcome.ok) return send(res, 409, outcome.message);
 		return send(
 			res,
 			200,
-			JSON.stringify({ path: outcome.path, cwd, mode, sid: outcome.sid }),
+			JSON.stringify({ path: outcome.path, cwd, mode, device: remoteDevice, sid: outcome.sid }),
 			"application/json",
 		);
 	}
@@ -4210,6 +4512,8 @@ async function start(api: ExtensionAPI, ctx: ExtensionContext): Promise<Bridge> 
 		hostRunning: false,
 		hostDone: false,
 		modelRuntime: undefined,
+		remotes: new Map(),
+		remoteProfiles: new Map(),
 		// `b` is only read when a request arrives, after the literal is assigned
 		handle: (req, res) => handle(b, req, res),
 	};

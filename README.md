@@ -87,6 +87,53 @@ three ways: `/webui auto off` (persisted in `~/.nife/agent/webui.json`, honors
 Each running CLI process gets its own port and its own token, so several sessions can be open in
 several tabs at once.
 
+## Devices over ssh
+
+A conversation can run on another machine without installing anything on it. The device only needs
+`sh` and `base64` (busybox is enough: routers, NAS boxes, embedded Linux); nife stays on this
+machine, and so do the transcripts.
+
+`+ New Work` asks where it runs first: the picker opens with two tabs, `本机` and `SSH 设备`. The
+second one lists the devices, has `添加 SSH 设备` / edit, and after a device is picked the same
+folder browser walks *its* filesystem - `in this directory` then starts a conversation whose tools
+run there.
+
+- **Nothing is written to the device.** A POSIX helper is passed as an argument to
+  `ssh host sh -c 'eval "$(...)"'`, so it lives only in that process's memory, and the frames that
+  follow travel on the same stdin. No node, no download, no cleanup, no root.
+- **One connection per device.** A fresh ssh per tool call costs a handshake every time, and
+  Windows' OpenSSH cannot multiplex; here the connection stays open and requests are serialized on
+  it. Requests are `EXEC` / `READ` / `WRITE` / `STAT` / `LIST` with base64 payloads, so a path with
+  spaces or a file with a NUL never has to survive shell quoting.
+- **The tools are nife's tools.** `bash`, `read`, `write`, `edit` and `ls` are the built-in
+  definitions with their operations pointed at the device, so the model sees the same schemas and
+  the same prompt snippets. `grep`/`find` are left out on purpose: the built-in ones run `rg`/`fd`
+  on *this* machine, and a silent search of the wrong disk is worse than no tool.
+- **The model is told what it is on.** The first connection probes the device (`uname`, os-release,
+  `systemctl`/`uci`/`apk`/`sudo`, user, root) and appends that to the system prompt, so a router is
+  not treated like a Debian box.
+
+A device conversation records the device in its session header (`webui.device`) and keeps the real
+remote path as its `cwd`, so the sidebar reads `router:/etc`, the tab reads `ssh:router · etc`, and
+re-opening the conversation after a reload still runs on the device.
+
+The device list is this extension's own: `~/.nife/agent/webui-hosts.json`, edited in the page and
+read from nowhere else - a conversation on another machine is a first-class thing here, not a side
+effect of whatever happens to be in `~/.ssh/config`:
+
+```json
+{ "hosts": [{ "alias": "router", "host": "192.168.1.1", "user": "root", "port": 22,
+              "identity": "~/.ssh/id_ed25519", "proxyJump": "bastion", "label": "路由器" }] }
+```
+
+`新增/编辑` in the picker's SSH tab writes it: name, host, user, port, key, jump host, label, with
+`测试连接` running a probe and reporting the OS, the user and how many usual commands exist.
+
+Keys are the only way in (`BatchMode=yes`): a password prompt would block a turn that has no
+terminal to answer it. Host keys are remembered in `~/.nife/agent/ssh_known_hosts` with
+`accept-new`, so a device works the first time it is added while a key that later changes is still
+refused; the user's own `~/.ssh/known_hosts` is never touched.
+
 ## Public URL (nifetun)
 
 With the [nifetun](https://github.com/OliverMao/nife-tunnel) extension installed (`/tunnel` in the
@@ -638,6 +685,12 @@ task, so opening the page shows the current prompt rather than something from th
 - If a browser tab closes while a dialog is open, the terminal dialog takes over on the next turn.
 - Markdown is rendered as plain pre-wrapped text. No syntax highlighting yet.
 - One bridge per CLI process; no landing page listing sessions across directories.
+- A device session has no `grep`/`find`/`subagent` (those would run on this machine); use `bash`
+  with `grep -rn` / `find` on the device instead.
+- Aborting a turn stops the model loop but not a command already running on the device: there is
+  nobody left to read its output, and killing it needs a second channel the helper does not have yet.
+- A device form covers host/user/port/key/jump host; anything else (extra `-o` options) is still
+  edited in `webui-hosts.json` by hand.
 - `/webui off` is the only way to close the port; quitting the CLI closes it with the process.
 - A published URL needs a nifetun whose extension answers the event bus (the current `main`); an
   older install simply gets no public URL. Reloading the page keeps the token in the address bar,

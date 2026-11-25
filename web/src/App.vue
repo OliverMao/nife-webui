@@ -275,6 +275,19 @@ const newBusy = ref(false);
 const newError = ref("");
 const newInput = ref(null);
 // Directory browser in the picker: the folder on screen, its children, and the home shortcut.
+// Devices are the other half of "where does this run": the picker's folder browser follows
+// `hostAlias`, and a session created while one is picked records `ssh://<alias>/<path>` as its cwd.
+const hostRows = ref([]);
+const hostAlias = ref("");
+const hostsLoaded = ref(false);
+/** New Work starts with a choice: this machine, or a device this extension knows about. */
+const hostTab = ref("local");
+/** `"new"` or the alias being edited; null when no device form is open. */
+const deviceForm = ref(null);
+const deviceDraft = ref({ alias: "", host: "", user: "", port: "", identity: "", proxyJump: "", label: "" });
+const deviceStatus = ref("");
+const deviceBusy = ref(false);
+
 const browseDir = ref("");
 const browseParent = ref(null);
 const browseHome = ref("");
@@ -1592,8 +1605,161 @@ async function refreshMeta() {
  */
 function syncTitle() {
 	const machine = state.value?.machine;
-	const project = projectName(state.value?.cwd);
-	document.title = [machine?.label, project].filter(Boolean).join(" · ") || "Nife";
+	const remote = state.value?.remote;
+	// A remote conversation names its device, not this machine: that is the difference between two
+	// tabs and the reason the title exists.
+	const where = remote ? `ssh:${remote.alias}` : machine?.label;
+	const project = remote ? String(remote.path || "").split("/").filter(Boolean).pop() : projectName(state.value?.cwd);
+	document.title = [where, project].filter(Boolean).join(" · ") || "Nife";
+}
+
+/** `router:/etc` for a device path, the path itself otherwise. */
+function cwdLabel(cwd, remote) {
+	return remote?.alias ? `${remote.alias}:${cwd}` : String(cwd || "");
+}
+
+/** The device list is small and changes rarely: read it when the picker opens, not on every render. */
+async function loadHosts({ force = false } = {}) {
+	if (hostsLoaded.value && !force) return;
+	try {
+		const response = await fetch(api("hosts"));
+		if (!response.ok) return;
+		const data = await response.json();
+		hostRows.value = Array.isArray(data.hosts) ? data.hosts : [];
+		hostsLoaded.value = true;
+	} catch {
+		// a picker without devices is still a picker: the local filesystem keeps working
+	}
+}
+
+/** Switch the picker between this machine and a device. */
+function pickHost(alias) {
+	const next = alias || "";
+	if (next === hostAlias.value) return;
+	hostAlias.value = next;
+	deviceForm.value = null;
+	newCwd.value = "";
+	// an empty dir means "nothing picked yet": the footer cannot offer to create a session with the
+	// previous machine's path when the new one failed to answer
+	browseDir.value = "";
+	browseDirs.value = [];
+	browseError.value = "";
+	void loadBrowse(next ? "~" : state.value.cwd || "~");
+}
+
+function switchTab(tab) {
+	if (hostTab.value === tab) return;
+	hostTab.value = tab;
+	deviceForm.value = null;
+	deviceStatus.value = "";
+	pickHost("");
+	newCwd.value = "";
+	browseDirs.value = [];
+	if (tab === "local") void loadBrowse(state.value.cwd || "~");
+	nextTick(() => newInput.value?.focus());
+}
+
+function startDeviceForm(host) {
+	deviceForm.value = host ? host.alias : "new";
+	deviceStatus.value = "";
+	deviceDraft.value = {
+		alias: host?.alias ?? "",
+		host: host?.host ?? "",
+		user: host?.user ?? "",
+		port: host?.port ? String(host.port) : "",
+		identity: host?.identity ?? "",
+		proxyJump: host?.proxyJump ?? "",
+		label: host?.label ?? "",
+	};
+	nextTick(() => newInput.value?.focus());
+}
+
+/** Save what the form says, then let the list show it: the device list is the page's source of truth. */
+async function saveDevice() {
+	if (deviceBusy.value) return;
+	const draft = deviceDraft.value;
+	if (!draft.alias.trim() || !draft.host.trim()) {
+		deviceStatus.value = "名称和主机都要填";
+		return;
+	}
+	deviceBusy.value = true;
+	deviceStatus.value = "";
+	const result = await postDetailed("hosts/save", {
+		alias: draft.alias.trim(),
+		host: draft.host.trim(),
+		user: draft.user.trim(),
+		port: draft.port.trim(),
+		identity: draft.identity.trim(),
+		proxyJump: draft.proxyJump.trim(),
+		label: draft.label.trim(),
+	});
+	deviceBusy.value = false;
+	if (!result.ok) {
+		deviceStatus.value = result.message || "保存失败";
+		return;
+	}
+	hostRows.value = Array.isArray(result.data?.hosts) ? result.data.hosts : hostRows.value;
+	hostsLoaded.value = true;
+	deviceForm.value = null;
+	deviceStatus.value = "";
+	// the list is what the next pick uses, and it carries what was probed a moment ago
+	void loadHosts({ force: true });
+}
+
+async function testDevice() {
+	if (deviceBusy.value) return;
+	const draft = deviceDraft.value;
+	if (!draft.alias.trim() || !draft.host.trim()) {
+		deviceStatus.value = "名称和主机都要填";
+		return;
+	}
+	deviceBusy.value = true;
+	deviceStatus.value = "连接中…";
+	// The test runs on the saved entry: save first, so what answered is what the session will use.
+	const saved = await postDetailed("hosts/save", {
+		alias: draft.alias.trim(),
+		host: draft.host.trim(),
+		user: draft.user.trim(),
+		port: draft.port.trim(),
+		identity: draft.identity.trim(),
+		proxyJump: draft.proxyJump.trim(),
+		label: draft.label.trim(),
+	});
+	if (!saved.ok) {
+		deviceBusy.value = false;
+		deviceStatus.value = saved.message || "保存失败";
+		return;
+	}
+	hostRows.value = Array.isArray(saved.data?.hosts) ? saved.data.hosts : hostRows.value;
+	const result = await postDetailed("hosts/test", { alias: draft.alias.trim() });
+	deviceBusy.value = false;
+	if (!result.ok) {
+		deviceStatus.value = result.message || "连接失败";
+		return;
+	}
+	if (!result.data?.ok) {
+		deviceStatus.value = result.data?.error || "连接失败";
+		return;
+	}
+	const profile = result.data.profile ?? {};
+	const tools = Array.isArray(profile.tools) ? profile.tools.length : 0;
+	deviceStatus.value = `连接成功 · ${profile.os || profile.kernel || "unknown"} · ${profile.user || ""}${profile.root ? " (root)" : ""} · ${tools} 个常用命令 · ${result.data.ms}ms`;
+	await loadHosts({ force: true });
+}
+
+async function removeDevice() {
+	if (deviceBusy.value || deviceForm.value === "new") return;
+	deviceBusy.value = true;
+	const result = await postDetailed("hosts/remove", { alias: deviceForm.value });
+	deviceBusy.value = false;
+	if (!result.ok) {
+		deviceStatus.value = result.message || "删除失败";
+		return;
+	}
+	hostRows.value = Array.isArray(result.data?.hosts) ? result.data.hosts : [];
+	deviceForm.value = null;
+	deviceStatus.value = "";
+	if (hostAlias.value === deviceForm.value) pickHost("");
 }
 
 /** The last path segment, for compact project labels next to rows from other projects. */
@@ -1656,6 +1822,11 @@ const browseCrumbs = computed(() => pathCrumbs(browseDir.value));
 const quickSpots = computed(() => {
 	const seen = new Set();
 	const list = [];
+	// a device has its own home and nothing else in common with this machine
+	if (hostAlias.value) {
+		if (browseHome.value) list.push({ name: "主目录", path: browseHome.value });
+		return list;
+	}
 	const add = (name, path) => {
 		const clean = String(path || "").trim();
 		if (!clean || seen.has(clean)) return;
@@ -1673,7 +1844,8 @@ async function loadBrowse(path) {
 	browseBusy.value = true;
 	browseError.value = "";
 	try {
-		const response = await fetch(api(`dirs?path=${encodeURIComponent(path ?? "")}`));
+		const suffix = hostAlias.value ? `&host=${encodeURIComponent(hostAlias.value)}` : "";
+		const response = await fetch(api(`dirs?path=${encodeURIComponent(path ?? "")}${suffix}`));
 		if (!response.ok) {
 			browseError.value = (await response.text()).slice(0, 200) || "无法打开这个文件夹";
 			return;
@@ -1757,7 +1929,10 @@ async function ensureGroup(key, force = false) {
 	if (!loadingProjects.value.includes(key)) loadingProjects.value = [...loadingProjects.value, key];
 	const job = (async () => {
 		try {
-			const response = await fetch(api(`sessions?cwd=${encodeURIComponent(key)}`));
+			// a project is a path *and* a machine: the group carries both, the key carries neither
+			const group = groups.value.find((entry) => entry.key === key);
+			const device = group?.device ? `&device=${encodeURIComponent(group.device)}` : "";
+			const response = await fetch(api(`sessions?cwd=${encodeURIComponent(group?.cwd ?? key)}${device}`));
 			if (!response.ok) return;
 			const data = await response.json();
 			if (generation !== groupGeneration) return;
@@ -1777,7 +1952,7 @@ async function ensureGroup(key, force = false) {
 }
 
 async function toggleProjectGroup(group) {
-	const key = group.cwd || "";
+	const key = group.key;
 	if (expandedProjects.value.includes(key)) {
 		expandedProjects.value = expandedProjects.value.filter((entry) => entry !== key);
 		return;
@@ -1787,8 +1962,9 @@ async function toggleProjectGroup(group) {
 }
 
 /** Reveal a group and load it, used by session switches, search jumps and new sessions. */
-async function revealProject(cwd) {
-	const key = cwd || "";
+async function revealProject(cwd, device) {
+	const key = groups.value.find((group) => group.cwd === cwd && (group.device ?? "") === (device ?? ""))?.key;
+	if (!key) return;
 	expandProject(key);
 	await ensureGroup(key);
 }
@@ -1809,7 +1985,7 @@ async function loadGroups(options = {}) {
 		sessionsByProject.value = {};
 		loadingProjects.value = [];
 	}
-	const keys = new Set(next.map((group) => group.cwd || ""));
+	const keys = new Set(next.map((group) => group.key));
 	const kept = {};
 	for (const [key, rows] of Object.entries(sessionsByProject.value)) {
 		if (keys.has(key)) kept[key] = rows;
@@ -1820,11 +1996,11 @@ async function loadGroups(options = {}) {
 		// Expand the current project when it has rows. An empty New Work, or a workspace whose
 		// conversations were just deleted, has no group at all: opening another project then would
 		// read as if the current one had moved there.
-		const active = next.find((group) => group.current)?.cwd;
+		const active = next.find((group) => group.current)?.key;
 		if (active !== undefined) expandProject(active);
 	}
 	if (reveal) {
-		const active = next.find((group) => group.current)?.cwd;
+		const active = next.find((group) => group.current)?.key;
 		if (active !== undefined) {
 			expandProject(active);
 			await ensureGroup(active, true);
@@ -1843,7 +2019,7 @@ async function loadGroups(options = {}) {
 const sessionGroups = computed(() => {
 	const pinned = new Set(pinnedPaths.value);
 	return groups.value.map((group) => {
-		const key = group.cwd || "";
+		const key = group.key;
 		const loaded = groupLoaded(key);
 		const raw = sessionsByProject.value[key] ?? [];
 		const first = [];
@@ -2800,7 +2976,7 @@ async function openSearchResult(group, match) {
 	const entryId = match?.entryId ?? group.matches?.[0]?.entryId ?? "";
 	const path = group.path;
 	closeSearch();
-	if (group.cwd) await revealProject(group.cwd);
+	if (group.cwd) await revealProject(group.cwd, group.device);
 	if (path !== currentFile.value) {
 		if (!(await attachSession(path))) return;
 	}
@@ -3403,7 +3579,7 @@ async function newSession() {
  * Create and switch to an empty session in `cwd`. From the picker a failure stays inline (the menu
  * is still open); from the sidebar there is no picker to write into, so it becomes a notice.
  */
-async function startNewSession(path, { inline = false } = {}) {
+async function startNewSession(path, { inline = false, host = "" } = {}) {
 	if (newBusy.value) return;
 	const cwd = String(path || "").trim();
 	if (!cwd) {
@@ -3413,7 +3589,9 @@ async function startNewSession(path, { inline = false } = {}) {
 	newBusy.value = true;
 	newError.value = "";
 	carryQueue(null);
-	const result = await postDetailed("new", { cwd, mode: mode.value });
+	// On a device the path is checked there and comes back as `ssh://<alias>/<path>`; locally it is
+	// still a directory to create.
+	const result = await postDetailed("new", host ? { host, path: cwd, mode: mode.value } : { cwd, mode: mode.value });
 	newBusy.value = false;
 	if (!result.ok) {
 		const message = result.message || "could not start a new session";
@@ -3427,8 +3605,12 @@ async function startNewSession(path, { inline = false } = {}) {
 	setSessionSid(result.data?.sid);
 	queue.value = [];
 	const resolved = typeof result.data?.cwd === "string" ? result.data.cwd : cwd;
-	localStorage.setItem("nife-webui.new-cwd", resolved);
-	newCwd.value = resolved;
+	// the remembered "last picked directory" is a local path; a remote one would be pasted back into
+	// a picker that starts on this machine
+	if (!host) {
+		localStorage.setItem("nife-webui.new-cwd", resolved);
+		newCwd.value = resolved;
+	}
 	freshSession.value = true;
 	workspaceMenu.value = false;
 	await loadState();
@@ -3444,6 +3626,12 @@ function toggleWorkspacePicker() {
 	newCwd.value = "";
 	// the recents list grows while the session runs, so re-read it instead of trusting the first load
 	void loadProjects();
+	// re-read on every open, and start on the local side: the choice is the first thing asked
+	void loadHosts({ force: true });
+	hostAlias.value = "";
+	hostTab.value = "local";
+	deviceForm.value = null;
+	deviceStatus.value = "";
 	void loadBrowse(state.value.cwd || browseHome.value || "~");
 	nextTick(() => {
 		newInput.value?.focus();
@@ -3462,11 +3650,11 @@ function closeWorkspacePicker() {
 async function pickWorkspace(path) {
 	const cwd = String(path || "").trim();
 	if (!cwd) return;
-	if (cwd === state.value.cwd) {
+	if (!hostAlias.value && cwd === state.value.cwd) {
 		closeWorkspacePicker();
 		return;
 	}
-	await startNewSession(cwd, { inline: true });
+	await startNewSession(cwd, { inline: true, host: hostAlias.value });
 }
 
 async function answer(value) {
@@ -3707,7 +3895,7 @@ onBeforeUnmount(() => {
 					<div
 						class="session-group-head"
 						:class="{ current: group.current, disabled: selecting }"
-						:title="group.cwd || 'Unknown project'"
+						:title="group.device ? `${group.device}:${group.cwd}` : group.cwd || 'Unknown project'"
 					>
 						<button
 							type="button"
@@ -3833,7 +4021,7 @@ onBeforeUnmount(() => {
 			</div>
 
 			<div v-else class="sidebar-foot">
-				<span class="muted ellipsis foot-path">{{ state.cwd }}</span>
+				<span class="muted ellipsis foot-path">{{ cwdLabel(state.cwd, state.remote) }}</span>
 				<!-- No nifetun extension, no tunnel control: the bridge reports whether it is usable -->
 				<button
 					v-if="state.tunnelAvailable"
@@ -4320,14 +4508,148 @@ onBeforeUnmount(() => {
 							<svg viewBox="0 0 16 16" aria-hidden="true">
 								<path d="M2.2 4.9a1.5 1.5 0 0 1 1.5-1.5h2.2l1.3 1.6h4.9a1.5 1.5 0 0 1 1.5 1.5v4.6a1.5 1.5 0 0 1-1.5 1.5H3.7a1.5 1.5 0 0 1-1.5-1.5z" />
 							</svg>
-							<span class="workspace-chip-name">{{ projectName(state.cwd) }}</span>
-							<span class="workspace-chip-path ellipsis">{{ state.cwd }}</span>
+							<span class="workspace-chip-name">
+								{{ state.remote ? `ssh:${state.remote.alias}` : projectName(state.cwd) }}
+							</span>
+							<span class="workspace-chip-path ellipsis">
+								{{ state.remote ? state.remote.path : state.cwd }}
+							</span>
 							<svg class="workspace-chip-caret" viewBox="0 0 16 16" aria-hidden="true">
 								<path d="M4.5 6.5L8 10l3.5-3.5" />
 							</svg>
 						</button>
 
 						<div v-if="workspaceMenu" class="menu workspace-menu" role="dialog" aria-label="选择项目目录" @click.stop>
+							<!-- Where the conversation runs comes first: a path means nothing until it is
+							     clear whose filesystem it is on. -->
+							<!-- Where it runs is the first question, asked before any path: this machine, or a
+							     device this extension keeps in its own list. -->
+							<div class="workspace-tabs">
+								<button
+									type="button"
+									class="workspace-tab"
+									:class="{ on: hostTab === 'local' }"
+									@click="switchTab('local')"
+								>
+									<svg viewBox="0 0 16 16" aria-hidden="true">
+										<path d="M2.5 3.5h11v7h-11z" />
+										<path d="M5.5 13h5M8 10.5V13" />
+									</svg>
+									本机
+								</button>
+								<button
+									type="button"
+									class="workspace-tab"
+									:class="{ on: hostTab === 'ssh' }"
+									@click="switchTab('ssh')"
+								>
+									<svg viewBox="0 0 16 16" aria-hidden="true">
+										<path d="M4.5 4.5L1.5 8l3 3.5M11.5 4.5L14.5 8l-3 3.5M9.2 3.2l-2.4 9.6" />
+									</svg>
+									SSH 设备
+								</button>
+							</div>
+
+							<!-- device list: pick one, edit one, or add one -->
+							<div v-if="hostTab === 'ssh' && !deviceForm && !hostAlias" class="workspace-devices">
+								<div v-for="host in hostRows" :key="host.alias" class="workspace-device">
+									<button type="button" class="workspace-device-main" @click="pickHost(host.alias)">
+										<span class="workspace-device-copy">
+											<span class="workspace-device-name">{{ host.label || host.alias }}</span>
+											<span class="workspace-device-target ellipsis">
+												{{ host.user ? `${host.user}@` : "" }}{{ host.host }}{{ host.port ? `:${host.port}` : "" }}
+											</span>
+										</span>
+										<span v-if="host.profile" class="workspace-device-state" title="这个会话里连过一次">
+											{{ host.profile.os || "已连接" }}
+										</span>
+										<svg class="workspace-option-chev" viewBox="0 0 16 16" aria-hidden="true">
+											<path d="M6.5 4.5L10 8l-3.5 3.5" />
+										</svg>
+									</button>
+									<button
+										type="button"
+										class="workspace-device-edit"
+										title="编辑这台设备"
+										@click="startDeviceForm(host)"
+									>
+										<svg viewBox="0 0 16 16" aria-hidden="true">
+											<path d="M11.2 2.8l2 2L6 12H4v-2z" />
+										</svg>
+									</button>
+								</div>
+								<p v-if="!hostRows.length" class="workspace-empty">
+									还没有 SSH 设备。加一台，之后就在这里选它。
+								</p>
+								<button type="button" class="workspace-device-add" @click="startDeviceForm()">
+									<svg viewBox="0 0 16 16" aria-hidden="true">
+										<path d="M8 3.5v9M3.5 8h9" />
+									</svg>
+									添加 SSH 设备
+								</button>
+							</div>
+
+							<!-- the device form: what ssh needs to reach it, nothing else -->
+							<div v-if="deviceForm" class="workspace-device-form">
+								<p class="workspace-label">{{ deviceForm === "new" ? "新设备" : `编辑 ${deviceForm}` }}</p>
+								<div class="workspace-field">
+									<span>名称</span>
+									<input v-model="deviceDraft.alias" type="text" spellcheck="false" placeholder="router" />
+								</div>
+								<div class="workspace-field">
+									<span>主机</span>
+									<input v-model="deviceDraft.host" type="text" spellcheck="false" placeholder="192.168.1.1 或 nas.lan" />
+								</div>
+								<div class="workspace-field-row">
+									<div class="workspace-field">
+										<span>用户</span>
+										<input v-model="deviceDraft.user" type="text" spellcheck="false" placeholder="root" />
+									</div>
+									<div class="workspace-field narrow">
+										<span>端口</span>
+										<input v-model="deviceDraft.port" type="text" inputmode="numeric" placeholder="22" />
+									</div>
+								</div>
+								<div class="workspace-field">
+									<span>私钥</span>
+									<input v-model="deviceDraft.identity" type="text" spellcheck="false" placeholder="~/.ssh/id_ed25519（留空用 ssh-agent）" />
+								</div>
+								<div class="workspace-field">
+									<span>跳板机</span>
+									<input v-model="deviceDraft.proxyJump" type="text" spellcheck="false" placeholder="可选：bastion" />
+								</div>
+								<div class="workspace-field">
+									<span>标签</span>
+									<input v-model="deviceDraft.label" type="text" placeholder="可选：路由器" />
+								</div>
+								<p v-if="deviceStatus" class="workspace-device-status">{{ deviceStatus }}</p>
+								<div class="workspace-device-actions">
+									<button type="button" class="workspace-cancel" @click="deviceForm = null">取消</button>
+									<button
+										v-if="deviceForm !== 'new'"
+										type="button"
+										class="workspace-cancel danger"
+										@click="removeDevice()"
+									>
+										删除
+									</button>
+									<button type="button" class="workspace-cancel" :disabled="deviceBusy" @click="testDevice()">
+										测试连接
+									</button>
+									<button type="button" class="workspace-go" :disabled="deviceBusy" @click="saveDevice()">
+										保存
+									</button>
+								</div>
+							</div>
+
+							<!-- a device is picked: name the directory on it, and a way back up -->
+							<div v-if="hostAlias" class="workspace-back">
+								<button type="button" @click="pickHost('')">‹ 设备列表</button>
+								<span class="workspace-back-name">{{ hostAlias }}</span>
+							</div>
+
+							<!-- naming a directory: on this machine, or on the device just picked -->
+							<template v-if="hostTab === 'local' || hostAlias">
 							<label class="workspace-search">
 								<svg viewBox="0 0 16 16" aria-hidden="true">
 									<circle cx="7" cy="7" r="4.2" />
@@ -4339,7 +4661,7 @@ onBeforeUnmount(() => {
 									type="text"
 									autocomplete="off"
 									spellcheck="false"
-									placeholder="搜索项目，或直接输入路径"
+									:placeholder="hostAlias ? `输入 ${hostAlias} 上的路径` : '搜索项目，或直接输入路径'"
 									@keydown.enter.prevent="pickWorkspace(targetPath)"
 									@keydown.esc.prevent.stop="closeWorkspacePicker()"
 								/>
@@ -4357,7 +4679,22 @@ onBeforeUnmount(() => {
 
 							<!-- typing: known projects, then the typed path as its own "create here" row -->
 							<template v-if="newCwd.trim()">
-								<div v-if="filteredProjects.length" class="workspace-list">
+								<button
+									v-if="hostAlias"
+									type="button"
+									class="workspace-option create"
+									:disabled="newBusy"
+									@click="pickWorkspace(newCwd)"
+								>
+									<svg viewBox="0 0 16 16" aria-hidden="true">
+										<path d="M8 3.5v9M3.5 8h9" />
+									</svg>
+									<span class="workspace-option-copy">
+										<span class="workspace-option-name">在 {{ hostAlias }} 上新建对话</span>
+										<span class="workspace-option-path ellipsis">{{ newCwd.trim() }}</span>
+									</span>
+								</button>
+								<div v-else-if="filteredProjects.length" class="workspace-list">
 									<button
 										v-for="entry in filteredProjects"
 										:key="entry.path"
@@ -4381,7 +4718,7 @@ onBeforeUnmount(() => {
 									</button>
 								</div>
 								<button
-									v-if="newPathRow"
+									v-if="newPathRow && !hostAlias"
 									type="button"
 									class="workspace-option create"
 									:disabled="newBusy"
@@ -4480,18 +4817,21 @@ onBeforeUnmount(() => {
 							<p v-if="newError" class="workspace-error">{{ newError }}</p>
 
 							<div class="workspace-foot">
-								<span class="workspace-target ellipsis" :title="targetPath">{{ targetPath }}</span>
+								<span class="workspace-target ellipsis" :title="targetPath">
+									{{ hostAlias ? `${hostAlias}:${targetPath}` : targetPath }}
+								</span>
 								<span v-if="targetIsTemp" class="workspace-temp" title="临时目录里的会话不会被保留">临时</span>
 								<button type="button" class="workspace-cancel" @click="closeWorkspacePicker()">取消</button>
 								<button
 									type="button"
 									class="workspace-go"
-									:disabled="newBusy || !targetPath || targetPath === state.cwd"
+									:disabled="newBusy || !targetPath || (!hostAlias && targetPath === state.cwd)"
 									@click="pickWorkspace(targetPath)"
 								>
-									{{ targetPath && targetPath === state.cwd ? "已是当前目录" : "在此新建对话" }}
+									{{ !hostAlias && targetPath === state.cwd ? "已是当前目录" : "在此新建对话" }}
 								</button>
 							</div>
+							</template>
 						</div>
 					</div>
 					<div v-if="attachments.length > 0 || files.length > 0" class="attachments">
