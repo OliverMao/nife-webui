@@ -132,14 +132,26 @@ effect of whatever happens to be in `~/.ssh/config`:
               "identity": "~/.ssh/id_ed25519", "proxyJump": "bastion", "label": "路由器" }] }
 ```
 
-`添加 SSH 设备` / edit in the picker's SSH tab writes it: name, host, user, port, key, jump host,
-label, with `测试连接` running a probe and reporting the OS, the user and how many usual commands
-exist. The row keeps the result (`已连接 · 482ms`, or `连接失败` with the reason in the tooltip).
+`添加 SSH 设备` / edit in the picker's SSH tab writes it: name, host, user, port, key, password,
+jump host, label, with `测试连接` running a probe and reporting the OS, the user and how many usual
+commands exist. The row keeps the result (`已连接 · 482ms`, or `连接失败` with the reason in the
+tooltip).
 
-Keys are the only way in (`BatchMode=yes`): a password prompt would block a turn that has no
-terminal to answer it. Host keys are remembered in `~/.nife/agent/ssh_known_hosts` with
-`accept-new`, so a device works the first time it is added while a key that later changes is still
-refused; the user's own `~/.ssh/known_hosts` is never touched.
+Authentication is a key when there is one and a password when there is not. Keys need nothing:
+`BatchMode=yes` is set so a missing key fails fast instead of waiting on a prompt nobody can answer.
+A password has to reach `ssh` without a terminal, so the form's password field is turned into an
+`SSH_ASKPASS` script plus a `0600` file in a private temp directory for the life of the connection
+(removed on close, and anything left behind by a crash is swept an hour later), with
+`NumberOfPasswordPrompts=1` so a wrong password fails once instead of looping.
+
+That password is stored **in clear** in `webui-hosts.json`, which is written `0600` - there is no
+keychain that works the same on Windows, WSL and a server, and pretending otherwise would only
+sound safer. A key is the better answer, and the form says so; `清除密码` removes a stored one
+without touching the rest of the entry.
+
+Host keys are remembered in `~/.nife/agent/ssh_known_hosts` with `accept-new`, so a device works the
+first time it is added while a key that later changes is still refused; the user's own
+`~/.ssh/known_hosts` is never touched.
 
 ## Public URL (nifetun)
 
@@ -695,8 +707,9 @@ task, so opening the page shows the current prompt rather than something from th
 - A device session has no `subagent` tool: a subagent would run on this machine with local tools.
 - `grep` on a device ignores `.gitignore` unless the device has `rg`; the built-in one always
   respects it, this one only when ripgrep is there to read it.
-- A device form covers host/user/port/key/jump host; anything else (extra `-o` options) is still
-  edited in `webui-hosts.json` by hand.
+- A device form covers host/user/port/key/password/jump host; anything else (extra `-o` options) is
+  still edited in `webui-hosts.json` by hand.
+- A stored password is plain text in that file (mode `0600`). Keys avoid the question entirely.
 - `/webui off` is the only way to close the port; quitting the CLI closes it with the process.
 - A published URL needs a nifetun whose extension answers the event bus (the current `main`); an
   older install simply gets no public URL. Reloading the page keeps the token in the address bar,

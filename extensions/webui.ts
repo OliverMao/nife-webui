@@ -43,6 +43,7 @@ import {
 	sshArgs,
 	sshTarget,
 	upsertHost,
+	writeAskpass,
 	VALID_ALIAS,
 	type HostEntry,
 } from "./ssh/hosts.ts";
@@ -1313,8 +1314,11 @@ function remoteConnection(b: Bridge, alias: string): RemoteHost {
 	const known = b.remotes.get(alias);
 	if (known) return known;
 	const entry = findHost(alias);
-	if (!entry) throw new Error(`unknown device: ${alias} (not in ${hostsFile()} or ~/.ssh/config)`);
-	const host = new RemoteHost(entry.alias, sshArgs(entry));
+	if (!entry) throw new Error(`unknown device: ${alias}`);
+	// A stored password becomes an askpass file for the life of this connection: ssh has no terminal
+	// here, and `BatchMode` would refuse to authenticate at all.
+	const askpass = entry.password ? writeAskpass(entry.password) : undefined;
+	const host = new RemoteHost(entry.alias, sshArgs(entry), askpass?.env, askpass?.cleanup);
 	b.remotes.set(alias, host);
 	return host;
 }
@@ -2633,9 +2637,11 @@ function projectPath(b: Bridge, value: string): string {
 function hostRows(
 	b: Bridge,
 ): (HostEntry & { target: string; profile?: HostProfile; status?: { at: number; ms?: number; error?: string } })[] {
-	return readHosts().map((entry) => ({
+	return readHosts().map(({ password, ...entry }) => ({
 		...entry,
 		target: sshTarget(entry),
+		// the password never leaves this process; the page only needs to know that one exists
+		hasPassword: Boolean(password),
 		profile: b.remoteProfiles.get(entry.alias),
 		status: b.remoteStatus.get(entry.alias),
 	}));
@@ -3115,9 +3121,13 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 			if (!host) return send(res, 400, "缺少主机地址");
 			const port = Number(body.port);
 			const text = (value: unknown): string => (typeof value === "string" ? value.trim() : "");
+			// An empty password field means "keep what is saved": the page never receives the old one,
+			// so it cannot send it back. Only an explicit clear removes it.
+			const password = text(body.password) || (body.clearPassword === true ? "" : (previous?.password ?? ""));
 			upsertHost({
 				alias,
 				host,
+				...(password ? { password } : {}),
 				...(text(body.user) ? { user: text(body.user) } : {}),
 				...(Number.isFinite(port) && port > 0 && port < 65536 ? { port } : {}),
 				...(text(body.identity) ? { identity: text(body.identity) } : {}),

@@ -7,8 +7,18 @@
  * plain mirror of what the page shows.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	readdirSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "nife-coding-agent";
 import type { HostProfile } from "./transport.ts";
@@ -22,6 +32,12 @@ export interface HostEntry {
 	identity?: string;
 	proxyJump?: string;
 	label?: string;
+	/**
+	 * Optional password, for a device whose key is not installed yet. It is written in clear in this
+	 * file (mode 0600) because there is no cross-platform keychain to put it in; a key is better and
+	 * the form says so. Never sent to the page - only `hasPassword` travels.
+	 */
+	password?: string;
 	/** extra `-o key=value` pairs, verbatim: whatever their setup needs */
 	options?: string[];
 }
@@ -65,12 +81,19 @@ export function readHosts(): HostEntry[] {
 export function writeHosts(hosts: HostEntry[]): void {
 	const path = hostsFile();
 	mkdirSync(dirname(path), { recursive: true });
-	writeFileSync(path, `${JSON.stringify({ hosts: hosts.map(plainHost) }, null, 2)}\n`, "utf8");
+	writeFileSync(path, `${JSON.stringify({ hosts: hosts.map(plainHost) }, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+	// the file may already exist with wider permissions: `mode` only applies when it is created
+	try {
+		chmodSync(path, 0o600);
+	} catch {
+		// a filesystem without modes (FAT, some network shares) is allowed to say no
+	}
 }
 
 const plainHost = (entry: HostEntry): HostEntry => ({
 	alias: entry.alias,
 	host: entry.host,
+	...(entry.password ? { password: entry.password } : {}),
 	...(entry.user ? { user: entry.user } : {}),
 	...(entry.port ? { port: entry.port } : {}),
 	...(entry.identity ? { identity: entry.identity } : {}),
@@ -114,12 +137,66 @@ export const sshTarget = (entry: HostEntry): string =>
  */
 export const knownHostsFile = (): string => join(getAgentDir(), "ssh_known_hosts");
 
+/**
+ * A password file that outlived its process is a secret on disk. Anything older than an hour is
+ * from a run that crashed rather than one that finished (cleanup removes its own directory), so it
+ * is deleted the next time a password is used. Best effort: a busy tmpdir is not an error.
+ */
+function sweepAskpass(): void {
+	try {
+		const base = tmpdir();
+		for (const name of readdirSync(base)) {
+			if (!name.startsWith("nife-askpass-")) continue;
+			const path = join(base, name);
+			try {
+				if (Date.now() - statSync(path).mtimeMs > 3_600_000) rmSync(path, { recursive: true, force: true });
+			} catch {
+				// vanished between listing and stat
+			}
+		}
+	} catch {
+		// no tmpdir to sweep
+	}
+}
+
+/**
+ * A password ssh can read without a terminal.
+ *
+ * `ssh` never takes a password on stdin; it asks a program named by `SSH_ASKPASS` (with
+ * `SSH_ASKPASS_REQUIRE=force`, which is what makes it work when there *is* a terminal). The
+ * password goes in its own 0600 file next to the script, and both live in a temporary directory
+ * that is removed when the connection closes.
+ */
+export interface Askpass {
+	env: Record<string, string>;
+	cleanup: () => void;
+}
+
+export function writeAskpass(password: string): Askpass {
+	sweepAskpass();
+	const dir = mkdtempSync(join(tmpdir(), "nife-askpass-"));
+	const secret = join(dir, "password");
+	writeFileSync(secret, `${password}\n`, { encoding: "utf8", mode: 0o600 });
+	const windows = process.platform === "win32";
+	const script = join(dir, windows ? "askpass.cmd" : "askpass.sh");
+	writeFileSync(script, windows ? '@echo off\r\ntype "%~dp0password"\r\n' : '#!/bin/sh\nexec cat "$(dirname "$0")/password"\n', {
+		encoding: "utf8",
+		mode: 0o700,
+	});
+	return {
+		// DISPLAY is a formality some builds still check before they run askpass at all
+		env: { SSH_ASKPASS: script, SSH_ASKPASS_REQUIRE: "force", DISPLAY: process.env.DISPLAY ?? ":0" },
+		cleanup: () => rmSync(dir, { recursive: true, force: true }),
+	};
+}
+
 /** The argv ssh needs, without the remote command that `RemoteHost` appends. */
 export function sshArgs(entry: HostEntry): string[] {
+	const password = Boolean(entry.password);
 	const args = [
 		"-T",
-		"-o",
-		"BatchMode=yes",
+		// BatchMode disables password auth entirely, so it only applies to key-only devices
+		...(password ? ["-o", "NumberOfPasswordPrompts=1", "-o", "PreferredAuthentications=publickey,password,keyboard-interactive"] : ["-o", "BatchMode=yes"]),
 		"-o",
 		"StrictHostKeyChecking=accept-new",
 		"-o",

@@ -284,7 +284,7 @@ const hostsLoaded = ref(false);
 const hostTab = ref("local");
 /** `"new"` or the alias being edited; null when no device form is open. */
 const deviceForm = ref(null);
-const deviceDraft = ref({ alias: "", host: "", user: "", port: "", identity: "", proxyJump: "", label: "" });
+const deviceDraft = ref({ alias: "", host: "", user: "", port: "", identity: "", proxyJump: "", label: "", password: "" });
 const deviceStatus = ref("");
 const deviceBad = ref(false);
 const deviceBusy = ref(false);
@@ -1660,6 +1660,41 @@ function switchTab(tab) {
 	nextTick(() => newInput.value?.focus());
 }
 
+/** Only the saved entry knows about a stored password; the page never receives the value itself. */
+const deviceHasPassword = computed(() => {
+	const alias = deviceForm.value;
+	if (!alias) return false;
+	return hostRows.value.find((host) => host.alias === alias)?.hasPassword === true;
+});
+
+/** Drop the saved password without touching the rest of the entry. */
+async function clearDevicePassword() {
+	if (!deviceForm.value || deviceBusy.value) return;
+	deviceBusy.value = true;
+	const result = await postDetailed("hosts/save", {
+		alias: deviceForm.value,
+		host: deviceDraft.value.host.trim() || hostRows.value.find((host) => host.alias === deviceForm.value)?.host,
+		user: deviceDraft.value.user.trim(),
+		port: deviceDraft.value.port.trim(),
+		identity: deviceDraft.value.identity.trim(),
+		proxyJump: deviceDraft.value.proxyJump.trim(),
+		label: deviceDraft.value.label.trim(),
+		clearPassword: true,
+	});
+	deviceBusy.value = false;
+	if (!result.ok) {
+		deviceStatus.value = result.message || "清除失败";
+		deviceBad.value = true;
+		return;
+	}
+	hostRows.value = Array.isArray(result.data?.hosts) ? result.data.hosts : hostRows.value;
+	// the field is a "new password" box: whatever was typed there is not the saved one any more
+	deviceDraft.value.password = "";
+	await loadHosts({ force: true });
+	deviceStatus.value = "已清除密码";
+	deviceBad.value = false;
+}
+
 /** One line about the last attempt, or what the device said it was. */
 function deviceState(host) {
 	if (host.status?.error) return "连接失败";
@@ -1687,6 +1722,8 @@ function startDeviceForm(host) {
 		identity: host?.identity ?? "",
 		proxyJump: host?.proxyJump ?? "",
 		label: host?.label ?? "",
+		// never filled in: the page is not given the stored password, only "there is one"
+		password: "",
 	};
 	nextTick(() => newInput.value?.focus());
 }
@@ -1711,6 +1748,7 @@ async function saveDevice() {
 		identity: draft.identity.trim(),
 		proxyJump: draft.proxyJump.trim(),
 		label: draft.label.trim(),
+		password: draft.password.trim(),
 	});
 	deviceBusy.value = false;
 	if (!result.ok) {
@@ -1746,6 +1784,7 @@ async function testDevice() {
 		identity: draft.identity.trim(),
 		proxyJump: draft.proxyJump.trim(),
 		label: draft.label.trim(),
+		password: draft.password.trim(),
 	});
 	if (!saved.ok) {
 		deviceBusy.value = false;
@@ -1762,7 +1801,8 @@ async function testDevice() {
 		return;
 	}
 	if (!result.data?.ok) {
-		deviceStatus.value = result.data?.error || "连接失败";
+		// the ssh prefix names the alias, which the form already shows
+		deviceStatus.value = String(result.data?.error ?? "连接失败").replace(/^ssh [^:]+: connection [^-]*- /, "");
 		deviceBad.value = true;
 		return;
 	}
@@ -4652,6 +4692,15 @@ onBeforeUnmount(() => {
 										placeholder="~/.ssh/id_ed25519（留空则用 ssh-agent）"
 									/>
 								</label>
+								<label class="workspace-field wide">
+									<span>密码<template v-if="deviceHasPassword">（已保存，留空保持不变）</template></span>
+									<input
+										v-model="deviceDraft.password"
+										type="password"
+										autocomplete="new-password"
+										:placeholder="deviceHasPassword ? '已保存' : '可选：没有密钥时填这里'"
+									/>
+								</label>
 								<label class="workspace-field">
 									<span>跳板机</span>
 									<input v-model="deviceDraft.proxyJump" type="text" spellcheck="false" placeholder="可选" />
@@ -4666,6 +4715,14 @@ onBeforeUnmount(() => {
 								<div class="workspace-device-actions wide">
 									<button v-if="deviceForm !== 'new'" type="button" class="workspace-link danger" @click="removeDevice()">
 										删除
+									</button>
+									<button
+										v-if="deviceHasPassword"
+										type="button"
+										class="workspace-link"
+										@click="clearDevicePassword()"
+									>
+										清除密码
 									</button>
 									<span class="workspace-grow"></span>
 									<button type="button" class="workspace-cancel" @click="deviceForm = null">取消</button>

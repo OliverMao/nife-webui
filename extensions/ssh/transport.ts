@@ -62,6 +62,9 @@ export class RemoteHost {
 	constructor(
 		readonly alias: string,
 		readonly sshArgs: string[],
+		/** extra environment for the ssh child: `SSH_ASKPASS` when the device has a password */
+		private readonly sshEnv: Record<string, string> = {},
+		private readonly onClose: () => void = () => {},
 	) {
 		// The helper reaches the device as an argument: `sh -s` would race the frames that follow it
 		// on stdin, because a shell parses stdin in blocks and can swallow requests before the loop
@@ -83,7 +86,10 @@ export class RemoteHost {
 		if (this.closed) throw new Error(`ssh ${this.alias}: connection was closed`);
 		if (this.child) return;
 		this.opening ??= (async () => {
-			const child = spawn("ssh", [...this.sshArgs, this.script], { stdio: ["pipe", "pipe", "pipe"] });
+			const child = spawn("ssh", [...this.sshArgs, this.script], {
+				stdio: ["pipe", "pipe", "pipe"],
+				env: { ...process.env, ...this.sshEnv },
+			});
 			// A dead ssh surfaces through `exit`; the stdin error that follows is noise.
 			child.stdin.on("error", () => {});
 			child.stdout.setEncoding("utf8");
@@ -353,6 +359,11 @@ export class RemoteHost {
 
 	close(): void {
 		this.closed = true;
+		try {
+			this.onClose();
+		} catch {
+			// a temporary directory that is already gone is not a problem
+		}
 		const child = this.child;
 		this.child = undefined;
 		if (!child) return;
