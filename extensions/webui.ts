@@ -16,7 +16,7 @@ import { readdirSync, readFileSync, readlinkSync } from "node:fs";
 import { mkdir, open, readdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import { homedir, hostname, tmpdir } from "node:os";
+import { homedir, hostname, tmpdir, userInfo } from "node:os";
 import { basename, dirname, extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getAgentDir, SessionManager, sessionEntryToContextMessages, type SessionInfo } from "nife-coding-agent";
@@ -2121,6 +2121,7 @@ function snapshot(b: Bridge, target: Target, metaOnly = false): unknown {
 	return {
 		sid: target.sid,
 		kind: target.kind,
+		machine: MACHINE,
 		sessionId: manager.getSessionId(),
 		sessionFile: manager.getSessionFile(),
 		name: target.kind === "host" ? b.api.getSessionName() : workerName(target.worker),
@@ -2159,27 +2160,85 @@ function snapshot(b: Bridge, target: Target, metaOnly = false): unknown {
 }
 
 /**
- * The browser tab says which machine is behind it: several nife-webui windows are usually open at
- * once, and "nife" alone does not tell them apart. Computed once - the hostname of a process that
- * long-running does not change under it.
+ * Which machine a page belongs to.
+ *
+ * Several windows are usually open at once - a server reached over ssh, a WSL distro, a Windows
+ * box - and a bare hostname is the one label that does not tell them apart: WSL and Windows often
+ * share (or mimic) one, and `ubuntu` is every second container. So the label names the *kind* of
+ * machine first and falls back to the hostname when the kind needs no explaining.
  */
-const PAGE_TITLE = `Nife - ${((): string => {
-	try {
-		return hostname() || "nife";
-	} catch {
-		return "nife";
-	}
-})()}`;
+interface Machine {
+	/** short, always the same for one environment: `WSL:Ubuntu`, `Windows`, `ssh:srv-01`, `srv-01` */
+	label: string;
+	host: string;
+	user: string;
+	platform: string;
+	/** favicon colour: one hue per machine, so truncated tabs still differ at a glance */
+	hue: number;
+}
 
-async function serveStatic(pathname: string, res: ServerResponse): Promise<void> {
+const MACHINE: Machine = (() => {
+	const host = (() => {
+		try {
+			return hostname() || "unknown";
+		} catch {
+			return "unknown";
+		}
+	})();
+	const user = (() => {
+		try {
+			return userInfo().username;
+		} catch {
+			return "";
+		}
+	})();
+	const platform = process.platform;
+	const wsl = (process.env.WSL_DISTRO_NAME ?? "").trim();
+	let label = host;
+	if (wsl) label = `WSL:${wsl.slice(0, 14)}`;
+	else if (platform === "win32") label = "Windows";
+	else if (platform === "darwin") label = "macOS";
+	else if (process.env.SSH_CONNECTION) label = `ssh:${host}`;
+	// FNV-1a over the identity: stable across restarts, different for Windows and WSL on one box
+	let hash = 0x811c9dc5;
+	for (const char of `${label}|${host}`) {
+		hash ^= char.codePointAt(0) ?? 0;
+		hash = Math.imul(hash, 0x01000193) >>> 0;
+	}
+	return { label, host, user, platform, hue: hash % 360 };
+})();
+
+/** The same "N" the CLI uses, tinted per machine; a data uri keeps the shell self-contained. */
+const FAVICON = (() => {
+	const svg =
+		`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">` +
+		`<rect width="32" height="32" rx="9" fill="hsl(${MACHINE.hue},58%,46%)"/>` +
+		`<path d="M10 23V9l12 14V9" fill="none" stroke="#fff" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>` +
+		`</svg>`;
+	return `data:image/svg+xml,${encodeURIComponent(svg)}`;
+})();
+
+const escapeHtml = (text: string): string => text.replace(/[<&"]/g, (c) => (c === "<" ? "&lt;" : c === "&" ? "&amp;" : "&quot;"));
+
+/**
+ * `WSL:Ubuntu · nife-webui`: the machine first, because that is what collides between windows, then
+ * the project, which is what separates two windows on the same machine.
+ */
+function pageTitle(machine: Machine, project: string): string {
+	return [machine.label, project].filter(Boolean).join(" · ");
+}
+
+async function serveStatic(pathname: string, res: ServerResponse, title = pageTitle(MACHINE, "")): Promise<void> {
 	const relative = pathname === "/" ? "index.html" : decodeURIComponent(pathname).replace(/^\/+/, "");
 	const file = resolve(DIST_DIR, relative);
 	if (!file.startsWith(DIST_DIR + sep)) return send(res, 404, `not found: ${pathname}`);
 	try {
 		const body = await readFile(file);
-		// only the shell carries a title; leaving it as "nife" made every window look the same
+		// only the shell carries a title: every tab used to be called "nife"
 		if (relative === "index.html") {
-			const html = body.toString("utf8").replace(/<title>[^<]*<\/title>/, () => `<title>${PAGE_TITLE.replace(/[<&]/g, (c) => (c === "<" ? "&lt;" : "&amp;"))}</title>`);
+			const html = body
+				.toString("utf8")
+				.replace(/<title>[^<]*<\/title>/, () => `<title>${escapeHtml(title)}</title><link rel="icon" href="${FAVICON}">`);
 			return send(res, 200, html, "text/html; charset=utf-8");
 		}
 		send(res, 200, body, CONTENT_TYPES[extname(file)] ?? "application/octet-stream");
@@ -2667,7 +2726,13 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 	if (DEBUG && (mount || req.url !== path)) console.error(`webui ${req.method} ${req.url} -> ${path}`);
 
 	// Static assets carry no session data and are requested without the token.
-	if (req.method === "GET" && !path.startsWith("/api/")) return serveStatic(path, res);
+	if (req.method === "GET" && !path.startsWith("/api/")) {
+		// The title is painted before any script runs, so it names the session this process serves -
+		// `viewSid` is global to the bridge and would hand another tab's project to this one. The page
+		// corrects it as soon as the state arrives (a tab that re-attaches lives somewhere else).
+		const project = b.ctx.cwd;
+		return serveStatic(path, res, pageTitle(MACHINE, project ? basename(project) : ""));
+	}
 
 	const origin = req.headers.origin;
 	if (origin) {

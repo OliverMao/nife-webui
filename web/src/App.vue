@@ -1549,6 +1549,7 @@ async function loadState() {
 	// while this nife process does (a stale one falls back to the re-attach above).
 	setSessionSid(loaded.sid, loaded.sessionFile);
 	state.value = loaded;
+	syncTitle();
 	mode.value = loaded.mode === "chat" ? "chat" : "work";
 	subagents.value = loaded.subagents ?? [];
 	// rows are keyed by message index, so an open row means nothing after a session switch; the same
@@ -1581,6 +1582,18 @@ async function refreshMeta() {
 	const loaded = await response.json();
 	state.value = { ...state.value, ...loaded, messages: state.value.messages };
 	mode.value = loaded.mode === "chat" ? "chat" : "work";
+	syncTitle();
+}
+
+/**
+ * The tab is the window's name: many of them are open at once (a server, a WSL distro, Windows),
+ * so it reads `WSL:Ubuntu · nife-webui` - machine first, project second. Session switches move the
+ * second half without touching the first.
+ */
+function syncTitle() {
+	const machine = state.value?.machine;
+	const project = projectName(state.value?.cwd);
+	document.title = [machine?.label, project].filter(Boolean).join(" · ") || "Nife";
 }
 
 /** The last path segment, for compact project labels next to rows from other projects. */

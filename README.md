@@ -71,9 +71,14 @@ In the CLI session:
 /webui auto               print the current setting
 ```
 
-The tab is titled `Nife - <hostname of the machine running it>`, so several windows opened against
-different machines are distinguishable at a glance. On launch the bridge starts by itself and the
-URL is opened once per process; the tab survives
+Several windows are usually open at once, so the tab is named after what makes it different:
+`<machine> · <project>`. The machine half is `WSL:<distro>` inside WSL, `Windows`, `macOS`,
+`ssh:<host>` for a process reached over ssh, and the hostname otherwise - the kind first, because a
+WSL distro and the Windows host of the same laptop often share one hostname. Each machine also gets
+its own favicon colour (a hash of that label), so truncated tabs still differ at a glance, and the
+project half follows the conversation the tab is switched to.
+
+On launch the bridge starts by itself and the URL is opened once per process; the tab survives
 `/reload`, `/new`, `/resume` and `/fork`, since the bridge keeps its port, token and session
 binding. Autostart is skipped for headless runs (`nife --print`, subagents) and can be turned off
 three ways: `/webui auto off` (persisted in `~/.nife/agent/webui.json`, honors
