@@ -286,6 +286,7 @@ const hostTab = ref("local");
 const deviceForm = ref(null);
 const deviceDraft = ref({ alias: "", host: "", user: "", port: "", identity: "", proxyJump: "", label: "" });
 const deviceStatus = ref("");
+const deviceBad = ref(false);
 const deviceBusy = ref(false);
 
 const browseDir = ref("");
@@ -1659,9 +1660,25 @@ function switchTab(tab) {
 	nextTick(() => newInput.value?.focus());
 }
 
+/** One line about the last attempt, or what the device said it was. */
+function deviceState(host) {
+	if (host.status?.error) return "连接失败";
+	if (host.status?.ms) return `已连接 · ${host.status.ms}ms`;
+	return host.profile?.os || "已连接";
+}
+
+function deviceStateTitle(host) {
+	const when = host.status?.at ? new Date(host.status.at).toLocaleTimeString() : "";
+	if (host.status?.error) return `${when} 连接失败：${host.status.error}`;
+	const parts = [host.profile?.os, host.profile?.kernel].filter(Boolean);
+	if (when) parts.push(`测试于 ${when}`);
+	return parts.join(" · ");
+}
+
 function startDeviceForm(host) {
 	deviceForm.value = host ? host.alias : "new";
 	deviceStatus.value = "";
+	deviceBad.value = false;
 	deviceDraft.value = {
 		alias: host?.alias ?? "",
 		host: host?.host ?? "",
@@ -1680,10 +1697,12 @@ async function saveDevice() {
 	const draft = deviceDraft.value;
 	if (!draft.alias.trim() || !draft.host.trim()) {
 		deviceStatus.value = "名称和主机都要填";
+		deviceBad.value = true;
 		return;
 	}
 	deviceBusy.value = true;
 	deviceStatus.value = "";
+	deviceBad.value = false;
 	const result = await postDetailed("hosts/save", {
 		alias: draft.alias.trim(),
 		host: draft.host.trim(),
@@ -1696,6 +1715,7 @@ async function saveDevice() {
 	deviceBusy.value = false;
 	if (!result.ok) {
 		deviceStatus.value = result.message || "保存失败";
+		deviceBad.value = true;
 		return;
 	}
 	hostRows.value = Array.isArray(result.data?.hosts) ? result.data.hosts : hostRows.value;
@@ -1711,10 +1731,12 @@ async function testDevice() {
 	const draft = deviceDraft.value;
 	if (!draft.alias.trim() || !draft.host.trim()) {
 		deviceStatus.value = "名称和主机都要填";
+		deviceBad.value = true;
 		return;
 	}
 	deviceBusy.value = true;
 	deviceStatus.value = "连接中…";
+	deviceBad.value = false;
 	// The test runs on the saved entry: save first, so what answered is what the session will use.
 	const saved = await postDetailed("hosts/save", {
 		alias: draft.alias.trim(),
@@ -1728,6 +1750,7 @@ async function testDevice() {
 	if (!saved.ok) {
 		deviceBusy.value = false;
 		deviceStatus.value = saved.message || "保存失败";
+		deviceBad.value = true;
 		return;
 	}
 	hostRows.value = Array.isArray(saved.data?.hosts) ? saved.data.hosts : hostRows.value;
@@ -1735,15 +1758,18 @@ async function testDevice() {
 	deviceBusy.value = false;
 	if (!result.ok) {
 		deviceStatus.value = result.message || "连接失败";
+		deviceBad.value = true;
 		return;
 	}
 	if (!result.data?.ok) {
 		deviceStatus.value = result.data?.error || "连接失败";
+		deviceBad.value = true;
 		return;
 	}
 	const profile = result.data.profile ?? {};
 	const tools = Array.isArray(profile.tools) ? profile.tools.length : 0;
 	deviceStatus.value = `连接成功 · ${profile.os || profile.kernel || "unknown"} · ${profile.user || ""}${profile.root ? " (root)" : ""} · ${tools} 个常用命令 · ${result.data.ms}ms`;
+	deviceBad.value = false;
 	await loadHosts({ force: true });
 }
 
@@ -1754,6 +1780,7 @@ async function removeDevice() {
 	deviceBusy.value = false;
 	if (!result.ok) {
 		deviceStatus.value = result.message || "删除失败";
+		deviceBad.value = true;
 		return;
 	}
 	hostRows.value = Array.isArray(result.data?.hosts) ? result.data.hosts : [];
@@ -4560,8 +4587,13 @@ onBeforeUnmount(() => {
 												{{ host.user ? `${host.user}@` : "" }}{{ host.host }}{{ host.port ? `:${host.port}` : "" }}
 											</span>
 										</span>
-										<span v-if="host.profile" class="workspace-device-state" title="这个会话里连过一次">
-											{{ host.profile.os || "已连接" }}
+										<span
+											v-if="host.status || host.profile"
+											class="workspace-device-state"
+											:class="{ online: host.status && !host.status.error, bad: host.status?.error }"
+											:title="deviceStateTitle(host)"
+										>
+											{{ deviceState(host) }}
 										</span>
 										<svg class="workspace-option-chev" viewBox="0 0 16 16" aria-hidden="true">
 											<path d="M6.5 4.5L10 8l-3.5 3.5" />
@@ -4589,50 +4621,54 @@ onBeforeUnmount(() => {
 								</button>
 							</div>
 
-							<!-- the device form: what ssh needs to reach it, nothing else -->
+							<!-- the device form: what ssh needs to reach it, nothing else. Labels sit above
+							     the inputs so every field can be scanned as one column of values. -->
 							<div v-if="deviceForm" class="workspace-device-form">
-								<p class="workspace-label">{{ deviceForm === "new" ? "新设备" : `编辑 ${deviceForm}` }}</p>
-								<div class="workspace-field">
+								<p class="workspace-label wide">
+									{{ deviceForm === "new" ? "新设备" : `编辑 ${deviceForm}` }}
+								</p>
+								<label class="workspace-field">
 									<span>名称</span>
 									<input v-model="deviceDraft.alias" type="text" spellcheck="false" placeholder="router" />
-								</div>
-								<div class="workspace-field">
+								</label>
+								<label class="workspace-field">
 									<span>主机</span>
-									<input v-model="deviceDraft.host" type="text" spellcheck="false" placeholder="192.168.1.1 或 nas.lan" />
-								</div>
-								<div class="workspace-field-row">
-									<div class="workspace-field">
-										<span>用户</span>
-										<input v-model="deviceDraft.user" type="text" spellcheck="false" placeholder="root" />
-									</div>
-									<div class="workspace-field narrow">
-										<span>端口</span>
-										<input v-model="deviceDraft.port" type="text" inputmode="numeric" placeholder="22" />
-									</div>
-								</div>
-								<div class="workspace-field">
+									<input v-model="deviceDraft.host" type="text" spellcheck="false" placeholder="192.168.1.1" />
+								</label>
+								<label class="workspace-field">
+									<span>用户</span>
+									<input v-model="deviceDraft.user" type="text" spellcheck="false" placeholder="root" />
+								</label>
+								<label class="workspace-field">
+									<span>端口</span>
+									<input v-model="deviceDraft.port" type="text" inputmode="numeric" placeholder="22" />
+								</label>
+								<label class="workspace-field wide">
 									<span>私钥</span>
-									<input v-model="deviceDraft.identity" type="text" spellcheck="false" placeholder="~/.ssh/id_ed25519（留空用 ssh-agent）" />
-								</div>
-								<div class="workspace-field">
+									<input
+										v-model="deviceDraft.identity"
+										type="text"
+										spellcheck="false"
+										placeholder="~/.ssh/id_ed25519（留空则用 ssh-agent）"
+									/>
+								</label>
+								<label class="workspace-field">
 									<span>跳板机</span>
-									<input v-model="deviceDraft.proxyJump" type="text" spellcheck="false" placeholder="可选：bastion" />
-								</div>
-								<div class="workspace-field">
+									<input v-model="deviceDraft.proxyJump" type="text" spellcheck="false" placeholder="可选" />
+								</label>
+								<label class="workspace-field">
 									<span>标签</span>
 									<input v-model="deviceDraft.label" type="text" placeholder="可选：路由器" />
-								</div>
-								<p v-if="deviceStatus" class="workspace-device-status">{{ deviceStatus }}</p>
-								<div class="workspace-device-actions">
-									<button type="button" class="workspace-cancel" @click="deviceForm = null">取消</button>
-									<button
-										v-if="deviceForm !== 'new'"
-										type="button"
-										class="workspace-cancel danger"
-										@click="removeDevice()"
-									>
+								</label>
+								<p v-if="deviceStatus" class="workspace-device-status wide" :class="{ bad: deviceBad }">
+									{{ deviceStatus }}
+								</p>
+								<div class="workspace-device-actions wide">
+									<button v-if="deviceForm !== 'new'" type="button" class="workspace-link danger" @click="removeDevice()">
 										删除
 									</button>
+									<span class="workspace-grow"></span>
+									<button type="button" class="workspace-cancel" @click="deviceForm = null">取消</button>
 									<button type="button" class="workspace-cancel" :disabled="deviceBusy" @click="testDevice()">
 										测试连接
 									</button>

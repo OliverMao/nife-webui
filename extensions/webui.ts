@@ -338,6 +338,8 @@ interface Bridge {
 	remotes: Map<string, RemoteHost>;
 	/** What each device turned out to be, asked once per process (OpenWrt is not Debian). */
 	remoteProfiles: Map<string, HostProfile>;
+	/** Last connection attempt per device, so the list can say "connected, 276ms" or "failed". */
+	remoteStatus: Map<string, { at: number; ms?: number; error?: string }>;
 }
 
 interface SwitchOutcome {
@@ -1442,7 +1444,8 @@ function openWorkerSession(
 				noTools: worker.workspace === "chat" ? "all" : undefined,
 				// On a device, nife's tools are the device's tools: same definitions, ssh operations.
 				// Everything else (grep, find, subagent) would quietly run on this machine instead.
-				customTools: remote && remoteHost ? remoteToolDefinitions(remoteHost, remote.path) : undefined,
+				customTools:
+					remote && remoteHost ? remoteToolDefinitions(remoteHost, remote.path, profile?.tools ?? []) : undefined,
 				tools: remote ? [...remoteToolNames] : undefined,
 			});
 			await session.bindExtensions({
@@ -2627,11 +2630,14 @@ function projectPath(b: Bridge, value: string): string {
 }
 
 /** The device list as the page sees it: what this extension saved, plus what was probed. */
-function hostRows(b: Bridge): (HostEntry & { target: string; profile?: HostProfile })[] {
+function hostRows(
+	b: Bridge,
+): (HostEntry & { target: string; profile?: HostProfile; status?: { at: number; ms?: number; error?: string } })[] {
 	return readHosts().map((entry) => ({
 		...entry,
 		target: sshTarget(entry),
 		profile: b.remoteProfiles.get(entry.alias),
+		status: b.remoteStatus.get(entry.alias),
 	}));
 }
 
@@ -3086,17 +3092,16 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 			const started = Date.now();
 			const profile = await host.probe();
 			b.remoteProfiles.set(host.alias, profile);
+			b.remoteStatus.set(host.alias, { at: Date.now(), ms: Date.now() - started });
 			return send(res, 200, JSON.stringify({ ok: true, profile, ms: Date.now() - started }), "application/json");
 		} catch (error) {
 			// a failed probe leaves the cached connection unusable: the next attempt must reconnect
 			host.close();
 			b.remotes.delete(host.alias);
-			return send(
-				res,
-				200,
-				JSON.stringify({ ok: false, error: error instanceof Error ? error.message : "connection failed" }),
-				"application/json",
-			);
+			const reason = error instanceof Error ? error.message : "connection failed";
+			b.remoteStatus.set(host.alias, { at: Date.now(), error: reason });
+			b.remoteProfiles.delete(host.alias);
+			return send(res, 200, JSON.stringify({ ok: false, error: reason }), "application/json");
 		}
 	}
 
@@ -4514,6 +4519,7 @@ async function start(api: ExtensionAPI, ctx: ExtensionContext): Promise<Bridge> 
 		modelRuntime: undefined,
 		remotes: new Map(),
 		remoteProfiles: new Map(),
+		remoteStatus: new Map(),
 		// `b` is only read when a request arrives, after the literal is assigned
 		handle: (req, res) => handle(b, req, res),
 	};

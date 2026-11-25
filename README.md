@@ -105,10 +105,16 @@ run there.
   Windows' OpenSSH cannot multiplex; here the connection stays open and requests are serialized on
   it. Requests are `EXEC` / `READ` / `WRITE` / `STAT` / `LIST` with base64 payloads, so a path with
   spaces or a file with a NUL never has to survive shell quoting.
-- **The tools are nife's tools.** `bash`, `read`, `write`, `edit` and `ls` are the built-in
+- **The tools are nife's tools.** `bash`, `read`, `write`, `edit`, `ls` and `find` are the built-in
   definitions with their operations pointed at the device, so the model sees the same schemas and
-  the same prompt snippets. `grep`/`find` are left out on purpose: the built-in ones run `rg`/`fd`
-  on *this* machine, and a silent search of the wrong disk is worse than no tool.
+  the same prompt snippets. `grep` is rewritten rather than reused - the built-in one spawns
+  ripgrep on *this* machine whatever the operations say - and it runs `rg` when the device has it,
+  `grep -r` when it does not, keeping the built-in output shapes (`path:line: text`, `path-line-
+  text` for context lines).
+- **The stop button stops something.** `EXEC` runs the command in its own session on the device and
+  streams its output, so the frame loop is still listening: aborting a turn sends `KILL`, which
+  takes the process group down. Without that the model loop would stop while the device kept
+  building.
 - **The model is told what it is on.** The first connection probes the device (`uname`, os-release,
   `systemctl`/`uci`/`apk`/`sudo`, user, root) and appends that to the system prompt, so a router is
   not treated like a Debian box.
@@ -126,8 +132,9 @@ effect of whatever happens to be in `~/.ssh/config`:
               "identity": "~/.ssh/id_ed25519", "proxyJump": "bastion", "label": "路由器" }] }
 ```
 
-`新增/编辑` in the picker's SSH tab writes it: name, host, user, port, key, jump host, label, with
-`测试连接` running a probe and reporting the OS, the user and how many usual commands exist.
+`添加 SSH 设备` / edit in the picker's SSH tab writes it: name, host, user, port, key, jump host,
+label, with `测试连接` running a probe and reporting the OS, the user and how many usual commands
+exist. The row keeps the result (`已连接 · 482ms`, or `连接失败` with the reason in the tooltip).
 
 Keys are the only way in (`BatchMode=yes`): a password prompt would block a turn that has no
 terminal to answer it. Host keys are remembered in `~/.nife/agent/ssh_known_hosts` with
@@ -685,10 +692,9 @@ task, so opening the page shows the current prompt rather than something from th
 - If a browser tab closes while a dialog is open, the terminal dialog takes over on the next turn.
 - Markdown is rendered as plain pre-wrapped text. No syntax highlighting yet.
 - One bridge per CLI process; no landing page listing sessions across directories.
-- A device session has no `grep`/`find`/`subagent` (those would run on this machine); use `bash`
-  with `grep -rn` / `find` on the device instead.
-- Aborting a turn stops the model loop but not a command already running on the device: there is
-  nobody left to read its output, and killing it needs a second channel the helper does not have yet.
+- A device session has no `subagent` tool: a subagent would run on this machine with local tools.
+- `grep` on a device ignores `.gitignore` unless the device has `rg`; the built-in one always
+  respects it, this one only when ripgrep is there to read it.
 - A device form covers host/user/port/key/jump host; anything else (extra `-o` options) is still
   edited in `webui-hosts.json` by hand.
 - `/webui off` is the only way to close the port; quitting the CLI closes it with the process.

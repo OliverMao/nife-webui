@@ -6,19 +6,23 @@
  * for the model: nothing in the prompt has to say "you are remote", and no skill has to learn a new
  * tool name.
  *
- * `find` and `grep` are deliberately absent: the built-in ones run `rg`/`fd` locally, and a silent
- * search of this machine's disk is worse than no tool at all. The model uses `bash` there, which is
- * honest about where the command ran.
+ * `grep` is the one exception. The built-in version spawns ripgrep on *this* machine whatever the
+ * operations say, and a silent search of the wrong disk is worse than no tool at all - so it gets
+ * an honest remote implementation here, running `rg` when the device has it and `grep -r` when it
+ * does not. `find` needs nothing special: its built-in definition already delegates to `operations`.
  */
 
+import { Type } from "typebox";
 import {
 	type BashOperations,
 	createBashToolDefinition,
 	createEditToolDefinition,
+	createFindToolDefinition,
 	createLsToolDefinition,
 	createReadToolDefinition,
 	createWriteToolDefinition,
 	type EditOperations,
+	type FindOperations,
 	type LsOperations,
 	type ReadOperations,
 	type ToolDefinition,
@@ -30,7 +34,121 @@ import type { RemoteHost } from "./transport.ts";
 export const shellQuote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
 
 /** The tools a device session is allowed to have. Everything else would run on this machine. */
-export const remoteToolNames = ["read", "bash", "edit", "write", "ls", "web_search"] as const;
+export const remoteToolNames = ["read", "bash", "edit", "write", "ls", "grep", "find", "web_search"] as const;
+
+const GREP_LIMIT = 100;
+const GREP_MAX_LINES = 2000;
+
+/** POSIX join: the device is always a POSIX box, whatever this machine runs. */
+export function remoteResolve(path: string, cwd: string): string {
+	const value = (path || "").trim();
+	if (!value) return cwd || "/";
+	if (value.startsWith("/")) return posixNormalize(value);
+	return posixNormalize(`${cwd || "/"}/${value}`);
+}
+
+function posixNormalize(path: string): string {
+	const parts: string[] = [];
+	for (const part of path.split("/")) {
+		if (!part || part === ".") continue;
+		if (part === "..") parts.pop();
+		else parts.push(part);
+	}
+	return `/${parts.join("/")}`;
+}
+
+const grepSchema = Type.Object({
+	pattern: Type.String({ description: "Search pattern (regex or literal string)" }),
+	path: Type.Optional(Type.String({ description: "Directory or file to search (default: current directory)" })),
+	glob: Type.Optional(Type.String({ description: "Filter files by glob pattern, e.g. '*.ts' or '**/*.spec.ts'" })),
+	ignoreCase: Type.Optional(Type.Boolean({ description: "Case-insensitive search (default: false)" })),
+	literal: Type.Optional(
+		Type.Boolean({ description: "Treat pattern as literal string instead of regex (default: false)" }),
+	),
+	context: Type.Optional(
+		Type.Number({ description: "Number of lines to show before and after each match (default: 0)" }),
+	),
+	limit: Type.Optional(Type.Number({ description: "Maximum number of matches to return (default: 100)" })),
+});
+
+/**
+ * grep on the device. Output is shaped like the built-in one (`path:line: text`, `path-line- text`
+ * for context), because that is what the model was told to expect; the search itself is `rg` when
+ * it exists and `grep -r` when the device is a busybox box.
+ */
+function createGrepDefinition(host: RemoteHost, cwd: string, hasRipgrep: boolean): ToolDefinition {
+	return {
+		name: "grep",
+		label: "grep",
+		description:
+			"Search file contents for a pattern. Returns matching lines with file paths and line numbers. Output is limited to 100 matches or 50KB.",
+		promptSnippet: "Search file contents for patterns (on the device)",
+		parameters: grepSchema as never,
+		async execute(
+			_callId: string,
+			input: unknown,
+			signal: AbortSignal | undefined,
+			_onUpdate: unknown,
+			ctx: { cwd?: string } | undefined,
+		) {
+			const args = input as {
+				pattern: string;
+				path?: string;
+				glob?: string;
+				ignoreCase?: boolean;
+				literal?: boolean;
+				context?: number;
+				limit?: number;
+			};
+			const searchPath = remoteResolve(args.path ?? ".", ctx?.cwd || cwd);
+			const limit = Math.max(1, args.limit ?? GREP_LIMIT);
+			const context = args.context && args.context > 0 ? Math.round(args.context) : 0;
+			// "no such file" has to be an error, and a pipeline would swallow the exit code: ask first
+			if (!(await host.exists(searchPath))) throw new Error(`Path not found: ${searchPath}`);
+			const words: string[] = hasRipgrep
+				? ["rg", "--no-config", "--line-number", "--no-heading", "--color", "never", "--hidden"]
+				: ["grep", "-rn"];
+			if (args.ignoreCase) words.push("-i");
+			if (args.literal) words.push("-F");
+			if (context > 0) words.push("-C", String(context));
+			if (args.glob) hasRipgrep ? words.push("--glob", shellQuote(args.glob)) : words.push(`--include=${shellQuote(args.glob)}`);
+			// `--` before the pattern: a pattern starting with `-` is data, not an option
+			const command = hasRipgrep
+				? `${words.join(" ")} -- ${shellQuote(args.pattern)} ${shellQuote(searchPath)}`
+				: `${words.join(" ")} -e ${shellQuote(args.pattern)} -- ${shellQuote(searchPath)}`;
+			const result = await host.run(`${command} 2>&1 | head -n ${GREP_MAX_LINES}`, "/", 60);
+			if (result.code !== 0 && result.code !== 1) {
+				throw new Error(result.text.trim() || `grep exited with code ${result.code}`);
+			}
+			if (signal?.aborted) throw new Error("Operation aborted");
+			const lines = result.text.split("\n").filter((line) => line.length > 0);
+			const output: string[] = [];
+			let matches = 0;
+			for (const line of lines) {
+				if (line === "--") continue;
+				// `path:12: text` is a match, `path-12- text` a context line; anything else is noise
+				const parsed = /^(.*?)([:-])(\d+)([:-]) ?(.*)$/.exec(line);
+				if (!parsed) {
+					output.push(line);
+					continue;
+				}
+				const [, file, , number, separator, text] = parsed;
+				const isMatch = separator === ":";
+				if (isMatch) {
+					matches += 1;
+					if (matches > limit) break;
+				}
+				const relative = (file ?? "").startsWith(`${searchPath}/`)
+					? (file ?? "").slice(searchPath.length + 1)
+					: file;
+				output.push(`${relative}${isMatch ? ":" : "-"}${number}${isMatch ? ": " : "- "}${text}`);
+			}
+			if (matches === 0) return { content: [{ type: "text", text: "No matches found" }] };
+			if (matches > limit) output.push(`\n[${limit} results limit reached]`);
+			return { content: [{ type: "text", text: output.join("\n") }] };
+		},
+	} as unknown as ToolDefinition;
+}
 
 const IMAGE_TYPES: Array<{ mime: string; test: (head: Buffer) => boolean }> = [
 	{ mime: "image/png", test: (head) => head.length > 8 && head.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) },
@@ -53,7 +171,8 @@ async function detectImageMimeType(host: RemoteHost, path: string): Promise<stri
 	return IMAGE_TYPES.find((entry) => entry.test(head))?.mime ?? null;
 }
 
-export function remoteToolDefinitions(host: RemoteHost, remoteCwd: string): ToolDefinition[] {
+export function remoteToolDefinitions(host: RemoteHost, remoteCwd: string, tools: string[] = []): ToolDefinition[] {
+	const hasRipgrep = tools.some((tool) => /(^|\/)rg$/.test(tool));
 	const bash: BashOperations = {
 		exec: (command, cwd, options) =>
 			host.exec(command, cwd || remoteCwd, {
@@ -99,12 +218,31 @@ export function remoteToolDefinitions(host: RemoteHost, remoteCwd: string): Tool
 		readdir: (path) => host.list(path),
 	};
 
+	// `find` already delegates to `operations` when they exist, so a remote glob is enough for it
+	const find: FindOperations = {
+		exists: (path) => host.exists(path),
+		glob: async (pattern, searchCwd, options) => {
+			const limit = Math.max(1, options.limit);
+			const command = hasRipgrep
+				? `rg --files --hidden -g ${shellQuote(pattern)} ${shellQuote(searchCwd)} 2>/dev/null | head -n ${limit}`
+				: // busybox find has no `**`: keep the last component, which is what a glob usually is
+					`find ${shellQuote(searchCwd)} -type f -name ${shellQuote(pattern.split("/").pop() || pattern)} 2>/dev/null | head -n ${limit}`;
+			const result = await host.run(command, "/", 60);
+			return result.text
+				.split("\n")
+				.map((line) => line.trim())
+				.filter((line) => line.length > 0);
+		},
+	};
+
 	return [
 		createBashToolDefinition(remoteCwd, { operations: bash }) as ToolDefinition,
 		createReadToolDefinition(remoteCwd, { operations: read }) as ToolDefinition,
 		createWriteToolDefinition(remoteCwd, { operations: write }) as ToolDefinition,
 		createEditToolDefinition(remoteCwd, { operations: edit }) as ToolDefinition,
 		createLsToolDefinition(remoteCwd, { operations: ls }) as ToolDefinition,
+		createFindToolDefinition(remoteCwd, { operations: find }) as ToolDefinition,
+		createGrepDefinition(host, remoteCwd, hasRipgrep),
 	];
 }
 
@@ -129,7 +267,7 @@ export function remotePrompt(alias: string, path: string, profile?: { user: stri
 	}
 	lines.push(
 		"",
-		"`grep` and `find` tools are not available in this session - run `grep -rn` / `find` through `bash` instead, on the device. Prefer commands that exist on this device (see the list above) over installing anything.",
+		"Prefer commands that exist on this device (see the list above) over installing anything. A command that is interrupted keeps nothing: there is no terminal here to answer a prompt, so avoid anything interactive.",
 	);
 	return lines.join("\n");
 }

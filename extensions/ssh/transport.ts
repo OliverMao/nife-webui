@@ -229,6 +229,13 @@ export class RemoteHost {
 				const onAbort = () => {
 					this.pending.delete(id);
 					clearTimeout(timer);
+					// The loop on the device is idle waiting for frames, so it can still act: the
+					// command's process group is killed there, not just abandoned here.
+					try {
+						this.write(`KILL ${id}`);
+					} catch {
+						// the connection is already gone; nothing left to kill
+					}
 					reject(new Error("aborted"));
 				};
 				if (options.signal?.aborted) {
@@ -329,7 +336,7 @@ export class RemoteHost {
 			`printf "os %s\\n" "$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null | tr -d '"')"`,
 			// POSIX `command -v` takes one name, and the point of this line is a device where half the
 			// usual tools are missing: ask for each and keep the ones that answered.
-			`printf "tools %s\\n" "$(for tool in sudo systemctl docker git node python3 busybox uci apk opkg apt-get dnf yum; do command -v "$tool" 2>/dev/null; done | tr '\\n' ' ')"`,
+			`printf "tools %s\\n" "$(for tool in sudo systemctl docker git node python3 busybox uci apk opkg apt-get dnf yum rg grep find sed awk; do command -v "$tool" 2>/dev/null; done | tr '\\n' ' ')"`,
 			`printf "root %s\\n" "$(id -u 2>/dev/null)"`,
 		].join("\n");
 		const { text } = await this.run(script, "/", 20);
