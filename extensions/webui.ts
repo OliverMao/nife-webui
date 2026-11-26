@@ -2592,27 +2592,33 @@ function projectGroups(
 	current: { cwd: string; device?: string } = { cwd: b.ctx.cwd },
 ): ProjectGroupInfo[] {
 	const groups = new Map<string, ProjectGroupInfo>();
+	// a device row reads as the name the user gave it ("路由器"), not as the ssh alias
+	const labels = new Map(readHosts().map((host) => [host.alias.toLowerCase(), host.label]));
 	for (const ref of refs) {
 		if (!ref.hasMessage) continue;
-		// group by the comparable path, but keep the spelling the session recorded: the page passes
-		// that `cwd` back when it asks for one project's rows
-		const key = ref.cwd ? projectKey(ref.device, ref.cwd) : "";
+		// A device is one place to look: its /etc, /root and /tmp/build are one group, because a
+		// sidebar with three rows per router stops being a list of projects and becomes a filesystem.
+		// Local projects keep one row per path - there, the path *is* the project.
+		const key = ref.device ? `ssh\n${ref.device.toLowerCase()}` : ref.cwd ? projectKey(undefined, ref.cwd) : "";
 		let group = groups.get(key);
 		if (!group) {
 			// A device path groups as `router:/etc`: `basename` alone would list three projects called
 			// `etc` for three devices, which is exactly the ambiguity this feature is about.
 			group = {
-				cwd: ref.cwd || "",
+				// a device group is about the machine, not one directory on it: `cwd` stays empty and
+				// the rows carry their own path
+				cwd: ref.device ? "" : ref.cwd || "",
 				device: ref.device,
 				name: ref.device
-					? `${ref.device}:${ref.cwd}`
+					? labels.get(ref.device.toLowerCase()) || ref.device
 					: ref.cwd
 						? basename(ref.cwd) || ref.cwd
 						: "Unknown project",
 				count: 0,
 				modified: ref.modified,
-				current:
-					Boolean(ref.cwd) && (ref.device ?? "") === (current.device ?? "") && samePath(ref.cwd, current.cwd),
+				current: ref.device
+					? ref.device === current.device
+					: Boolean(ref.cwd) && !current.device && samePath(ref.cwd, current.cwd),
 			};
 			groups.set(key, group);
 		}
@@ -2666,15 +2672,17 @@ async function sessionInfoFromPath(path: string): Promise<SessionInfo | null> {
 }
 
 async function projectSessionsForCwd(b: Bridge, workspace: Workspace, cwd: string, device?: string): Promise<SessionInfo[]> {
-	const key = `${workspace}\n${projectKey(device, cwd)}`;
+	// device groups have no single cwd: the key is the device, or it would miss every other path
+	const key = `${workspace}\n${device ? `ssh:${device.toLowerCase()}` : projectKey(undefined, cwd)}`;
 	const cached = b.projectSessionCache[key];
 	if (cached && Date.now() - cached.at < SESSION_CACHE_MS) return cached.sessions;
-	const refs = (await workspaceRefs(b, workspace)).filter(
-		(ref) =>
-			ref.hasMessage &&
-			(ref.device ?? "") === (device ?? "") &&
-			(cwd ? samePath(ref.cwd, cwd) : ref.cwd === ""),
-	);
+	const refs = (await workspaceRefs(b, workspace)).filter((ref) => {
+		if (!ref.hasMessage) return false;
+		// a device group is every path on that device; everything else is one local project
+		if (device) return ref.device === device;
+		if (ref.device) return false;
+		return cwd ? samePath(ref.cwd, cwd) : ref.cwd === "";
+	});
 	const infos = await mapLimit(refs, 8, (ref) => sessionInfoFromPath(ref.path));
 	const sessions = infos
 		.filter((session): session is SessionInfo => session !== null && session.messageCount > 0)
@@ -2778,7 +2786,10 @@ async function listGroups(b: Bridge): Promise<unknown> {
 		current: targetCwd(b, viewed),
 		currentFile: targetManager(b, viewed).getSessionFile(),
 		mode: targetWorkspace(b, viewed),
-		groups: groups.map((group) => ({ ...group, key: projectKey(group.device, group.cwd) })),
+		groups: groups.map((group) => ({
+			...group,
+			key: group.device ? `ssh\n${group.device.toLowerCase()}` : projectKey(undefined, group.cwd),
+		})),
 	};
 }
 

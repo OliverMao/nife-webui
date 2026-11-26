@@ -449,6 +449,31 @@ svg {
 	background: var(--accent);
 }
 
+/* a device group: the machine, with each row saying which of its directories it runs in */
+.session-group-device {
+	flex: 0 0 auto;
+	width: 11px;
+	height: 11px;
+	margin-right: -2px;
+	fill: none;
+	stroke: var(--dim);
+	stroke-width: 1.4;
+	stroke-linecap: round;
+	stroke-linejoin: round;
+}
+
+.session-dir {
+	flex: 0 0 auto;
+	max-width: 84px;
+	margin-right: 2px;
+	color: var(--dim);
+	font-family: var(--mono);
+	font-size: 10.5px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
 .session-group-name {
 	flex: 1;
 	min-width: 0;

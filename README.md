@@ -119,8 +119,12 @@ run there.
   `systemctl`/`uci`/`apk`/`sudo`, user, root) and appends that to the system prompt, so a router is
   not treated like a Debian box.
 
+In the sidebar a device is one group, not one group per directory: `路由器` with every conversation
+that ran on it, each row tagged with the directory it ran in (`work`, `etc`, `root`). Three rows per
+router would turn Recents into a filesystem listing.
+
 A device conversation records the device in its session header (`webui.device`) and keeps the real
-remote path as its `cwd`, so the sidebar reads `router:/etc`, the tab reads `ssh:router · etc`, and
+remote path as its `cwd`, so the tab reads `ssh:router · etc`, and
 re-opening the conversation after a reload still runs on the device. That cwd is a path *on the
 device*: the "temporary session" cleanup (a cwd or file under `tmp`/`temp` is thrown away) only ever
 looks at this machine, never at a device path.

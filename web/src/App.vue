@@ -1996,10 +1996,13 @@ async function ensureGroup(key, force = false) {
 	if (!loadingProjects.value.includes(key)) loadingProjects.value = [...loadingProjects.value, key];
 	const job = (async () => {
 		try {
-			// a project is a path *and* a machine: the group carries both, the key carries neither
+			// A device group is one row for the whole machine, so it asks for the device and no path;
+			// everything else asks for exactly one local project directory.
 			const group = groups.value.find((entry) => entry.key === key);
-			const device = group?.device ? `&device=${encodeURIComponent(group.device)}` : "";
-			const response = await fetch(api(`sessions?cwd=${encodeURIComponent(group?.cwd ?? key)}${device}`));
+			const query = group?.device
+				? `device=${encodeURIComponent(group.device)}`
+				: `cwd=${encodeURIComponent(group?.cwd ?? key)}`;
+			const response = await fetch(api(`sessions?${query}`));
 			if (!response.ok) return;
 			const data = await response.json();
 			if (generation !== groupGeneration) return;
@@ -2030,7 +2033,9 @@ async function toggleProjectGroup(group) {
 
 /** Reveal a group and load it, used by session switches, search jumps and new sessions. */
 async function revealProject(cwd, device) {
-	const key = groups.value.find((group) => group.cwd === cwd && (group.device ?? "") === (device ?? ""))?.key;
+	const key = groups.value.find((group) =>
+		device ? group.device === device : !group.device && group.cwd === cwd,
+	)?.key;
 	if (!key) return;
 	expandProject(key);
 	await ensureGroup(key);
@@ -3978,6 +3983,9 @@ onBeforeUnmount(() => {
 								<path d="M4.5 6.5L8 10l3.5-3.5" />
 							</svg>
 							<span v-if="group.current" class="session-group-current" title="Current project"></span>
+							<svg v-if="group.device" class="session-group-device" viewBox="0 0 16 16" aria-hidden="true">
+								<path d="M4.5 4.5L1.5 8l3 3.5M11.5 4.5L14.5 8l-3 3.5M9.2 3.2l-2.4 9.6" />
+							</svg>
 							<span class="session-group-name">{{ group.name }}</span>
 							<span class="session-group-count">{{ group.count }}</span>
 						</button>
@@ -4045,7 +4053,10 @@ onBeforeUnmount(() => {
 							title="已完成，点开查看"
 							aria-label="finished"
 						></span>
-						<span v-if="isPinned(session.path)" class="session-pin" title="Pinned">
+						<span v-if="group.device" class="session-dir" :title="session.cwd">
+							{{ projectName(session.cwd) }}
+						</span>
+							<span v-if="isPinned(session.path)" class="session-pin" title="Pinned">
 								<svg viewBox="0 0 16 16" aria-hidden="true">
 									<path d="M9.6 2.4l4 4-1.7.5-2.3 2.3.5 2.2-1 1L4.4 7.7l1-1 2.2.5L9.9 4.9z" />
 									<path d="M6.3 9.7L3 13" />
