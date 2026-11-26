@@ -284,7 +284,7 @@ const hostsLoaded = ref(false);
 const hostTab = ref("local");
 /** `"new"` or the alias being edited; null when no device form is open. */
 const deviceForm = ref(null);
-const deviceDraft = ref({ alias: "", host: "", user: "", port: "", identity: "", proxyJump: "", label: "", password: "" });
+const deviceDraft = ref({ alias: "", host: "", user: "", port: "", identity: "", proxyJump: "", password: "" });
 const deviceStatus = ref("");
 const deviceBad = ref(false);
 const deviceBusy = ref(false);
@@ -1678,7 +1678,6 @@ async function clearDevicePassword() {
 		port: deviceDraft.value.port.trim(),
 		identity: deviceDraft.value.identity.trim(),
 		proxyJump: deviceDraft.value.proxyJump.trim(),
-		label: deviceDraft.value.label.trim(),
 		clearPassword: true,
 	});
 	deviceBusy.value = false;
@@ -1721,7 +1720,6 @@ function startDeviceForm(host) {
 		port: host?.port ? String(host.port) : "",
 		identity: host?.identity ?? "",
 		proxyJump: host?.proxyJump ?? "",
-		label: host?.label ?? "",
 		// never filled in: the page is not given the stored password, only "there is one"
 		password: "",
 	};
@@ -1747,7 +1745,6 @@ async function saveDevice() {
 		port: draft.port.trim(),
 		identity: draft.identity.trim(),
 		proxyJump: draft.proxyJump.trim(),
-		label: draft.label.trim(),
 		password: draft.password.trim(),
 	});
 	deviceBusy.value = false;
@@ -1783,7 +1780,6 @@ async function testDevice() {
 		port: draft.port.trim(),
 		identity: draft.identity.trim(),
 		proxyJump: draft.proxyJump.trim(),
-		label: draft.label.trim(),
 		password: draft.password.trim(),
 	});
 	if (!saved.ok) {
@@ -4637,7 +4633,7 @@ onBeforeUnmount(() => {
 								<div v-for="host in hostRows" :key="host.alias" class="workspace-device">
 									<button type="button" class="workspace-device-main" @click="pickHost(host.alias)">
 										<span class="workspace-device-copy">
-											<span class="workspace-device-name">{{ host.label || host.alias }}</span>
+											<span class="workspace-device-name">{{ host.alias }}</span>
 											<span class="workspace-device-target ellipsis">
 												{{ host.user ? `${host.user}@` : "" }}{{ host.host }}{{ host.port ? `:${host.port}` : "" }}
 											</span>
@@ -4716,13 +4712,9 @@ onBeforeUnmount(() => {
 										:placeholder="deviceHasPassword ? '已保存' : '可选：没有密钥时填这里'"
 									/>
 								</label>
-								<label class="workspace-field">
+								<label class="workspace-field wide">
 									<span>跳板机</span>
 									<input v-model="deviceDraft.proxyJump" type="text" spellcheck="false" placeholder="可选" />
-								</label>
-								<label class="workspace-field">
-									<span>标签</span>
-									<input v-model="deviceDraft.label" type="text" placeholder="可选：路由器" />
 								</label>
 								<p v-if="deviceStatus" class="workspace-device-status wide" :class="{ bad: deviceBad }">
 									{{ deviceStatus }}

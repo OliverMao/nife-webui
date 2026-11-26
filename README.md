@@ -119,7 +119,7 @@ run there.
   `systemctl`/`uci`/`apk`/`sudo`, user, root) and appends that to the system prompt, so a router is
   not treated like a Debian box.
 
-In the sidebar a device is one group, not one group per directory: `路由器` with every conversation
+In the sidebar a device is one group, not one group per directory: `router` with every conversation
 that ran on it, each row tagged with the directory it ran in (`work`, `etc`, `root`). Three rows per
 router would turn Recents into a filesystem listing.
 
@@ -140,12 +140,13 @@ effect of whatever happens to be in `~/.ssh/config`:
 
 ```json
 { "hosts": [{ "alias": "router", "host": "192.168.1.1", "user": "root", "port": 22,
-              "identity": "~/.ssh/id_ed25519", "proxyJump": "bastion", "label": "路由器" }] }
+              "identity": "~/.ssh/id_ed25519", "proxyJump": "bastion" }] }
 ```
 
 `添加 SSH 设备` / edit in the picker's SSH tab writes it: name, host, user, port, key, password,
-jump host, label, with `测试连接` running a probe and reporting the OS, the user and how many usual
-commands exist. The row keeps the result (`已连接 · 482ms`, or `连接失败` with the reason in the
+jump host, with `测试连接` running a probe and reporting the OS, the user and how many usual
+commands exist. The name *is* the identity - it is what the sidebar groups by and what `ssh:<name>`
+means in the tab title and the session header. The row keeps the result (`已连接 · 482ms`, or `连接失败` with the reason in the
 tooltip).
 
 Authentication is a key when there is one and a password when there is not. Keys need nothing:

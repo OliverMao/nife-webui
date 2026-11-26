@@ -2592,8 +2592,6 @@ function projectGroups(
 	current: { cwd: string; device?: string } = { cwd: b.ctx.cwd },
 ): ProjectGroupInfo[] {
 	const groups = new Map<string, ProjectGroupInfo>();
-	// a device row reads as the name the user gave it ("路由器"), not as the ssh alias
-	const labels = new Map(readHosts().map((host) => [host.alias.toLowerCase(), host.label]));
 	for (const ref of refs) {
 		if (!ref.hasMessage) continue;
 		// A device is one place to look: its /etc, /root and /tmp/build are one group, because a
@@ -2610,7 +2608,7 @@ function projectGroups(
 				cwd: ref.device ? "" : ref.cwd || "",
 				device: ref.device,
 				name: ref.device
-					? labels.get(ref.device.toLowerCase()) || ref.device
+					? ref.device
 					: ref.cwd
 						? basename(ref.cwd) || ref.cwd
 						: "Unknown project",
@@ -3210,7 +3208,6 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 				...(Number.isFinite(port) && port > 0 && port < 65536 ? { port } : {}),
 				...(text(body.identity) ? { identity: text(body.identity) } : {}),
 				...(text(body.proxyJump) ? { proxyJump: text(body.proxyJump) } : {}),
-				...(text(body.label) ? { label: text(body.label) } : {}),
 				...(Array.isArray(body.options)
 					? { options: body.options.filter((option): option is string => typeof option === "string" && option.length > 0) }
 					: previous?.options?.length

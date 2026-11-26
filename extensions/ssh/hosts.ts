@@ -31,7 +31,6 @@ export interface HostEntry {
 	port?: number;
 	identity?: string;
 	proxyJump?: string;
-	label?: string;
 	/**
 	 * Optional password, for a device whose key is not installed yet. It is written in clear in this
 	 * file (mode 0600) because there is no cross-platform keychain to put it in; a key is better and
@@ -75,7 +74,9 @@ export function readHosts(): HostEntry[] {
 	const list = Array.isArray(file.hosts) ? file.hosts : [];
 	return list
 		.filter((entry): entry is HostEntry => Boolean(entry) && typeof entry.alias === "string" && entry.alias.length > 0)
-		.map((entry) => ({ ...entry, alias: entry.alias.trim() }));
+		// normalized through the same shape that is written: a key this version does not know (an old
+		// `label`, a typo) must not reach the page and must not survive the next save
+		.map((entry) => plainHost({ ...entry, alias: entry.alias.trim() }));
 }
 
 export function writeHosts(hosts: HostEntry[]): void {
@@ -98,7 +99,6 @@ const plainHost = (entry: HostEntry): HostEntry => ({
 	...(entry.port ? { port: entry.port } : {}),
 	...(entry.identity ? { identity: entry.identity } : {}),
 	...(entry.proxyJump ? { proxyJump: entry.proxyJump } : {}),
-	...(entry.label ? { label: entry.label } : {}),
 	...(entry.options?.length ? { options: entry.options } : {}),
 });
 
