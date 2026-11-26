@@ -178,10 +178,12 @@ What differs is everything around the local `ssh.exe`:
   sees it, so every path is normalized back (`C:\etc\nginx` -> `/etc/nginx`) before it is sent.
 - `UserKnownHostsFile` is quoted when the profile path contains a space.
 
-**Passwords are the one part that is not Windows-ready.** `ssh` asks for a password through a
-program named by `SSH_ASKPASS`, and Windows runs that program with `CreateProcess`, which does not
-start a `.cmd`. A device that needs a password reports the failure with that hint; use a key (or
-`ssh-agent`) for devices you reach from Windows.
+Passwords work here too, which is worth stating because the mechanism looks like it should not:
+`ssh` asks for a password through the program named by `SSH_ASKPASS`, and Windows' `ssh.exe` starts
+that with its own `posix_spawnp` - which does run a `.cmd`. Tested against Windows OpenSSH 9.5p1
+with `SSH_ASKPASS_REQUIRE=force`, a `.cmd` under a path containing spaces, and the password in a
+separate `0600` file (the shape this extension writes). No askpass `.exe` is needed, and the
+official Win32-OpenSSH release does not ship one either.
 
 ## Public URL (nifetun)
 

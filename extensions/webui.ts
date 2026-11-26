@@ -2704,19 +2704,6 @@ function projectPath(b: Bridge, value: string): string {
 	return resolve(b.ctx.cwd || PROJECTS_ROOT, input);
 }
 
-/**
- * Windows' ssh asks for a password through a program it launches, and a `.cmd` is not something
- * `CreateProcess` runs directly, so the askpass script may never start there. The error alone
- * ("connection exit 255") says nothing about that, so say it.
- */
-function describeConnectError(error: unknown, usesPassword: boolean): string {
-	const reason = error instanceof Error ? error.message : "connection failed";
-	if (process.platform !== "win32" || !usesPassword) return reason;
-	return `${reason}（Windows 的 ssh 可能无法用脚本读取密码，请改用密钥或 ssh-agent）`;
-}
-
-const entryPassword = (b: Bridge, alias: string): boolean => Boolean(findHost(alias)?.password);
-
 /** The device list as the page sees it: what this extension saved, plus what was probed. */
 function hostRows(
 	b: Bridge,
@@ -3193,7 +3180,7 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 			host.close();
 			const state = remoteState(b);
 			state.hosts.delete(host.alias);
-			const reason = describeConnectError(error, Boolean(entryPassword(b, alias)));
+			const reason = error instanceof Error ? error.message : "connection failed";
 			state.status.set(host.alias, { at: Date.now(), error: reason });
 			state.profiles.delete(host.alias);
 			return send(res, 200, JSON.stringify({ ok: false, error: reason }), "application/json");
