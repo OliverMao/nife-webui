@@ -2033,8 +2033,11 @@ function hoverScrollStart(event) {
 	if (!clip || !strip) return;
 	const overflow = strip.offsetWidth - clip.clientWidth;
 	if (overflow <= 6) return;
-	strip.style.setProperty("--shift", `-${overflow + 10}px`);
-	strip.style.setProperty("--marquee-time", `${Math.max(1.6, (overflow + 10) / 24)}s`);
+	// ~150px/s: fast enough to read along with, slow enough not to blur. The cap keeps a very long
+	// title from taking forever, and the floor keeps a one-glyph overflow from snapping.
+	const distance = overflow + 10;
+	strip.style.setProperty("--shift", `-${distance}px`);
+	strip.style.setProperty("--marquee-time", `${Math.min(6, Math.max(0.5, distance / 150))}s`);
 	strip.classList.add("marquee");
 }
 
