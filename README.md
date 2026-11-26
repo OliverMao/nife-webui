@@ -307,7 +307,11 @@ From the browser:
   started there keeps going while the page reads something else, and every per-session endpoint
   takes a `sid` so a turn is never confused with the conversation next to it. Rows show a blue
   spinner while a turn runs and a green dot when it finished unattended, with a toast naming the
-  conversation; opening the row clears the dot. A running conversation can still be aborted, or
+  conversation; opening the row clears the dot. The row state comes from the event stream: a list
+  response that was computed before the last status event is not allowed to overwrite it (a turn
+  that ended while the request was in flight kept its spinner until a page refresh), a pinned row is
+  patched in its own copy of the list, and a reconnected stream re-reads the list instead of waiting
+  for a refresh. A running conversation can still be aborted, or
   deleted (which stops it first). Idle runtimes are rebuilt from the session file on the next visit,
   and the page remembers which conversation it was on across reloads A trash button on each
   project header deletes that workspace's conversations after one confirmation; the project

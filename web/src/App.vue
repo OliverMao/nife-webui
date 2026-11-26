@@ -1372,13 +1372,44 @@ function stampEntryId(entryId) {
 }
 
 /** Sidebar rows of every project that is loaded, so a status event can patch them in place. */
+/**
+ * The last status the bridge sent for a conversation, plus a clock counting those events.
+ *
+ * Rows arrive over HTTP while `session_status` travels over the event stream, so a turn that ends
+ * while a list request is in flight produces a response computed *before* the end. Storing that
+ * response would put the spinner back on a finished conversation - and nothing would fetch again, so
+ * it stayed there until a page refresh. A fetch therefore notes the clock and, if any status arrived
+ * while it was in flight, its rows pass through this map before they are stored: the event wins,
+ * because it is the newer fact.
+ */
+const liveStatus = new Map();
+let statusClock = 0;
+
+function rememberStatus(path, running, done) {
+	if (!path) return;
+	liveStatus.set(path, { running: Boolean(running), done: Boolean(done) });
+	statusClock += 1;
+}
+
+function withLiveStatus(rows, clock) {
+	if (statusClock === clock) return rows;
+	return rows.map((row) => {
+		const known = liveStatus.get(row.path);
+		return known ? { ...row, ...known } : row;
+	});
+}
+
 function patchSessionRow(path, patch) {
 	if (!path) return;
+	if ("running" in patch) rememberStatus(path, patch.running, patch.done);
 	const found = sessions.value.find((session) => session.path === path);
 	if (found) Object.assign(found, patch);
 	for (const rows of Object.values(sessionsByProject.value)) {
 		for (const session of rows) if (session.path === path) Object.assign(session, patch);
 	}
+	// A pinned conversation is a *copy* of a row in its own list; if the patch misses it, the top of
+	// the sidebar keeps spinning over a turn that ended.
+	for (const session of pinnedRows.value) if (session.path === path) Object.assign(session, patch);
 }
 
 /** A background turn finished while the reader was elsewhere: dot on the row, toast on the page. */
@@ -1549,8 +1580,17 @@ function handle(payload) {
 
 function connect() {
 	source = new EventSource(api("events"));
+	let opened = false;
 	source.onopen = () => {
 		online.value = true;
+		// The stream reconnects on its own, and every status sent while it was down is gone: a turn
+		// that ended in the gap would keep its spinner forever. The first open needs nothing - the
+		// page has just loaded - but a reopen reads the truth again instead of waiting for a refresh.
+		if (opened) {
+			void loadGroups({ refresh: true });
+			void loadState().catch(() => {});
+		}
+		opened = true;
 	};
 	source.onerror = () => {
 		online.value = false;
@@ -2012,11 +2052,15 @@ async function ensureGroup(key, force = false) {
 			const query = group?.device
 				? `device=${encodeURIComponent(group.device)}`
 				: `cwd=${encodeURIComponent(group?.cwd ?? key)}`;
+			const clock = statusClock;
 			const response = await fetch(api(`sessions?${query}`));
 			if (!response.ok) return;
 			const data = await response.json();
 			if (generation !== groupGeneration) return;
-			sessionsByProject.value = { ...sessionsByProject.value, [key]: data.sessions ?? [] };
+			sessionsByProject.value = {
+				...sessionsByProject.value,
+				[key]: withLiveStatus(Array.isArray(data.sessions) ? data.sessions : [], clock),
+			};
 			if (data.current) currentFile.value = data.current;
 		} catch {
 			// the group stays folded-empty; opening it again retries
@@ -2213,10 +2257,11 @@ async function refreshPinnedRows() {
 		return;
 	}
 	try {
+		const clock = statusClock;
 		const response = await fetch(api(`sessions/pins?paths=${encodeURIComponent(paths.join(","))}`));
 		if (!response.ok) return;
 		const data = await response.json();
-		pinnedRows.value = Array.isArray(data.sessions) ? data.sessions : [];
+		pinnedRows.value = withLiveStatus(Array.isArray(data.sessions) ? data.sessions : [], clock);
 	} catch {
 		// a section that cannot load is better empty than wrong
 	}
