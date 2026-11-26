@@ -3693,13 +3693,17 @@ function toggleWorkspacePicker() {
 	newCwd.value = "";
 	// the recents list grows while the session runs, so re-read it instead of trusting the first load
 	void loadProjects();
-	// re-read on every open, and start on the local side: the choice is the first thing asked
 	void loadHosts({ force: true });
-	hostAlias.value = "";
-	hostTab.value = "local";
+	// A device conversation opens on its own device and directory. Preselecting 本机 here made
+	// picking a folder on that device look like it did nothing: the browser walked this machine.
+	const remote = state.value.remote;
+	hostAlias.value = remote?.alias ?? "";
+	hostTab.value = remote ? "ssh" : "local";
 	deviceForm.value = null;
 	deviceStatus.value = "";
-	void loadBrowse(state.value.cwd || browseHome.value || "~");
+	browseDir.value = "";
+	browseDirs.value = [];
+	void loadBrowse(remote?.path || state.value.cwd || browseHome.value || "~");
 	nextTick(() => {
 		newInput.value?.focus();
 		newInput.value?.select();

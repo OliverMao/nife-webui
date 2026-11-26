@@ -57,6 +57,8 @@ export class RemoteHost {
 	private queue: Promise<unknown> = Promise.resolve();
 	private counter = 0;
 	private closed = false;
+	/** Last frame the device answered for; the bridge closes connections nobody is using. */
+	lastUsed = Date.now();
 	private readonly script: string;
 
 	constructor(
@@ -74,6 +76,7 @@ export class RemoteHost {
 
 	/** Serialized: shell requests do not interleave, and neither do their answers. */
 	private enqueue<T>(run: () => Promise<T>): Promise<T> {
+		this.lastUsed = Date.now();
 		const next = this.queue.then(run, run);
 		this.queue = next.then(
 			() => undefined,
@@ -358,6 +361,7 @@ export class RemoteHost {
 	}
 
 	close(): void {
+		if (this.closed) return;
 		this.closed = true;
 		try {
 			this.onClose();

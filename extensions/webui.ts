@@ -336,11 +336,15 @@ interface Bridge {
 	 * streamed per connection, so opening a second one for a second conversation would pay for the
 	 * same handshake twice and leave two shells idling on the device.
 	 */
-	remotes: Map<string, RemoteHost>;
+	/**
+	 * Optional because `/reload` reuses the bridge object from an older module: a field added here is
+	 * simply absent on a bridge that was built before it existed. Always go through `remoteState()`.
+	 */
+	remotes?: Map<string, RemoteHost>;
 	/** What each device turned out to be, asked once per process (OpenWrt is not Debian). */
-	remoteProfiles: Map<string, HostProfile>;
+	remoteProfiles?: Map<string, HostProfile>;
 	/** Last connection attempt per device, so the list can say "connected, 276ms" or "failed". */
-	remoteStatus: Map<string, { at: number; ms?: number; error?: string }>;
+	remoteStatus?: Map<string, { at: number; ms?: number; error?: string }>;
 }
 
 interface SwitchOutcome {
@@ -1191,6 +1195,17 @@ function focusSession(b: Bridge, sid: string): void {
 	if (sid === "host") hostStatus(b);
 }
 
+/** The device connection is only worth keeping while some conversation still runs on it. */
+function releaseRemote(b: Bridge, device: string | undefined): void {
+	if (!device) return;
+	for (const other of b.workers.values()) if (other.device === device) return;
+	const state = remoteState(b);
+	const host = state.hosts.get(device);
+	if (!host) return;
+	host.close();
+	state.hosts.delete(device);
+}
+
 function disposeWorker(b: Bridge, worker: Worker): void {
 	b.workers.delete(worker.sid);
 	if (b.workersByPath.get(pathKey(worker.path)) === worker.sid) b.workersByPath.delete(pathKey(worker.path));
@@ -1205,6 +1220,8 @@ function disposeWorker(b: Bridge, worker: Worker): void {
 		// same: dispose is best effort
 	}
 	if (b.viewSid === worker.sid) focusSession(b, "host");
+	// after the removal above, so the worker itself is not counted as still using the device
+	releaseRemote(b, worker.device);
 }
 
 /** Oldest idle worker, or undefined when every slot is busy (or the page is looking at it). */
@@ -1216,6 +1233,25 @@ function evictable(b: Bridge): Worker | undefined {
 }
 
 /** Drop runtimes nobody is using: their session files are the history, the memory is not. */
+/**
+ * Close device connections that no conversation is attached to any more.
+ *
+ * A connection whose worker still exists is kept even while idle: the worker's tools hold that
+ * exact object, so dropping it would break the next turn instead of saving anything. Workers are
+ * themselves evicted when idle (`sweepWorkers`), and that path closes the connection immediately -
+ * this sweep only catches what is left over, such as the connection a `测试连接` opened.
+ */
+function sweepRemotes(b: Bridge, now = Date.now()): void {
+	const attached = new Set<string>();
+	for (const worker of b.workers.values()) if (worker.device) attached.add(worker.device);
+	for (const [alias, host] of remoteState(b).hosts) {
+		if (attached.has(alias)) continue;
+		if (now - host.lastUsed < REMOTE_IDLE_MS) continue;
+		host.close();
+		remoteState(b).hosts.delete(alias);
+	}
+}
+
 function sweepWorkers(b: Bridge): void {
 	const now = Date.now();
 	for (const worker of [...b.workers.values()]) {
@@ -1310,8 +1346,25 @@ async function createAttachedSession(
  * An alias that is not in the device list is a session from another machine or an edited config:
  * it fails loudly here, once, rather than as a confusing "connection closed" inside a turn.
  */
+/**
+ * The three maps a device feature needs, created on first use. `/reload` re-runs this module while
+ * keeping the bridge that the previous run left on globalThis, so a bridge can predate these fields
+ * and reading `b.remotes.get` would throw inside the first request after a reload.
+ */
+function remoteState(b: Bridge): {
+	hosts: Map<string, RemoteHost>;
+	profiles: Map<string, HostProfile>;
+	status: Map<string, { at: number; ms?: number; error?: string }>;
+} {
+	b.remotes ??= new Map();
+	b.remoteProfiles ??= new Map();
+	b.remoteStatus ??= new Map();
+	return { hosts: b.remotes, profiles: b.remoteProfiles, status: b.remoteStatus };
+}
+
 function remoteConnection(b: Bridge, alias: string): RemoteHost {
-	const known = b.remotes.get(alias);
+	const { hosts } = remoteState(b);
+	const known = hosts.get(alias);
 	if (known) return known;
 	const entry = findHost(alias);
 	if (!entry) throw new Error(`unknown device: ${alias}`);
@@ -1319,7 +1372,7 @@ function remoteConnection(b: Bridge, alias: string): RemoteHost {
 	// here, and `BatchMode` would refuse to authenticate at all.
 	const askpass = entry.password ? writeAskpass(entry.password) : undefined;
 	const host = new RemoteHost(entry.alias, sshArgs(entry), askpass?.env, askpass?.cleanup);
-	b.remotes.set(alias, host);
+	hosts.set(alias, host);
 	return host;
 }
 
@@ -1340,11 +1393,12 @@ function remoteExtensionFor(alias: string, path: string, profile?: HostProfile) 
 
 /** Ask once per process what a device is; a probe failure must not break the session. */
 async function deviceProfile(b: Bridge, host: RemoteHost): Promise<HostProfile | undefined> {
-	const cached = b.remoteProfiles.get(host.alias);
+	const { profiles } = remoteState(b);
+	const cached = profiles.get(host.alias);
 	if (cached) return cached;
 	try {
 		const profile = await host.probe();
-		b.remoteProfiles.set(host.alias, profile);
+		profiles.set(host.alias, profile);
 		return profile;
 	} catch {
 		return undefined;
@@ -2365,6 +2419,13 @@ async function serveStatic(pathname: string, res: ServerResponse, title = pageTi
 	}
 }
 
+/**
+ * An ssh connection is not free on the device: it holds a shell, a pty-less session and a slot in
+ * sshd's MaxSessions. Nothing should stay connected just because it was once used, so a connection
+ * with no traffic for this long is closed - the next turn on that device reopens it in ~300ms.
+ */
+const REMOTE_IDLE_MS = 10 * 60 * 1000;
+
 const SESSION_CACHE_MS = 2500;
 const INDEX_CACHE_MS = 4000;
 
@@ -2485,7 +2546,11 @@ async function workspaceRefs(b: Bridge, workspace: Workspace): Promise<SessionRe
 		// A session whose project or file lives under a temp path is a throwaway run: forget the row
 		// and delete the file, so neither this scan nor the next one has to look at it again. The
 		// session this process is running is never deleted, even when it happens to live there.
-		if (isTempPath(ref.cwd) || isTempPath(ref.path)) {
+		//
+		// `ref.device` is the exception that matters: its cwd is a path *on another machine*, where
+		// `/tmp/build` is a perfectly ordinary place to work. Judging it by this machine's temp roots
+		// deleted device conversations the moment the sidebar scanned for them.
+		if (!ref.device && (isTempPath(ref.cwd) || isTempPath(ref.path))) {
 			if (!live.has(resolve(ref.path))) {
 				await rm(ref.path, { force: true }).catch(() => {});
 				dropped = true;
@@ -2637,13 +2702,14 @@ function projectPath(b: Bridge, value: string): string {
 function hostRows(
 	b: Bridge,
 ): (HostEntry & { target: string; profile?: HostProfile; status?: { at: number; ms?: number; error?: string } })[] {
+	const { profiles, status } = remoteState(b);
 	return readHosts().map(({ password, ...entry }) => ({
 		...entry,
 		target: sshTarget(entry),
 		// the password never leaves this process; the page only needs to know that one exists
 		hasPassword: Boolean(password),
-		profile: b.remoteProfiles.get(entry.alias),
-		status: b.remoteStatus.get(entry.alias),
+		profile: profiles.get(entry.alias),
+		status: status.get(entry.alias),
 	}));
 }
 
@@ -3097,16 +3163,17 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		try {
 			const started = Date.now();
 			const profile = await host.probe();
-			b.remoteProfiles.set(host.alias, profile);
-			b.remoteStatus.set(host.alias, { at: Date.now(), ms: Date.now() - started });
+			remoteState(b).profiles.set(host.alias, profile);
+			remoteState(b).status.set(host.alias, { at: Date.now(), ms: Date.now() - started });
 			return send(res, 200, JSON.stringify({ ok: true, profile, ms: Date.now() - started }), "application/json");
 		} catch (error) {
 			// a failed probe leaves the cached connection unusable: the next attempt must reconnect
 			host.close();
-			b.remotes.delete(host.alias);
+			const state = remoteState(b);
+			state.hosts.delete(host.alias);
 			const reason = error instanceof Error ? error.message : "connection failed";
-			b.remoteStatus.set(host.alias, { at: Date.now(), error: reason });
-			b.remoteProfiles.delete(host.alias);
+			state.status.set(host.alias, { at: Date.now(), error: reason });
+			state.profiles.delete(host.alias);
 			return send(res, 200, JSON.stringify({ ok: false, error: reason }), "application/json");
 		}
 	}
@@ -3143,12 +3210,14 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 			deleteHost(alias);
 		}
 		// Edited or removed settings must not be served by a connection opened with the old ones.
-		const live = b.remotes.get(alias);
+		const state = remoteState(b);
+		const live = state.hosts.get(alias);
 		if (live) {
 			live.close();
-			b.remotes.delete(alias);
+			state.hosts.delete(alias);
 		}
-		b.remoteProfiles.delete(alias);
+		state.profiles.delete(alias);
+		state.status.delete(alias);
 		return send(res, 200, JSON.stringify({ ok: true, hosts: hostRows(b) }), "application/json");
 	}
 
@@ -4534,7 +4603,10 @@ async function start(api: ExtensionAPI, ctx: ExtensionContext): Promise<Bridge> 
 		handle: (req, res) => handle(b, req, res),
 	};
 
-	const sweep = setInterval(() => sweepWorkers(b), 5 * 60 * 1000);
+	const sweep = setInterval(() => {
+		sweepWorkers(b);
+		sweepRemotes(b);
+	}, 5 * 60 * 1000);
 	sweep.unref?.();
 
 	server.on("request", (req, res) => {

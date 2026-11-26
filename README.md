@@ -121,7 +121,14 @@ run there.
 
 A device conversation records the device in its session header (`webui.device`) and keeps the real
 remote path as its `cwd`, so the sidebar reads `router:/etc`, the tab reads `ssh:router · etc`, and
-re-opening the conversation after a reload still runs on the device.
+re-opening the conversation after a reload still runs on the device. That cwd is a path *on the
+device*: the "temporary session" cleanup (a cwd or file under `tmp`/`temp` is thrown away) only ever
+looks at this machine, never at a device path.
+
+The connection has a life of its own. It opens on the first tool call (or a `测试连接`), is shared by
+every conversation on that device, and is closed the moment the last of them is closed; one that no
+conversation is attached to any more is swept after 10 minutes. Nothing stays connected just because
+it was used once.
 
 The device list is this extension's own: `~/.nife/agent/webui-hosts.json`, edited in the page and
 read from nowhere else - a conversation on another machine is a first-class thing here, not a side
@@ -710,6 +717,8 @@ task, so opening the page shows the current prompt rather than something from th
 - A device form covers host/user/port/key/password/jump host; anything else (extra `-o` options) is
   still edited in `webui-hosts.json` by hand.
 - A stored password is plain text in that file (mode `0600`). Keys avoid the question entirely.
+- One connection per device, serialized requests: two conversations on the same router wait for each
+  other's commands rather than interleaving their output.
 - `/webui off` is the only way to close the port; quitting the CLI closes it with the process.
 - A published URL needs a nifetun whose extension answers the event bus (the current `main`); an
   older install simply gets no public URL. Reloading the page keeps the token in the address bar,
