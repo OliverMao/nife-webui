@@ -12,6 +12,8 @@
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { HELPER_SCRIPT } from "./helper.ts";
 
 /** A command to run remotely, streamed the way `BashOperations` expects. */
@@ -37,6 +39,9 @@ interface PendingJob {
 	fail: (error: Error) => void;
 }
 
+/** POSIX single-quote escaping, used for every value that reaches a remote shell. */
+export const shellQuote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
+
 const decode = (payload: string): string => Buffer.from(payload, "base64").toString("utf8");
 const encode = (text: string): string => Buffer.from(text, "utf8").toString("base64");
 
@@ -47,6 +52,22 @@ const encode = (text: string): string => Buffer.from(text, "utf8").toString("bas
 const field = (text: string): string => (text === "" ? "-" : encode(text));
 
 const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+/**
+ * Where `ssh` is.
+ *
+ * On Windows the client is `%SystemRoot%\\System32\\OpenSSH\\ssh.exe`, which is not always on PATH -
+ * a plain `spawn("ssh")` then fails with ENOENT and no hint. `NIFE_SSH_PATH` overrides both.
+ */
+function sshBinary(): string {
+	const configured = process.env.NIFE_SSH_PATH?.trim();
+	if (configured) return configured;
+	if (process.platform === "win32" && process.env.SystemRoot) {
+		const bundled = join(process.env.SystemRoot, "System32", "OpenSSH", "ssh.exe");
+		if (existsSync(bundled)) return bundled;
+	}
+	return "ssh";
+}
 
 export class RemoteHost {
 	private child?: ChildProcessWithoutNullStreams;
@@ -71,7 +92,11 @@ export class RemoteHost {
 		// The helper reaches the device as an argument: `sh -s` would race the frames that follow it
 		// on stdin, because a shell parses stdin in blocks and can swallow requests before the loop
 		// that should read them exists.
-		this.script = `sh -c 'eval "$(printf %s ${Buffer.from(HELPER_SCRIPT, "utf8").toString("base64")} | base64 -d)"'`;
+		//
+		// Quoted with single quotes only. Windows hands this argv element through libuv, which wraps
+		// it in double quotes and escapes what is inside - so a bootstrap written with `"` has two
+		// rounds of quoting to survive, and this one has none.
+		this.script = `sh -c ${shellQuote(HELPER_SCRIPT)}`;
 	}
 
 	/** Serialized: shell requests do not interleave, and neither do their answers. */
@@ -89,7 +114,7 @@ export class RemoteHost {
 		if (this.closed) throw new Error(`ssh ${this.alias}: connection was closed`);
 		if (this.child) return;
 		this.opening ??= (async () => {
-			const child = spawn("ssh", [...this.sshArgs, this.script], {
+			const child = spawn(sshBinary(), [...this.sshArgs, this.script], {
 				stdio: ["pipe", "pipe", "pipe"],
 				env: { ...process.env, ...this.sshEnv },
 			});

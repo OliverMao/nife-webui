@@ -28,10 +28,25 @@ import {
 	type ToolDefinition,
 	type WriteOperations,
 } from "nife-coding-agent";
-import type { RemoteHost } from "./transport.ts";
+import { shellQuote, type RemoteHost } from "./transport.ts";
 
-/** POSIX single quotes: the remote side is a shell, so a path is data that has to be quoted. */
-export const shellQuote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
+export { shellQuote };
+
+/**
+ * Remote paths are POSIX, but the machine running nife may not be.
+ *
+ * The session cwd is `/etc/nginx` on the device; Node on Windows resolves it to `C:\etc\nginx`
+ * before a tool sees it, and that string would be sent to a Linux box. Undoing that here keeps
+ * every tool honest without teaching each of them about platforms: `/tmp/x`, `C:\tmp\x` and
+ * `C:/tmp/x` all become `/tmp/x`.
+ */
+export function toRemotePath(value: string): string {
+	const path = String(value ?? "").trim();
+	if (!path) return path;
+	const withoutDrive = /^[A-Za-z]:/.test(path) ? path.slice(2) : path;
+	// repeated separators are legal in POSIX but make a path hard to read and to compare
+	return withoutDrive.replace(/\\/g, "/").replace(/\/{2,}/g, "/");
+}
 
 /** The tools a device session is allowed to have. Everything else would run on this machine. */
 export const remoteToolNames = ["read", "bash", "edit", "write", "ls", "grep", "find", "web_search"] as const;
@@ -41,10 +56,12 @@ const GREP_MAX_LINES = 2000;
 
 /** POSIX join: the device is always a POSIX box, whatever this machine runs. */
 export function remoteResolve(path: string, cwd: string): string {
-	const value = (path || "").trim();
-	if (!value) return cwd || "/";
+	// both halves can arrive in the host's shape (`C:\etc` on Windows): the device only ever sees POSIX
+	const value = toRemotePath(String(path ?? "").trim());
+	const base = toRemotePath(cwd || "/") || "/";
+	if (!value) return base;
 	if (value.startsWith("/")) return posixNormalize(value);
-	return posixNormalize(`${cwd || "/"}/${value}`);
+	return posixNormalize(`${base}/${value}`);
 }
 
 function posixNormalize(path: string): string {
@@ -175,7 +192,7 @@ export function remoteToolDefinitions(host: RemoteHost, remoteCwd: string, tools
 	const hasRipgrep = tools.some((tool) => /(^|\/)rg$/.test(tool));
 	const bash: BashOperations = {
 		exec: (command, cwd, options) =>
-			host.exec(command, cwd || remoteCwd, {
+			host.exec(command, toRemotePath(cwd || remoteCwd), {
 				onData: options.onData,
 				timeout: options.timeout,
 				signal: options.signal,
@@ -183,45 +200,46 @@ export function remoteToolDefinitions(host: RemoteHost, remoteCwd: string, tools
 	};
 
 	const read: ReadOperations = {
-		readFile: (path) => host.readFile(path),
+		readFile: (path) => host.readFile(toRemotePath(path)),
 		// `access` promises exactly what the local one does: throw when the file cannot be read
 		access: async (path) => {
-			const { directory } = await host.stat(path);
+			const { directory } = await host.stat(toRemotePath(path));
 			if (directory) throw new Error(`is a directory: ${path}`);
 		},
-		detectImageMimeType: (path) => detectImageMimeType(host, path),
+		detectImageMimeType: (path) => detectImageMimeType(host, toRemotePath(path)),
 	};
 
 	const write: WriteOperations = {
-		writeFile: (path, content) => host.writeFile(path, content),
+		writeFile: (path, content) => host.writeFile(toRemotePath(path), content),
 		mkdir: async (dir) => {
-			const { code, text } = await host.run(`mkdir -p ${shellQuote(dir)}`, "/", 30);
+			const { code, text } = await host.run(`mkdir -p ${shellQuote(toRemotePath(dir))}`, "/", 30);
 			if (code !== 0) throw new Error(text.trim() || `cannot create ${dir}`);
 		},
 	};
 
 	const edit: EditOperations = {
-		readFile: (path) => host.readFile(path),
-		writeFile: (path, content) => host.writeFile(path, content),
+		readFile: (path) => host.readFile(toRemotePath(path)),
+		writeFile: (path, content) => host.writeFile(toRemotePath(path), content),
 		access: async (path) => {
-			const { directory } = await host.stat(path);
+			const { directory } = await host.stat(toRemotePath(path));
 			if (directory) throw new Error(`is a directory: ${path}`);
 		},
 	};
 
 	const ls: LsOperations = {
-		exists: (path) => host.exists(path),
+		exists: (path) => host.exists(toRemotePath(path)),
 		stat: async (path) => {
-			const { directory } = await host.stat(path);
+			const { directory } = await host.stat(toRemotePath(path));
 			return { isDirectory: () => directory };
 		},
-		readdir: (path) => host.list(path),
+		readdir: (path) => host.list(toRemotePath(path)),
 	};
 
 	// `find` already delegates to `operations` when they exist, so a remote glob is enough for it
 	const find: FindOperations = {
-		exists: (path) => host.exists(path),
+		exists: (path) => host.exists(toRemotePath(path)),
 		glob: async (pattern, searchCwd, options) => {
+			searchCwd = toRemotePath(searchCwd);
 			const limit = Math.max(1, options.limit);
 			const command = hasRipgrep
 				? `rg --files --hidden -g ${shellQuote(pattern)} ${shellQuote(searchCwd)} 2>/dev/null | head -n ${limit}`

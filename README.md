@@ -165,6 +165,24 @@ Host keys are remembered in `~/.nife/agent/ssh_known_hosts` with `accept-new`, s
 first time it is added while a key that later changes is still refused; the user's own
 `~/.ssh/known_hosts` is never touched.
 
+### On Windows
+
+The bridge runs on Windows too, and the device side is unchanged - it is still just `sh` over ssh.
+What differs is everything around the local `ssh.exe`:
+
+- The client is `%SystemRoot%\System32\OpenSSH\ssh.exe`, which is not always on `PATH`; it is looked
+  up there before falling back to `ssh`, and `NIFE_SSH_PATH` overrides both.
+- The helper travels as one argv element (`sh -c '<script>'`) with no double quotes in it, because
+  Windows hands that element through libuv's quoting on the way to `ssh.exe`.
+- Remote paths stay POSIX. Node on Windows resolves `/etc/nginx` to `C:\etc\nginx` before a tool
+  sees it, so every path is normalized back (`C:\etc\nginx` -> `/etc/nginx`) before it is sent.
+- `UserKnownHostsFile` is quoted when the profile path contains a space.
+
+**Passwords are the one part that is not Windows-ready.** `ssh` asks for a password through a
+program named by `SSH_ASKPASS`, and Windows runs that program with `CreateProcess`, which does not
+start a `.cmd`. A device that needs a password reports the failure with that hint; use a key (or
+`ssh-agent`) for devices you reach from Windows.
+
 ## Public URL (nifetun)
 
 With the [nifetun](https://github.com/OliverMao/nife-tunnel) extension installed (`/tunnel` in the

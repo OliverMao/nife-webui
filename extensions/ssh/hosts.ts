@@ -137,6 +137,9 @@ export const sshTarget = (entry: HostEntry): string =>
  */
 export const knownHostsFile = (): string => join(getAgentDir(), "ssh_known_hosts");
 
+/** Quote an `-o` value that would otherwise be split by ssh's own config parser. */
+const quoteOption = (value: string): string => (/\s/.test(value) ? `"${value}"` : value);
+
 /**
  * A password file that outlived its process is a secret on disk. Anything older than an hour is
  * from a run that crashed rather than one that finished (cleanup removes its own directory), so it
@@ -200,7 +203,9 @@ export function sshArgs(entry: HostEntry): string[] {
 		"-o",
 		"StrictHostKeyChecking=accept-new",
 		"-o",
-		`UserKnownHostsFile=${knownHostsFile()}`,
+		// an `-o key=value` string is tokenized by ssh itself, so a Windows profile path with a space
+		// in it has to be quoted here
+		`UserKnownHostsFile=${quoteOption(knownHostsFile())}`,
 		"-o",
 		"ConnectTimeout=10",
 		"-o",
