@@ -566,9 +566,9 @@ Streaming is batched so a token never invalidates the transcript:
 ### Long names
 
 A project or session name wider than the sidebar is not lost: the row's content is one strip
-(`.session-scroll`) inside a clip, and while the pointer is on the row the strip slides left until
-its end is in view and back at ~150px/s (`--shift` measured on hover, so rows that fit never move;
-the animation is off under `prefers-reduced-motion`). At rest the clip fades its last 14px, which says "there is
+(`.session-scroll`) inside a clip, and while the pointer is on the row the strip slides left to its
+end at ~150px/s and stays there; leaving returns it to the start in 0.22s. `--shift` is measured on
+hover, so rows that fit never move, and there is no motion under `prefers-reduced-motion`. At rest the clip fades its last 14px, which says "there is
 more" without an ellipsis cutting a glyph in half.
 
 ## UI

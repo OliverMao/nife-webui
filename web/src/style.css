@@ -528,22 +528,25 @@ svg {
 	will-change: transform;
 }
 
-.session-scroll.marquee {
-	animation: session-marquee var(--marquee-time, 2s) linear infinite alternate;
+/*
+ * Hover slides the strip to its end and leaves it there; the pointer leaving sends it back. A
+ * transition rather than an animation: it holds the final position on its own, and the return uses
+ * the short duration from the base rule.
+ */
+.session-scroll {
+	transition: transform 0.22s ease-out;
 }
 
-@keyframes session-marquee {
-	from {
-		transform: translateX(0);
-	}
-	to {
-		transform: translateX(var(--shift, 0));
-	}
+.session-scroll.marquee {
+	/* set by hoverScrollStart from the measured overflow: linear, so the speed is even */
+	transition: transform var(--marquee-time, 2s) linear;
+	transform: translateX(var(--shift, 0));
 }
 
 @media (prefers-reduced-motion: reduce) {
+	.session-scroll,
 	.session-scroll.marquee {
-		animation: none;
+		transition: none;
 	}
 }
 
