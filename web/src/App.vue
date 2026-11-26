@@ -36,6 +36,17 @@ const live = ref(null); // { text, thinking } for the message currently streamin
 const streaming = ref(false);
 const online = ref(true);
 const state = ref({ name: "", sessionId: "", cwd: "", model: null, thinkingLevel: "" });
+
+/**
+ * Reading a conversation never needs a runtime, so opening one while all the background slots are
+ * busy still shows everything - only the next turn has to wait. Say that once, quietly, instead of
+ * letting the send fail first.
+ */
+const coldHint = computed(() => {
+	if (state.value.runtime !== false || (state.value.slots ?? 1) > 0) return "";
+	const slots = state.value.maxSlots ?? 3;
+	return `后台已有 ${slots} 个对话在运行，停一个后才能在这里发送（阅读不受影响）`;
+});
 const text = ref("");
 const dialog = ref(null);
 const dialogText = ref("");
@@ -4614,6 +4625,10 @@ onBeforeUnmount(() => {
 
 			<form class="composer" @submit.prevent="send">
 				<p v-if="notice" class="composer-notice" :style="noticeStyle">{{ notice }}</p>
+
+				<!-- Opened while every background slot is busy: the transcript is all here, only a new
+				     turn has to wait for one to finish. -->
+				<p v-if="coldHint" class="composer-cold">{{ coldHint }}</p>
 
 				<!-- queue strip: narrower than the composer box and flush against its top edge -->
 				<!-- no items, no strip: a paused empty queue would be a popup with nothing in it -->

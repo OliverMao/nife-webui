@@ -1022,6 +1022,14 @@ function statsOf(messages: TranscriptMessage[]) {
  * dies with it, exactly like a terminal session would.
  */
 const MAX_WORKERS = 3;
+/**
+ * How many session files may be open at once. A "worker" is a parsed session file plus, if the
+ * conversation has been used, a runtime. The point of `MAX_WORKERS` is the runtimes (each one is a
+ * whole agent with tools, a model and an event stream); reading history needs only the parse. So the
+ * slots below only cap how many turns can be *in flight*, and this cap is the memory guard for the
+ * parses themselves - opening a conversation must never wait for another one to finish.
+ */
+const MAX_ATTACHED = 12;
 /** An idle background runtime keeps its tools and model warm; after this it is disposed and rebuilt
  * on the next visit (the session file is the source of truth). */
 const WORKER_IDLE_MS = 30 * 60 * 1000;
@@ -1206,19 +1214,28 @@ function releaseRemote(b: Bridge, device: string | undefined): void {
 	state.hosts.delete(device);
 }
 
-function disposeWorker(b: Bridge, worker: Worker): void {
-	b.workers.delete(worker.sid);
-	if (b.workersByPath.get(pathKey(worker.path)) === worker.sid) b.workersByPath.delete(pathKey(worker.path));
+/** Give up one conversation's runtime, keeping its session file readable. */
+function closeRuntime(worker: Worker): void {
 	try {
 		worker.unsub?.();
 	} catch {
 		// the session is going away; a failing unsubscribe must not keep it alive
 	}
+	worker.unsub = undefined;
 	try {
 		worker.session?.dispose();
 	} catch {
 		// same: dispose is best effort
 	}
+	worker.session = undefined;
+	worker.live = null;
+	worker.running = false;
+}
+
+function disposeWorker(b: Bridge, worker: Worker): void {
+	b.workers.delete(worker.sid);
+	if (b.workersByPath.get(pathKey(worker.path)) === worker.sid) b.workersByPath.delete(pathKey(worker.path));
+	closeRuntime(worker);
 	if (b.viewSid === worker.sid) focusSession(b, "host");
 	// after the removal above, so the worker itself is not counted as still using the device
 	releaseRemote(b, worker.device);
@@ -1230,6 +1247,27 @@ function evictable(b: Bridge): Worker | undefined {
 		(worker) => !worker.running && !worker.opening && worker.sid !== b.viewSid,
 	);
 	return idle.sort((left, right) => left.lastUsed - right.lastUsed)[0];
+}
+
+/** How many conversations hold a live runtime (one being built counts, it is about to). */
+function runtimeCount(b: Bridge): number {
+	let count = 0;
+	for (const worker of b.workers.values()) if (worker.session || worker.opening) count += 1;
+	return count;
+}
+
+/**
+ * Free one runtime slot without closing the conversation: the session file stays open, so the page
+ * can still read it and the next prompt rebuilds the runtime from that same file.
+ */
+function evictRuntime(b: Bridge): Worker | undefined {
+	const idle = [...b.workers.values()].filter(
+		(worker) => worker.session && !worker.running && !worker.opening && worker.sid !== b.viewSid,
+	);
+	const victim = idle.sort((left, right) => left.lastUsed - right.lastUsed)[0];
+	if (!victim) return undefined;
+	closeRuntime(victim);
+	return victim;
 }
 
 /** Drop runtimes nobody is using: their session files are the history, the memory is not. */
@@ -1278,9 +1316,12 @@ function attachSession(b: Bridge, rawPath: string): AttachOutcome {
 		return { ok: true, sid: known };
 	}
 	if (!existsSync(path)) return { ok: false, message: "session file not found" };
-	if (b.workers.size >= MAX_WORKERS) {
+	// Reading a conversation needs a parsed file, nothing more: the runtime is built on the first
+	// prompt. So only the number of open files is capped here, and switching to a conversation never
+	// waits for a background turn to finish.
+	if (b.workers.size >= MAX_ATTACHED) {
 		const victim = evictable(b);
-		if (!victim) return { ok: false, message: `${MAX_WORKERS} 个会话已经在后台运行，先等一个结束再打开别的` };
+		if (!victim) return { ok: false, message: `已经打开了 ${MAX_ATTACHED} 个对话，先关掉一些` };
 		disposeWorker(b, victim);
 	}
 	let manager: SessionManager;
@@ -1469,6 +1510,15 @@ function openWorkerSession(
 ): Promise<{ ok: true; session: AgentSession } | { ok: false; message: string }> {
 	worker.opening ??= (async () => {
 		try {
+			// A runtime slot is only needed to *run* something. Take back an idle one first, so a page
+			// with three conversations open in the background can still open a fourth to read it.
+			while (runtimeCount(b) >= MAX_WORKERS) {
+				if (evictRuntime(b)) continue;
+				return {
+					ok: false as const,
+					message: `后台已经有 ${MAX_WORKERS} 个对话在运行，先停一个再在这个对话里发送`,
+				};
+			}
 			const agentDir = getAgentDir();
 			// A remote conversation records `ssh://router/etc` as its cwd: that is what makes the
 			// transcript self-describing (a re-attach knows it is remote) and what gives the sidebar
@@ -2305,6 +2355,11 @@ function snapshot(b: Bridge, target: Target, metaOnly = false): unknown {
 			name: model.name,
 		})),
 		streaming: targetRunning(b, target),
+		// Reading never needs a runtime, so a conversation opened while all the slots are busy is still
+		// fully viewable - the composer just cannot start a turn until one finishes.
+		runtime: target.kind === "host" ? true : Boolean(target.worker.session || target.worker.opening),
+		slots: Math.max(0, MAX_WORKERS - runtimeCount(b)),
+		maxSlots: MAX_WORKERS,
 		// What a background conversation can actually do. A device session has fewer tools than a local
 		// one, and saying so is cheaper than letting the model discover it by failing.
 		tools: target.kind === "worker" ? (target.worker.session?.getActiveToolNames() ?? []) : null,

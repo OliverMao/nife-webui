@@ -1797,6 +1797,15 @@ img {
  * it. Fixed positioning on purpose - it must not depend on the composer's own layout - and the
  * `bottom` / `--rise` pair is measured from the box in showNotice().
  */
+/* a quiet line above the box: this conversation is readable but cannot start a turn yet */
+.composer-cold {
+	margin: 0 0 6px;
+	padding: 0 4px;
+	color: var(--muted);
+	font-size: 11px;
+	line-height: 1.5;
+}
+
 .composer-notice {
 	position: fixed;
 	left: 50%;
