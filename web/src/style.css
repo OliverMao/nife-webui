@@ -370,6 +370,7 @@ svg {
 	gap: 6px;
 	flex: 1;
 	min-width: 0;
+	overflow: hidden;
 	padding: 5px 7px;
 	border-radius: 6px;
 	color: inherit;
@@ -498,11 +499,52 @@ svg {
 }
 
 .session-group-name {
-	flex: 1;
+	flex: 0 0 auto;
+	white-space: nowrap;
+}
+
+/*
+ * One scrolling strip per row: the clip is what the sidebar shows, the strip is the whole content.
+ * With the pointer on the row the strip slides to its end and back (see hoverScrollStart), so a name
+ * wider than the sidebar is readable without widening the sidebar or opening anything.
+ */
+.session-clip {
+	display: flex;
+	flex: 1 1 auto;
 	min-width: 0;
 	overflow: hidden;
-	text-overflow: ellipsis;
-	white-space: nowrap;
+	/* a faded edge says "there is more" without an ellipsis cutting a glyph in half; content that
+	   fits ends before the fade, so nothing else is dimmed */
+	mask-image: linear-gradient(to right, #000 calc(100% - 14px), transparent 100%);
+}
+
+.session-scroll {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	width: max-content;
+	/* keeps the last element (the time) out of the faded strip when everything fits */
+	padding-right: 14px;
+	will-change: transform;
+}
+
+.session-scroll.marquee {
+	animation: session-marquee var(--marquee-time, 2s) linear infinite alternate;
+}
+
+@keyframes session-marquee {
+	from {
+		transform: translateX(0);
+	}
+	to {
+		transform: translateX(var(--shift, 0));
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.session-scroll.marquee {
+		animation: none;
+	}
 }
 
 .session-group-head.current .session-group-name {
@@ -833,16 +875,12 @@ svg {
 
 .session-copy {
 	display: flex;
-	flex: 1;
+	flex: 0 0 auto;
 	flex-direction: column;
-	min-width: 0;
 	gap: 1px;
 }
 
 .session-name {
-	min-width: 0;
-	overflow: hidden;
-	text-overflow: ellipsis;
 	white-space: nowrap;
 }
 

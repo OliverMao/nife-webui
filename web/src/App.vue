@@ -2020,6 +2020,32 @@ async function ensureGroup(key, force = false) {
 	return job;
 }
 
+/**
+ * A name longer than the sidebar is still readable: while the pointer is on the row, its content
+ * slides left until the end is in view and back. The distance is measured on the fly, so nothing has
+ * to know the width in advance and rows that fit never move.
+ */
+function hoverScrollStart(event) {
+	const row = event.target?.closest?.(".session-main, .session-group-toggle");
+	if (!row) return;
+	const clip = row.querySelector(".session-clip");
+	const strip = row.querySelector(".session-scroll");
+	if (!clip || !strip) return;
+	const overflow = strip.offsetWidth - clip.clientWidth;
+	if (overflow <= 6) return;
+	strip.style.setProperty("--shift", `-${overflow + 10}px`);
+	strip.style.setProperty("--marquee-time", `${Math.max(1.6, (overflow + 10) / 24)}s`);
+	strip.classList.add("marquee");
+}
+
+function hoverScrollEnd(event) {
+	const row = event.target?.closest?.(".session-main, .session-group-toggle");
+	if (!row) return;
+	// `mouseout` also fires when moving between two children of the same row
+	if (event.relatedTarget && row.contains(event.relatedTarget)) return;
+	row.querySelector(".session-scroll")?.classList.remove("marquee");
+}
+
 async function toggleProjectGroup(group) {
 	const key = group.key;
 	if (expandedProjects.value.includes(key)) {
@@ -4012,7 +4038,12 @@ onBeforeUnmount(() => {
 			</button>
 
 			<div v-if="!selecting" class="section-label">{{ isChat ? "Chats" : "Recents" }}</div>
-			<div class="session-list" :class="{ picking: selecting }">
+			<div
+				class="session-list"
+				:class="{ picking: selecting }"
+				@mouseover="hoverScrollStart"
+				@mouseout="hoverScrollEnd"
+			>
 				<p v-if="groups.length === 0" class="muted pad">{{ isChat ? "No chats yet." : "No sessions yet." }}</p>
 				<div v-for="group in sessionGroups" :key="group.key" class="session-group">
 					<div
@@ -4037,7 +4068,11 @@ onBeforeUnmount(() => {
 							<svg v-if="group.device" class="session-group-device" viewBox="0 0 16 16" aria-hidden="true">
 								<path d="M4.5 4.5L1.5 8l3 3.5M11.5 4.5L14.5 8l-3 3.5M9.2 3.2l-2.4 9.6" />
 							</svg>
-							<span class="session-group-name">{{ group.name }}</span>
+							<span class="session-clip">
+								<span class="session-scroll">
+									<span class="session-group-name">{{ group.name }}</span>
+								</span>
+							</span>
 							<span class="session-group-count">{{ group.count }}</span>
 						</button>
 						<button
@@ -4089,40 +4124,44 @@ onBeforeUnmount(() => {
 					/>
 					<template v-else>
 						<button type="button" class="session-main" @click="switchTo(session.path)">
-							<span class="session-copy">
-								<span class="session-name">{{ sessionTitle(session) }}</span>
+							<span class="session-clip">
+								<span class="session-scroll">
+									<span class="session-copy">
+										<span class="session-name">{{ sessionTitle(session) }}</span>
+									</span>
+									<span
+										v-if="session.running"
+										class="session-state running"
+										title="正在后台运行"
+										aria-label="running"
+									></span>
+									<span
+										v-else-if="session.done"
+										class="session-state done"
+										title="已完成，点开查看"
+										aria-label="finished"
+									></span>
+									<svg
+										v-if="group.pinned && session.device"
+										class="session-ssh"
+										viewBox="0 0 16 16"
+										aria-hidden="true"
+										:title="session.device"
+									>
+										<path d="M4.5 4.5L1.5 8l3 3.5M11.5 4.5L14.5 8l-3 3.5M9.2 3.2l-2.4 9.6" />
+									</svg>
+									<span v-if="session.device || group.pinned" class="session-dir" :title="session.cwd">
+										{{ projectName(session.cwd) }}
+									</span>
+									<span v-if="isPinned(session.path)" class="session-pin" title="Pinned">
+										<svg viewBox="0 0 16 16" aria-hidden="true">
+											<path d="M9.6 2.4l4 4-1.7.5-2.3 2.3.5 2.2-1 1L4.4 7.7l1-1 2.2.5L9.9 4.9z" />
+											<path d="M6.3 9.7L3 13" />
+										</svg>
+									</span>
+									<span class="session-when">{{ when(session.modified) }}</span>
+								</span>
 							</span>
-							<span
-							v-if="session.running"
-							class="session-state running"
-							title="正在后台运行"
-							aria-label="running"
-						></span>
-						<span
-							v-else-if="session.done"
-							class="session-state done"
-							title="已完成，点开查看"
-							aria-label="finished"
-						></span>
-						<svg
-							v-if="group.pinned && session.device"
-							class="session-ssh"
-							viewBox="0 0 16 16"
-							aria-hidden="true"
-							:title="session.device"
-						>
-							<path d="M4.5 4.5L1.5 8l3 3.5M11.5 4.5L14.5 8l-3 3.5M9.2 3.2l-2.4 9.6" />
-						</svg>
-						<span v-if="session.device || group.pinned" class="session-dir" :title="session.cwd">
-							{{ projectName(session.cwd) }}
-						</span>
-							<span v-if="isPinned(session.path)" class="session-pin" title="Pinned">
-								<svg viewBox="0 0 16 16" aria-hidden="true">
-									<path d="M9.6 2.4l4 4-1.7.5-2.3 2.3.5 2.2-1 1L4.4 7.7l1-1 2.2.5L9.9 4.9z" />
-									<path d="M6.3 9.7L3 13" />
-								</svg>
-							</span>
-							<span class="session-when">{{ when(session.modified) }}</span>
 						</button>
 						<button
 							type="button"
