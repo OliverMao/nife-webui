@@ -297,10 +297,10 @@ From the browser:
   runtime. The terminal's own session runs in place; every other conversation the page opens gets
   its own in-process `AgentSession` (`POST /api/attach`), so switching the page away from a running
   turn keeps it running instead of answering `stop the current turn first`. Two different limits:
-  at most 12 session files are open at once (a parsed transcript, cheap) and at most 3 of them hold
+  at most 12 session files are open at once (a parsed transcript, cheap) and at most 5 of them hold
   a *runtime* (a whole agent with tools, a model and an event stream). Reading a conversation needs
   only the parse, so opening one - clicking a row, switching Work/Chat - never waits for a
-  background turn to finish; when all three runtimes are busy the transcript still opens in full,
+  background turn to finish; when all five runtimes are busy the transcript still opens in full,
   the composer says so and refuses the send until one ends. A runtime is recycled automatically:
   the oldest idle one first, never the one on screen, and the session file stays open so the next
   prompt rebuilds it. A run that

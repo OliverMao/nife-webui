@@ -1021,7 +1021,7 @@ function statsOf(messages: TranscriptMessage[]) {
  * turn that was running. No child processes and no tmux: the pool lives in this Node process and
  * dies with it, exactly like a terminal session would.
  */
-const MAX_WORKERS = 3;
+const MAX_WORKERS = 5;
 /**
  * How many session files may be open at once. A "worker" is a parsed session file plus, if the
  * conversation has been used, a runtime. The point of `MAX_WORKERS` is the runtimes (each one is a
