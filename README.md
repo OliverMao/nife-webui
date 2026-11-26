@@ -124,8 +124,9 @@ that ran on it, each row tagged with the directory it ran in (`work`, `etc`, `ro
 router would turn Recents into a filesystem listing. Devices and local projects share one list,
 sorted by recency - a device just carries the terminal glyph (and its rows the directory tag).
 
-Pinned conversations are not folded into their groups: they sit in a `收藏` block at the top that
-never collapses, so "the four I use" are always one click away. A conversation is listed once - the
+Pinned conversations are not folded into their groups: they sit in a `置顶` block at the top that
+never collapses, so "the four I use" are always one click away. Every row there carries the project
+(or the device directory) it belongs to, because no group header says it any more. A conversation is listed once - the
 group it came from shows it only after it is unpinned, and a group that held nothing but pins
 disappears instead of lingering as "0 / No sessions".
 

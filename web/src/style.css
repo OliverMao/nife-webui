@@ -462,14 +462,15 @@ svg {
 	stroke-linejoin: round;
 }
 
-/* the pinned section: a star instead of a chevron, and it never folds */
-.session-group-star {
+/* the pinned section: a pin instead of a chevron, and it never folds */
+.session-group-pin {
 	flex: 0 0 auto;
 	width: 10px;
 	height: 10px;
 	fill: none;
 	stroke: #d0a85a;
 	stroke-width: 1.3;
+	stroke-linecap: round;
 	stroke-linejoin: round;
 }
 

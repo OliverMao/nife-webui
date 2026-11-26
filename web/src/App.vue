@@ -2123,7 +2123,7 @@ const sessionGroups = computed(() => {
 		{
 			key: PINNED_KEY,
 			pinned: true,
-			name: "收藏",
+			name: "置顶",
 			cwd: "",
 			loaded: true,
 			loading: false,
@@ -4029,8 +4029,9 @@ onBeforeUnmount(() => {
 							<svg v-if="!group.pinned" class="session-group-chevron" :class="{ collapsed: groupCollapsed(group.key) }" viewBox="0 0 16 16" aria-hidden="true">
 								<path d="M4.5 6.5L8 10l3.5-3.5" />
 							</svg>
-							<svg v-else class="session-group-star" viewBox="0 0 16 16" aria-hidden="true">
-								<path d="M8 2.4l1.7 3.6 3.9.5-2.9 2.7.8 3.9L8 11.2l-3.5 1.9.8-3.9L2.4 6.5l3.9-.5z" />
+							<svg v-else class="session-group-pin" viewBox="0 0 16 16" aria-hidden="true">
+								<path d="M9.6 2.4l4 4-1.7.5-2.3 2.3.5 2.2-1 1L4.4 7.7l1-1 2.2.5L9.9 4.9z" />
+								<path d="M6.3 9.7L3 13" />
 							</svg>
 							<span v-if="group.current" class="session-group-current" title="Current project"></span>
 							<svg v-if="group.device" class="session-group-device" viewBox="0 0 16 16" aria-hidden="true">
@@ -4112,7 +4113,7 @@ onBeforeUnmount(() => {
 						>
 							<path d="M4.5 4.5L1.5 8l3 3.5M11.5 4.5L14.5 8l-3 3.5M9.2 3.2l-2.4 9.6" />
 						</svg>
-						<span v-if="session.device" class="session-dir" :title="session.cwd">
+						<span v-if="session.device || group.pinned" class="session-dir" :title="session.cwd">
 							{{ projectName(session.cwd) }}
 						</span>
 							<span v-if="isPinned(session.path)" class="session-pin" title="Pinned">
