@@ -121,7 +121,13 @@ run there.
 
 In the sidebar a device is one group, not one group per directory: `router` with every conversation
 that ran on it, each row tagged with the directory it ran in (`work`, `etc`, `root`). Three rows per
-router would turn Recents into a filesystem listing.
+router would turn Recents into a filesystem listing. Devices and local projects share one list,
+sorted by recency - a device just carries the terminal glyph (and its rows the directory tag).
+
+Pinned conversations are not folded into their groups: they sit in a `收藏` block at the top that
+never collapses, so "the four I use" are always one click away. A conversation is listed once - the
+group it came from shows it only after it is unpinned, and a group that held nothing but pins
+disappears instead of lingering as "0 / No sessions".
 
 A device conversation records the device in its session header (`webui.device`) and keeps the real
 remote path as its `cwd`, so the tab reads `ssh:router · etc`, and

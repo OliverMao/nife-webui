@@ -2630,7 +2630,10 @@ function projectGroups(
 }
 
 /** Parse one full session, but only after its project group was expanded. */
-async function sessionInfoFromPath(path: string): Promise<SessionInfo | null> {
+/** A session as the sidebar needs it: nife's own info plus the one field this extension added. */
+type SidebarSession = SessionInfo & { device?: string };
+
+async function sessionInfoFromPath(path: string): Promise<SidebarSession | null> {
 	try {
 		const info = await stat(path);
 		const manager = SessionManager.open(path);
@@ -2652,10 +2655,12 @@ async function sessionInfoFromPath(path: string): Promise<SessionInfo | null> {
 			}
 		}
 		const created = new Date(header.timestamp);
+		const device = (header as { webui?: { device?: unknown } }).webui?.device;
 		return {
 			path,
 			id: manager.getSessionId(),
 			cwd: manager.getCwd(),
+			...(typeof device === "string" && device ? { device } : {}),
 			name: manager.getSessionName(),
 			parentSessionPath: header.parentSession,
 			created: Number.isNaN(created.getTime()) ? info.mtime : created,
@@ -2791,6 +2796,30 @@ async function listGroups(b: Bridge): Promise<unknown> {
 	};
 }
 
+/** One sidebar row: what the page shows for a session, wherever it is listed. */
+function sessionRow(b: Bridge, session: SidebarSession): Record<string, unknown> {
+	const workerSid = b.workersByPath.get(pathKey(session.path));
+	const worker = workerSid ? b.workers.get(workerSid) : undefined;
+	const host = hostFile(b);
+	const isHost = Boolean(host && samePath(host, session.path));
+	return {
+		path: session.path,
+		id: session.id,
+		name: session.name,
+		cwd: session.cwd,
+		// the row marks itself as remote by this, not by the group it happens to sit in
+		...(session.device ? { device: session.device } : {}),
+		modified: session.modified,
+		messageCount: session.messageCount,
+		// The sidebar shows a blue spinner while a turn runs and a green dot when it finished
+		// in the background, so a reader in another conversation still sees what is happening.
+		running: worker ? worker.running : isHost ? !b.ctx.isIdle() : false,
+		done: worker ? worker.done : isHost ? b.hostDone === true : false,
+		// Whitespace collapsed here, not in the page: a title is one line, whatever was pasted.
+		firstMessage: session.firstMessage.replace(/\s+/g, " ").trim().slice(0, SESSION_TITLE_MAX),
+	};
+}
+
 async function listSessions(b: Bridge, cwd: string, device?: string): Promise<unknown> {
 	const viewed = viewedTarget(b);
 	// Header-only sessions are the empty target of a workspace switch; they join Recents with their
@@ -2799,26 +2828,7 @@ async function listSessions(b: Bridge, cwd: string, device?: string): Promise<un
 	return {
 		current: targetManager(b, viewed).getSessionFile(),
 		cwd,
-		sessions: sessions.map((session) => {
-			const workerSid = b.workersByPath.get(pathKey(session.path));
-			const worker = workerSid ? b.workers.get(workerSid) : undefined;
-			const host = hostFile(b);
-			const isHost = Boolean(host && samePath(host, session.path));
-			return {
-				path: session.path,
-				id: session.id,
-				name: session.name,
-				cwd: session.cwd,
-				modified: session.modified,
-				messageCount: session.messageCount,
-				// The sidebar shows a blue spinner while a turn runs and a green dot when it finished
-				// in the background, so a reader in another conversation still sees what is happening.
-				running: worker ? worker.running : isHost ? !b.ctx.isIdle() : false,
-				done: worker ? worker.done : isHost ? b.hostDone === true : false,
-				// Whitespace collapsed here, not in the page: a title is one line, whatever was pasted.
-				firstMessage: session.firstMessage.replace(/\s+/g, " ").trim().slice(0, SESSION_TITLE_MAX),
-			};
-		}),
+		sessions: sessions.map((session) => sessionRow(b, session)),
 	};
 }
 
@@ -3240,6 +3250,23 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 			res,
 			200,
 			JSON.stringify(await listSessions(b, cwd ?? targetCwd(b, viewedTarget(b)), device)),
+			"application/json",
+		);
+	}
+
+	if (req.method === "GET" && path === "/api/sessions/pins") {
+		// Pins are the page's own list of paths, so they can span projects, devices and workspaces.
+		// One request answers "what is in the pinned section" without expanding their groups.
+		const wanted = (url.searchParams.get("paths") ?? "")
+			.split(",")
+			.map((entry) => entry.trim())
+			.filter((entry) => entry.length > 0)
+			.slice(0, 200);
+		const infos = await mapLimit(wanted, 8, (entry) => sessionInfoFromPath(resolve(entry)));
+		return send(
+			res,
+			200,
+			JSON.stringify({ sessions: infos.filter((info): info is SidebarSession => info !== null).map((info) => sessionRow(b, info)) }),
 			"application/json",
 		);
 	}

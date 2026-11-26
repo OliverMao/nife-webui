@@ -308,6 +308,9 @@ const renameText = ref("");
 const renameEl = ref(null);
 // Pinned sessions live in localStorage, shared by every project in the workspace.
 const pinnedPaths = ref([]);
+// Rows for the pinned section: pins are paths, and a pinned conversation may live in a group that is
+// collapsed and never loaded, so it cannot come from `sessionsByProject`.
+const pinnedRows = ref([]);
 // Multi-select: rows become checkboxes and the sidebar footer turns into its action bar.
 const selecting = ref(false);
 const selectedPaths = ref([]);
@@ -2045,6 +2048,7 @@ async function loadGroups(options = {}) {
 	const next = Array.isArray(data.groups) ? data.groups : [];
 	groups.value = next;
 	if (data.currentFile) currentFile.value = data.currentFile;
+	void refreshPinnedRows();
 	if (groupsMode.value !== (data.mode || "work")) {
 		groupsMode.value = data.mode || "work";
 		groupGeneration += 1;
@@ -2084,24 +2088,52 @@ async function loadGroups(options = {}) {
 }
 
 /** One section per project; rows arrive from ensureGroup when the section is opened. */
+/** The pinned conversations, as one always-open group at the top of the list. */
+const PINNED_KEY = "__pinned__";
+
 const sessionGroups = computed(() => {
 	const pinned = new Set(pinnedPaths.value);
-	return groups.value.map((group) => {
+	// How many of a group's conversations are in the pinned section: they are still counted there,
+	// not in the group - and a group that only held pinned ones must not linger as "0 / No sessions".
+	const pinnedIn = (group) =>
+		pinnedRows.value.filter((row) =>
+			group.device
+				? row.device === group.device
+				: !row.device && String(row.cwd || "").toLowerCase() === String(group.cwd || "").toLowerCase(),
+		).length;
+	const groupsOut = [];
+	for (const group of groups.value) {
 		const key = group.key;
 		const loaded = groupLoaded(key);
-		const raw = sessionsByProject.value[key] ?? [];
-		const first = [];
-		const rest = [];
-		for (const session of raw) (pinned.has(session.path) ? first : rest).push(session);
-		return {
+		const raw = (sessionsByProject.value[key] ?? []).filter((session) => !pinned.has(session.path));
+		const hidden = pinnedIn(group);
+		const count = (loaded ? raw.length : group.count) - (loaded ? 0 : hidden);
+		if (count <= 0) continue;
+		groupsOut.push({
 			...group,
 			key,
 			loaded,
 			loading: loadingProjects.value.includes(key),
-			count: loaded ? raw.length : group.count,
-			sessions: [...first, ...rest],
-		};
-	});
+			count,
+			sessions: raw,
+		});
+	}
+	if (pinnedRows.value.length === 0) return groupsOut;
+	return [
+		{
+			key: PINNED_KEY,
+			pinned: true,
+			name: "收藏",
+			cwd: "",
+			loaded: true,
+			loading: false,
+			count: pinnedRows.value.length,
+			modified: new Date(),
+			current: false,
+			sessions: pinnedRows.value,
+		},
+		...groupsOut,
+	];
 });
 
 const orderedSessions = computed(() => sessionGroups.value.flatMap((group) => group.sessions));
@@ -2130,6 +2162,24 @@ function loadPinned() {
 	} catch {
 		pinnedPaths.value = [];
 	}
+	void refreshPinnedRows();
+}
+
+/** Fetch the rows the pinned section shows. Empty pins means no request at all. */
+async function refreshPinnedRows() {
+	const paths = pinnedPaths.value.filter((entry) => typeof entry === "string" && entry.length > 0);
+	if (paths.length === 0) {
+		pinnedRows.value = [];
+		return;
+	}
+	try {
+		const response = await fetch(api(`sessions/pins?paths=${encodeURIComponent(paths.join(","))}`));
+		if (!response.ok) return;
+		const data = await response.json();
+		pinnedRows.value = Array.isArray(data.sessions) ? data.sessions : [];
+	} catch {
+		// a section that cannot load is better empty than wrong
+	}
 }
 
 function savePinned() {
@@ -2157,6 +2207,7 @@ function setPinned(list, pinned) {
 	}
 	pinnedPaths.value = [...next];
 	savePinned();
+	void refreshPinnedRows();
 }
 
 /** Place the row menu next to its button, right-aligned enough to stay on screen. */
@@ -3966,17 +4017,20 @@ onBeforeUnmount(() => {
 				<div v-for="group in sessionGroups" :key="group.key" class="session-group">
 					<div
 						class="session-group-head"
-						:class="{ current: group.current, disabled: selecting }"
-						:title="group.device ? `${group.device}:${group.cwd}` : group.cwd || 'Unknown project'"
+						:class="{ current: group.current, disabled: selecting, pinned: group.pinned }"
+						:title="group.pinned ? '置顶的对话' : group.device ? `${group.device}:${group.cwd}` : group.cwd || 'Unknown project'"
 					>
 						<button
 							type="button"
 							class="session-group-toggle"
-							:aria-expanded="!groupCollapsed(group.key)"
-							@click="toggleProjectGroup(group)"
+							:aria-expanded="group.pinned ? true : !groupCollapsed(group.key)"
+							@click="group.pinned ? undefined : toggleProjectGroup(group)"
 						>
-							<svg class="session-group-chevron" :class="{ collapsed: groupCollapsed(group.key) }" viewBox="0 0 16 16" aria-hidden="true">
+							<svg v-if="!group.pinned" class="session-group-chevron" :class="{ collapsed: groupCollapsed(group.key) }" viewBox="0 0 16 16" aria-hidden="true">
 								<path d="M4.5 6.5L8 10l3.5-3.5" />
+							</svg>
+							<svg v-else class="session-group-star" viewBox="0 0 16 16" aria-hidden="true">
+								<path d="M8 2.4l1.7 3.6 3.9.5-2.9 2.7.8 3.9L8 11.2l-3.5 1.9.8-3.9L2.4 6.5l3.9-.5z" />
 							</svg>
 							<span v-if="group.current" class="session-group-current" title="Current project"></span>
 							<svg v-if="group.device" class="session-group-device" viewBox="0 0 16 16" aria-hidden="true">
@@ -3986,7 +4040,7 @@ onBeforeUnmount(() => {
 							<span class="session-group-count">{{ group.count }}</span>
 						</button>
 						<button
-							v-if="!selecting"
+							v-if="!selecting && !group.pinned"
 							type="button"
 							class="session-group-delete"
 							title="删除工作区会话"
@@ -3998,7 +4052,7 @@ onBeforeUnmount(() => {
 							</svg>
 						</button>
 					</div>
-					<div class="session-group-body" :class="{ collapsed: groupCollapsed(group.key) }">
+					<div class="session-group-body" :class="{ collapsed: groupCollapsed(group.key) && !group.pinned }">
 						<div class="session-group-inner">
 							<p v-if="group.loading && !group.loaded" class="session-group-hint">Loading…</p>
 							<p v-else-if="group.loaded && group.sessions.length === 0" class="session-group-hint">No sessions</p>
@@ -4049,7 +4103,16 @@ onBeforeUnmount(() => {
 							title="已完成，点开查看"
 							aria-label="finished"
 						></span>
-						<span v-if="group.device" class="session-dir" :title="session.cwd">
+						<svg
+							v-if="group.pinned && session.device"
+							class="session-ssh"
+							viewBox="0 0 16 16"
+							aria-hidden="true"
+							:title="session.device"
+						>
+							<path d="M4.5 4.5L1.5 8l3 3.5M11.5 4.5L14.5 8l-3 3.5M9.2 3.2l-2.4 9.6" />
+						</svg>
+						<span v-if="session.device" class="session-dir" :title="session.cwd">
 							{{ projectName(session.cwd) }}
 						</span>
 							<span v-if="isPinned(session.path)" class="session-pin" title="Pinned">
