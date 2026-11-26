@@ -75,7 +75,6 @@ export class RemoteHost {
 	private buffer = "";
 	private stderr = "";
 	private pending = new Map<string, PendingJob>();
-	private queue: Promise<unknown> = Promise.resolve();
 	private counter = 0;
 	private closed = false;
 	/** Last frame the device answered for; the bridge closes connections nobody is using. */
@@ -99,15 +98,19 @@ export class RemoteHost {
 		this.script = `sh -c ${shellQuote(HELPER_SCRIPT)}`;
 	}
 
-	/** Serialized: shell requests do not interleave, and neither do their answers. */
-	private enqueue<T>(run: () => Promise<T>): Promise<T> {
+	/**
+	 * Requests run concurrently, not in a queue.
+	 *
+	 * The device helper starts every command in its own session and tags every frame with the request
+	 * id, so "read this file while that build runs" is safe on both ends. Serializing them made the
+	 * second conversation on a device wait for the first one's slowest command - which reads as "only
+	 * one ssh session at a time".
+	 */
+	private async start<T>(run: () => Promise<T>): Promise<T> {
 		this.lastUsed = Date.now();
-		const next = this.queue.then(run, run);
-		this.queue = next.then(
-			() => undefined,
-			() => undefined,
-		);
-		return next;
+		await this.ensure();
+		this.lastUsed = Date.now();
+		return run();
 	}
 
 	private async ensure(): Promise<void> {
@@ -234,10 +237,7 @@ export class RemoteHost {
 
 	/** A short request/response, serialized behind whatever else the device is doing. */
 	private async callRaw(frame: (id: string) => string, budgetMs = 60_000): Promise<string> {
-		return this.enqueue(async () => {
-			await this.ensure();
-			return this.roundTrip(frame, budgetMs);
-		});
+		return this.start(() => this.roundTrip(frame, budgetMs));
 	}
 
 	/** The same, for answers that are text: paths, listings, `d 4096`. */
@@ -251,9 +251,9 @@ export class RemoteHost {
 		// and aborts where the signal asked for it. An aborted command keeps running on the device,
 		// which is honest - there is nobody left to read its output.
 		const budget = (seconds > 0 ? seconds * 1000 : 3_600_000) + 30_000;
-		return this.enqueue(async () => {
-			await this.ensure();
-			return new Promise<{ exitCode: number | null }>((resolve, reject) => {
+		return this.start(
+			() =>
+				new Promise<{ exitCode: number | null }>((resolve, reject) => {
 				const id = `${++this.counter}`;
 				const timer = setTimeout(() => {
 					this.pending.delete(id);
@@ -307,8 +307,8 @@ export class RemoteHost {
 					this.pending.delete(id);
 					reject(error instanceof Error ? error : new Error(messageOf(error)));
 				}
-			});
-		});
+				}),
+		);
 	}
 
 	/** Collect a whole command's output, for the small requests that are not a tool call. */

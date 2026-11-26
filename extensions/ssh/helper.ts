@@ -103,9 +103,18 @@ run_exec() {
 		tries=$((tries + 1))
 	done
 	pid=$(cat "$pidf" 2>/dev/null)
+	# Short commands are the common case (stat, ls, grep on a few files), and a 200ms poll put a
+	# 200ms floor under every tool call. Poll fast at first, then settle: a build is not helped by
+	# 20 wakeups a second.
+	ticks=0
 	while [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; do
 		while pump "$id" "$out"; do :; done
-		sleep 0.2 2>/dev/null || sleep 1
+		ticks=$((ticks + 1))
+		if [ "$ticks" -lt 20 ]; then
+			sleep 0.05 2>/dev/null || sleep 1
+		else
+			sleep 0.2 2>/dev/null || sleep 1
+		fi
 	done
 	while pump "$id" "$out"; do :; done
 	code=$(cat "$codefile" 2>/dev/null)

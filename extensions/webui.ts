@@ -3096,19 +3096,26 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 		} catch (error) {
 			return send(res, 404, error instanceof Error ? error.message : `unknown device: ${alias}`);
 		}
-		let target: string;
-		try {
-			target = await resolveRemoteDir(host, url.searchParams.get("path") ?? "~");
-		} catch (error) {
-			return send(res, 400, error instanceof Error ? error.message : `无法打开：${alias}`);
-		}
-		// Directories only, and no `find`: a busybox `find` without `-maxdepth` walks the whole tree.
-		const listing = await host.run(
-			`cd ${shellQuote(target)} && for entry in * .[!.]*; do [ -d "$entry" ] && printf '%s\\n' "$entry"; done`,
-			"/",
-			30,
-		);
-		const names = listing.text
+		// One round trip for the whole screen: the picker is opened and clicked all the time, and three
+		// commands per level cost three latencies. The script prints the resolved path, the home and
+		// the directories, separated by NUL (a name may contain a newline, not a NUL).
+		const asked = url.searchParams.get("path") || "~";
+		const script = [
+			`p=${shellQuote(asked)}`,
+			`case $p in "~") p=$HOME ;; "~/"*) p=$HOME/\${p#\~/} ;; esac`,
+			`cd "$p" 2>/dev/null || exit 3`,
+			`pwd; printf '\\0'; printf %s "$HOME"; printf '\\0'`,
+			// Directories only, and no `find`: a busybox `find` without `-maxdepth` walks the whole tree.
+			`for entry in * .[!.]*; do [ -d "$entry" ] && printf '%s\\n' "$entry"; done`,
+			// the loop's status is the last test's, which is false when the last entry is a file
+			`true`,
+		].join("\n");
+		const listing = await host.run(script, "/", 30);
+		if (listing.code !== 0) return send(res, 400, `无法打开：${asked}`);
+		const [pathPart = "", homePart = "", namesPart = ""] = listing.text.split("\0");
+		const target = pathPart.trim().split("\n").pop()?.trim() || asked;
+		const home = homePart.trim() || "/";
+		const names = namesPart
 			.split("\n")
 			.map((name) => name.trim())
 			.filter((name) => name.length > 0 && name !== "." && name !== "..")
@@ -3117,13 +3124,10 @@ async function handle(b: Bridge, req: IncomingMessage, res: ServerResponse): Pro
 			.map((name) => ({ name, path: target === "/" ? `/${name}` : `${target}/${name}` }))
 			.sort((left, right) => left.name.localeCompare(right.name, "zh"));
 		const parent = target === "/" ? null : target.replace(/\/+$/, "").replace(/\/[^/]+$/, "") || "/";
-		const home = (
-			await host.run(`printf %s "$HOME"`, "/", 10).catch(() => ({ text: "" }))
-		).text.trim();
 		return send(
 			res,
 			200,
-			JSON.stringify({ host: alias, path: target, parent, home: home || "/", dirs }),
+			JSON.stringify({ host: alias, path: target, parent, home, dirs }),
 			"application/json",
 		);
 	}
