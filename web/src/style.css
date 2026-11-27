@@ -3266,6 +3266,48 @@ img {
 	}
 }
 
+/* math (KaTeX) */
+
+/* A wide formula scrolls instead of pushing the transcript sideways. */
+.md .math-block {
+	margin: 10px 0;
+	padding: 2px 0;
+	overflow-x: auto;
+	overflow-y: hidden;
+}
+
+.md .math-block .katex-display {
+	margin: 0;
+}
+
+/* KaTeX sizes itself for a document; the transcript's line box is tighter, and display math needs a
+   little air above and below so that taller constructs (fractions, matrices) do not clip. */
+.md .katex {
+	font-size: 1.05em;
+}
+
+/* Left-aligned like the rest of the transcript (KaTeX centres display math by default), but never
+   wrapped: its layout depends on the line staying one box. */
+.md .math-block .katex-display,
+.md .math-block .katex-display > .katex {
+	text-align: left;
+}
+
+/* Math must not wrap inside itself. The transcript's `.text` rule sets `pre-wrap` plus
+   `overflow-wrap: anywhere` on prose so pasted text keeps its newlines - and KaTeX uses the same
+   class name for the contents of \text{}, which made a CJK run break after every character. */
+.md .katex,
+.md .katex .text {
+	white-space: nowrap;
+	overflow-wrap: normal;
+}
+
+/* KaTeX has no CJK glyphs and marks those runs `cjk_fallback`, a class its stylesheet never styles:
+   without a font here every Chinese character in \text{} falls back to a face of a different width. */
+.md .katex .cjk_fallback {
+	font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", ui-sans-serif, system-ui, sans-serif;
+}
+
 /* tables */
 
 .md .table-wrap {

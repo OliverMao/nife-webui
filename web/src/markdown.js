@@ -1,8 +1,56 @@
 // Minimal, safe markdown for chat output. Escapes first, then applies a fixed set of
 // inline/block transforms, so raw HTML in model output never reaches the DOM.
-// Deliberately no dependency: nested lists and reference links are out of scope.
+// Deliberately no dependency except KaTeX: math is a syntax no hand-written renderer gets right,
+// and nested lists and reference links are still out of scope.
+
+import katex from "katex";
 
 const PLACEHOLDER = "\u0000";
+
+/**
+ * LaTeX, in whichever spelling the model was trained on. `$…$` and `\(…\)` are inline; `$$…$$` and
+ * `\[…\]` are display math and get their own block. The dollar form only fires when it looks like a
+ * formula - no space just inside the delimiters, no digit right after the closing one - so a sentence
+ * such as "$5 for the small one and $12 for the large" stays a sentence. Finding those runs is the
+ * callers' job (see `inline` and the display loop); this is only tex in, html out.
+ */
+
+/**
+ * Rendered formulas, keyed by their source. A streaming answer re-renders its whole markdown on every
+ * token, so the same formula is parsed dozens of times a second; rendering is pure, so it is kept. The
+ * ceiling matters: a long answer keeps arriving with formulas nobody will draw again.
+ */
+const mathCache = new Map();
+const MATH_CACHE_MAX = 512;
+
+function mathHtml(tex, display) {
+	const body = String(tex).trim();
+	if (!body) return "";
+	const key = `${display ? "d" : "i"}:${body}`;
+	const cached = mathCache.get(key);
+	if (cached !== undefined) return cached;
+	let html;
+	try {
+		html = katex.renderToString(body, {
+			displayMode: display,
+			// Model output is not a LaTeX document: an unknown macro or a stray character must show as
+			// red text in place, not blank the message or throw during a stream of updates.
+			throwOnError: false,
+			strict: false,
+			trust: false,
+		});
+	} catch {
+		html = `<code>${escapeHtml(body)}</code>`;
+	}
+	if (mathCache.size >= MATH_CACHE_MAX) mathCache.clear();
+	mathCache.set(key, html);
+	return html;
+}
+
+/** Display math as its own block, with the tex kept as a title so it can still be copied out. */
+function mathBlock(tex) {
+	return `<div class="math-block" title="${escapeHtml(String(tex).trim())}">${mathHtml(tex, true)}</div>`;
+}
 
 export function escapeHtml(text) {
 	return String(text)
@@ -39,6 +87,12 @@ function inline(text) {
 	work = work.replace(/<(https?:\/\/[^\s>]+)>/g, (_, url) =>
 		keep(`<a href="${escapeHtml(url)}" target="_blank" rel="noreferrer noopener">${escapeHtml(url)}</a>`),
 	);
+	// Math is stashed with the code: rendering it here means the tex never meets the emphasis pass,
+	// and a formula may contain characters that pass would otherwise eat (`*`, `_`, `~~`).
+	work = work.replace(/\$\$([^$\n]+?)\$\$/g, (_, tex) => keep(mathBlock(tex)));
+	work = work.replace(/\\\[([\s\S]+?)\\\]/g, (_, tex) => keep(mathBlock(tex)));
+	work = work.replace(/\\\(([\s\S]+?)\\\)/g, (_, tex) => keep(mathHtml(tex, false)));
+	work = work.replace(/(?<![\\$])\$(?![\s$])([^$\n]+?)(?<![\s\\])\$(?![\d$])/g, (_, tex) => keep(mathHtml(tex, false)));
 
 	let out = emphasis(escapeHtml(work));
 	out = out.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (match, label, url) => {
@@ -159,6 +213,37 @@ export function renderMarkdown(source) {
 				}
 				i -= 1; // the for loop advances again
 				html.push(table(header, delimiters, rows));
+				continue;
+			}
+		}
+
+		// A display formula on its own lines: `$$` … `$$` or `\[` … `\]`, one line or several. Text
+		// after the closing delimiter is left to the normal path, so a stray `$$` cannot swallow a
+		// whole message.
+		const open = line.match(/^\s*(\$\$|\\\[)\s*(.*)$/);
+		if (open) {
+			const closer = open[1] === "$$" ? "$$" : "\\]";
+			let collected = "";
+			let closed = false;
+			let cursor = i;
+			let tail = open[2];
+			while (true) {
+				const at = tail.indexOf(closer);
+				if (at >= 0) {
+					collected += `${collected ? "\n" : ""}${tail.slice(0, at)}`;
+					closed = true;
+					break;
+				}
+				collected += `${collected ? "\n" : ""}${tail}`;
+				cursor += 1;
+				if (cursor >= lines.length) break;
+				tail = lines[cursor];
+			}
+			if (closed) {
+				flushParagraph();
+				flushList();
+				i = cursor;
+				html.push(mathBlock(collected));
 				continue;
 			}
 		}

@@ -23,6 +23,7 @@
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^6.0.11",
+    "katex": "^0.19.1",
     "pdfjs-dist": "^6.5.438",
     "vite": "^8.3.8",
     "vue": "^3.5.45"

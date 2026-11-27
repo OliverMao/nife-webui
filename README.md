@@ -558,10 +558,25 @@ From the browser:
 
 ## Rendering
 
-Assistant output is rendered as markdown by `web/src/markdown.js`: ~120 lines, no dependency,
+Assistant output is rendered as markdown by `web/src/markdown.js`: ~250 lines, one dependency,
 escapes everything before applying a fixed set of transforms (headings, lists, quotes, fences,
 tables with column alignment, inline code, bold/italic/strike, http(s) links). Raw HTML from the model is always escaped, so
 `v-html` is safe. Code blocks carry a language label and a copy button.
+
+Math is the one thing that is not hand-written: KaTeX renders it, in all four spellings a model might
+use (`$…$` and `\(…\)` inline, `$$…$$` and `\[…\]` as their own block, one line or several).
+`$` only becomes math when it looks like a formula - no space just inside the delimiters and no digit
+right after the closing one - so "$5 for this and $12 for that" stays a sentence, and a formula inside
+backticks stays code. Bad TeX degrades to red text in place rather than blanking the message, the
+rendered markup is cached by source (a streaming answer re-renders on every token), and the build
+keeps only the woff2 copies of KaTeX's fonts: `vite.config.ts` rewrites its `@font-face` rules, which
+name all three formats and would ship 1.2 MB for the 292 KB a browser actually fetches.
+
+Two KaTeX details cost an afternoon and are easy to reintroduce: it uses the class `text` for the
+contents of `\text{}`, which collides with the transcript's `.text { white-space: pre-wrap }` and
+made every Chinese character inside `\text{}` break onto its own line; and its CJK runs carry the
+class `cjk_fallback`, which its own stylesheet never styles, so those runs need a font-family from
+`style.css` or they are drawn with the wrong advances.
 
 Streaming is batched so a token never invalidates the transcript:
 
